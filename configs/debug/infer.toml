@@ -1,2 +1,5 @@
+[parallel]
+dp = 8
+
 [model]
 enforce_eager = true

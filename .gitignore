@@ -3,6 +3,16 @@
 *.jsonl
 configs/endpoints.py
 
+# Cache and data directories
+*outputs/
+outputs/
+torchinductor_cache/
+triton_cache2/
+uv_cache/
+xdg_cache/
+pythonuserbase/
+amd_smi/
+
 # Artifacts
 **/slurm
 **/torchrun

@@ -1,0 +1,8 @@
+max_steps = 100
+
+[model]
+name = "PrimeIntellect/Qwen3-0.6B"
+
+[wandb]
+project = "reasoning"
+name = "gsm8k-tw-train"

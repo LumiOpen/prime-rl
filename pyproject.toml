@@ -41,6 +41,15 @@ dependencies = [
     "prime>=0.5.0",
     "tenacity>=8.2.0",
     "pyzmq>=27.1.0",
+    "flash-attn>=2.8.3",
+    "amdsmi",
+    "pip>=25.3",
+    "wheel>=0.45.1",
+    "setuptools>=79.0.1",
+    "ninja>=1.13.0",
+    "cmake>=4.2.1",
+    "pybind11>=3.0.1",
+    "math-env",
 ]
 
 [project.scripts]
@@ -52,10 +61,10 @@ sft = "prime_rl.trainer.sft.train:main"
 eval = "prime_rl.eval.eval:main"
 synthesize = "prime_rl.synthesize.synthesize:main"
 
-[project.optional-dependencies]
-flash-attn = [
-    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.6.8/flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl",
-]
+# [project.optional-dependencies]
+# flash-attn = [
+#     "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.6.8/flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl",
+# ]
 
 [dependency-groups]
 dev = [
@@ -70,27 +79,39 @@ dev = [
 [tool.uv]
 no-build-isolation-package = ["flash-attn"]
 prerelease = "allow"
+override-dependencies = [
+    "torch==2.9.1+rocm6.4",
+    "torchvision==0.24.1+rocm6.4",
+    "pytorch-triton-rocm==3.5.1+rocm6.4",  # This skips the dependency
+    # "flash-attn==2.7.0"  # Use a stable version that doesn't have git parsing issues
+]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
+torch = { index = "pytorch-rocm" }
+torchvision = { index = "pytorch-rocm" }
+pytorch-triton-rocm = { url = "https://download.pytorch.org/whl/pytorch_triton_rocm-3.5.1-cp312-cp312-linux_x86_64.whl" }
 reverse-text = { index = "primeintellect" }
+math-env = { index = "primeintellect" }
 verifiers = { git = "https://github.com/PrimeIntellect-ai/verifiers.git", rev = "eb3bae36c93b2f574e13a39da2908609d4ec4b2f" }
 dion = { git = "https://github.com/samsja/dion.git", rev = "main" }
 torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "a1fdd7e" }
+vllm = { path = "/shared_silo/scratch/kahakala/lib/wheels/vllm-0.12.0+rocm641-cp312-cp312-linux_x86_64.whl" }
+amdsmi = { path = "/shared_silo/scratch/kahakala/lib/prime-rl/amd_smi" }
+# flash-attn = { git = "https://github.com/Dao-AILab/flash-attention.git", rev = "v2.8.3" }
 
-[tool.uv.extra-build-dependencies]
-flash-attn = [{ requirement = "torch", match-runtime = true }]
+# [tool.uv.extra-build-dependencies]
+# flash-attn = [{ requirement = "torch", match-runtime = true }]
 
-[tool.uv.extra-build-variables]
-flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
+# [tool.uv.extra-build-variables]
+# flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
 
 [[tool.uv.index]]
 name = "primeintellect"
 url = "https://hub.primeintellect.ai/primeintellect/simple/"
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/test/cu128"
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.4"
 explicit = true
 
 [tool.ruff.lint]

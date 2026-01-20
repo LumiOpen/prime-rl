@@ -1,0 +1,20 @@
+batch_size = 512
+rollouts_per_example = 16
+max_steps = 100
+seq_len = 2048
+num_train_workers = 8
+
+[model]
+name = "PrimeIntellect/Qwen3-0.6B"
+
+[wandb]
+project = "reasoning"
+name = "gsm8k-tw-orch"
+
+[sampling]
+max_tokens = 2048
+
+[[env]]
+id = "math-env"
+name = "gsm8k"
+args = { dataset_name = "openai/gsm8k", dataset_subset = "main", math_verify_max_workers = 128, math_verify_timeout = 60 }
