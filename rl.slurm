@@ -21,7 +21,7 @@ export IMG="/shared_silo/scratch/containers/rocm_vllm-dev_nightly_0624_rc2_0624_
 export INFERENCE_CONFIG=${INFERENCE_CONFIG:-"configs/deepscaler/stage1/infer.toml"}
 export ORCHESTRATOR_CONFIG=${ORCHESTRATOR_CONFIG:-"configs/deepscaler/stage1/orch.toml"}
 export TRAINER_CONFIG=${TRAINER_CONFIG:-"configs/deepscaler/stage1/train.toml"}
-export OUTPUT_DIR=./outputs/stage1
+export OUTPUT_DIR="./deepscaler_outputs/stage1"
 
 # Get node list and master node
 NODELIST=($(scontrol show hostnames $SLURM_JOB_NODELIST))
@@ -29,9 +29,12 @@ MASTER_NODE=${NODELIST[0]}
 MASTER_ADDR=$MASTER_NODE
 VLLM_MASTER_NODE=${NODELIST[1]}
 
+VLLM_MASTER_IP=$(srun --nodes=1 --ntasks=1 -w $VLLM_MASTER_NODE ip -4 addr show eno0 | grep -oP 'inet \K[0-9.]+')
+
 echo "Master node: $MASTER_NODE ($MASTER_ADDR)"
 echo "All nodes: ${NODELIST[@]}"
 echo "Number of inference nodes: $NUM_INFERENCE_NODES"
+echo "VLLM Master node: $VLLM_MASTER_NODE ($VLLM_MASTER_IP)"
 
 # Singularity bind mounts
 BIND_MOUNTS="-B /shared_silo/scratch/kahakala/,/home/kahakala@amd.com --bind /usr/local/lib/libbnxt_re-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libbnxt_re-rdmav34.so -B /usr/share/libdrm:/usr/share/libdrm:ro"
@@ -47,6 +50,7 @@ ENV_SETUP='
     export PATH=$PYTHONUSERBASE/bin:$PATH
     export UV_CACHE_DIR=./uv_cache
     export NCCL_SOCKET_IFNAME=eno0
+    export GLOO_SOCKET_IFNAME=eno0
 '
 
 # Start inference master on first inference node
@@ -55,10 +59,10 @@ srun --nodes=1 --ntasks=1 --nodelist=$VLLM_MASTER_NODE --job-name=inference-mast
     singularity exec --rocm --cleanenv $BIND_MOUNTS "$IMG" \
     bash -c "
         $ENV_SETUP
-        export DATA_PARALLEL_ADDRESS=$VLLM_MASTER_NODE
+        export DATA_PARALLEL_ADDRESS=$VLLM_MASTER_IP
         export DATA_PARALLEL_RPC_PORT=29500
         
-        uv run --no-sync inference @ $INFERENCE_CONFIG \
+        uv run inference @ $INFERENCE_CONFIG \
             --data-parallel-size $((NUM_INFERENCE_NODES * 8)) \
             --tensor-parallel-size 1 \
             --data-parallel-size-local 8 \
@@ -79,10 +83,10 @@ for ((i=2; i<=NUM_INFERENCE_NODES; i++)); do
         singularity exec --rocm --cleanenv $BIND_MOUNTS "$IMG" \
         bash -c "
             $ENV_SETUP
-            export DATA_PARALLEL_ADDRESS=$VLLM_MASTER_NODE
+            export DATA_PARALLEL_ADDRESS=$VLLM_MASTER_IP
             export DATA_PARALLEL_RPC_PORT=29500
-            
-            uv run --no-sync inference @ $INFERENCE_CONFIG \
+
+            uv run inference @ $INFERENCE_CONFIG \
                 --data-parallel-size $((NUM_INFERENCE_NODES * 8)) \
                 --tensor-parallel-size 1 \
                 --data-parallel-size-local 8 \
@@ -108,7 +112,7 @@ srun --nodes=1 --ntasks=1 --nodelist=$MASTER_NODE --job-name=rl-training-master 
         export DATA_PARALLEL_RPC_PORT=29500
         
         # Start orchestrator in background
-        uv run --no-sync orchestrator @ $ORCHESTRATOR_CONFIG \
+        uv run orchestrator @ $ORCHESTRATOR_CONFIG \
             --client.base-url http://\$INFERENCE_SERVER_IP:8000/v1 \
             --output-dir "$OUTPUT_DIR/run_default" &
         ORCH_PID=\$!
