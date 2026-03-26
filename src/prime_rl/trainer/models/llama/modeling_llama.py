@@ -307,3 +307,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
                 rotary_emb.config, rotary_emb.inv_freq.device
             )
             rotary_emb.inv_freq.copy_(inv_freq)
+            # LongRoPE models store original_inv_freq for frequency updates;
+            # FSDP leaves it on the meta device, so materialise it here.
+            if hasattr(rotary_emb, "original_inv_freq") and rotary_emb.original_inv_freq.is_meta:
+                rotary_emb.original_inv_freq = inv_freq.clone()

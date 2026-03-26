@@ -135,6 +135,7 @@ def resolve_tool_call_parser(model_name: str, tool_call_parser: str | None) -> s
 
 logger = get_logger()
 from prime_rl.inference.patches import (
+    _apply_patch,
     monkey_patch_harmony_stop_token_propagation,
     monkey_patch_hermes_tool_parser_thread_safety,
     monkey_patch_load_lora_adapter,
@@ -148,18 +149,18 @@ from prime_rl.inference.vllm.serving_chat_with_tokens import (
 )
 
 # NOTE: Fix harmony stop token propagation for GPT-OSS models (vLLM 0.17.0 bug)
-monkey_patch_harmony_stop_token_propagation()
+_apply_patch(monkey_patch_harmony_stop_token_propagation)
 # NOTE: Monkeypatch PrometheusStatLogger to avoid NotImplementedError for LoRA in DP mode
-monkey_patch_prometheus_stat_logger_for_lora_in_dp_mode()
+_apply_patch(monkey_patch_prometheus_stat_logger_for_lora_in_dp_mode)
 # NOTE: Monkeypatch LoadLoRAAdapter to allow loading the same adapter multiple times
-monkey_patch_load_lora_adapter()
+_apply_patch(monkey_patch_load_lora_adapter)
 # NOTE: Monkeypatch TokenizeParams to fix overly conservative validation
-monkey_patch_tokenize_params_validation()
+_apply_patch(monkey_patch_tokenize_params_validation)
 # NOTE: Monkeypatch Hermes tool parser to fix "Already borrowed" RuntimeError under concurrent load
-monkey_patch_hermes_tool_parser_thread_safety()
+_apply_patch(monkey_patch_hermes_tool_parser_thread_safety)
 # NOTE: Monkeypatch HF tokenizer to fix "Already borrowed" RuntimeError during concurrent chat template processing
 # Can be removed once https://github.com/vllm-project/vllm/pull/36557 is merged and we upgrade vllm
-monkey_patch_tokenizer_thread_safety()
+_apply_patch(monkey_patch_tokenizer_thread_safety)
 
 logger = init_logger("vllm.entrypoints.openai.api_server")
 

@@ -1,16 +1,28 @@
+def _apply_patch(fn):
+    """Apply a monkey-patch, skipping if it depends on CUDA-only vLLM modules absent from ROCm builds."""
+    try:
+        fn()
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pass
+
+
 def transformers_v5_compat():
     """vLLM general plugin: patch transformers v5 config attrs that vLLM 0.16 still expects.
 
     Registered as a ``vllm.general_plugins`` entry-point so it runs automatically
     in every vLLM process, including spawned workers.
     """
-    from transformers import Qwen3VLMoeTextConfig
+    try:
+        from transformers import Qwen3VLMoeTextConfig
 
-    if not hasattr(Qwen3VLMoeTextConfig, "tie_word_embeddings"):
-        Qwen3VLMoeTextConfig.tie_word_embeddings = False
+        if not hasattr(Qwen3VLMoeTextConfig, "tie_word_embeddings"):
+            Qwen3VLMoeTextConfig.tie_word_embeddings = False
 
-    _patch_qwen35_lora()
-    monkey_patch_dp_engine_core_pause_resume_deadlock()
+        _patch_qwen35_lora()
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pass
+
+    _apply_patch(monkey_patch_dp_engine_core_pause_resume_deadlock)
 
 
 def _patch_qwen35_lora():
