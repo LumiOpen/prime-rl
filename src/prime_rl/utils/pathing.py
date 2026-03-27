@@ -1,4 +1,5 @@
 import asyncio
+import shutil
 import time
 from pathlib import Path
 
@@ -7,6 +8,10 @@ from prime_rl.utils.logger import get_logger
 
 def get_log_dir(output_dir: Path) -> Path:
     return output_dir / "logs"
+
+
+def get_config_dir(output_dir: Path) -> Path:
+    return output_dir / "configs"
 
 
 def get_ckpt_dir(output_dir: Path) -> Path:
@@ -39,6 +44,12 @@ def get_all_ckpt_steps(ckpt_dir: Path) -> list[int]:
     return sorted([int(step_dir.name.split("_")[-1]) for step_dir in step_dirs])
 
 
+def get_stable_ckpt_steps(ckpt_dir: Path) -> list[int]:
+    """Gets checkpoint steps that have STABLE file, sorted in ascending order."""
+    steps = get_all_ckpt_steps(ckpt_dir)
+    return [s for s in steps if (ckpt_dir / f"step_{s}" / "STABLE").exists()]
+
+
 def resolve_latest_ckpt_step(ckpt_dir: Path) -> int | None:
     """Gets the latest checkpoint step from the checkpoint directory. Returns None if no checkpoints are found."""
     steps = get_all_ckpt_steps(ckpt_dir)
@@ -50,6 +61,45 @@ def resolve_latest_ckpt_step(ckpt_dir: Path) -> int | None:
     logger = get_logger()
     logger.info(f"Found latest checkpoint in {ckpt_dir}: {latest_step}")
     return latest_step
+
+
+def has_checkpoints(output_dir: Path) -> bool:
+    """Check if the output directory contains any checkpoints."""
+    ckpt_dir = get_ckpt_dir(output_dir)
+    return ckpt_dir.exists() and any(ckpt_dir.iterdir())
+
+
+def validate_output_dir(output_dir: Path, *, resuming: bool, clean: bool, ckpt_output_dir: Path | None = None) -> None:
+    """Validate the output directory before training starts.
+
+    Raises if the directory contains checkpoints from a previous run, unless
+    explicitly resuming or opting into cleaning. Other artifacts (logs,
+    rollouts, configs) are fine and don't trigger the error.
+
+    When ckpt_output_dir is set, checkpoints live there instead of under
+    output_dir, so the guard and clean logic check both locations.
+    """
+    dirs_to_check = [output_dir]
+    if ckpt_output_dir is not None and ckpt_output_dir != output_dir:
+        dirs_to_check.append(ckpt_output_dir)
+
+    if resuming:
+        return
+    if clean:
+        logger = get_logger()
+        for d in dirs_to_check:
+            if d.exists():
+                logger.warning(f"Cleaning existing directory: {d}")
+                shutil.rmtree(d)
+        return
+    for d in dirs_to_check:
+        if has_checkpoints(d):
+            raise FileExistsError(
+                f"Directory '{d}' already contains checkpoints from a previous run. "
+                f"To resume the latest step of the previous run, set ckpt.resume_step=-1 or --ckpt.resume-step -1 via CLI. "
+                f"To delete the existing directory and start fresh, set clean_output_dir=true or --clean-output-dir via CLI. "
+                f"Otherwise use a unique output_dir for this experiment."
+            )
 
 
 def sync_wait_for_path(path: Path, interval: int = 1, log_interval: int = 10) -> None:

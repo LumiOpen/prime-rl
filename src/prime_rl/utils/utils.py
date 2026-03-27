@@ -1,7 +1,9 @@
 import asyncio
 import functools
+import importlib
 import os
 import subprocess
+import sys
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
@@ -11,7 +13,7 @@ import torch
 import torch.distributed as dist
 import wandb
 
-from prime_rl.orchestrator.config import EnvConfig, EvalEnvConfig
+from prime_rl.configs.orchestrator import EnvConfig, EvalEnvConfig
 from prime_rl.utils.logger import get_logger
 
 # TODO: Change all imports to use utils.pathing
@@ -23,12 +25,20 @@ from prime_rl.utils.pathing import (
     get_eval_dir,
     get_log_dir,
     get_rollout_dir,
+    get_stable_ckpt_steps,
     get_step_path,
     get_weights_dir,
     resolve_latest_ckpt_step,
     sync_wait_for_path,
     wait_for_path,
 )
+
+
+def import_object(dotted_path: str) -> Any:
+    """Import an object from a dotted path like 'my_module.submodule.MyClass'."""
+    module_path, _, name = dotted_path.rpartition(".")
+    module = importlib.import_module(module_path)
+    return getattr(module, name)
 
 
 def rgetattr(obj: Any, attr_path: str) -> Any:
@@ -120,9 +130,13 @@ def clean_exit(func: Callable) -> Callable:
                 ret = await func(*args, **kwargs)
                 wandb.finish()
                 return ret
-            except Exception as e:
+            except Exception:
+                get_logger().opt(exception=True).error(f"Fatal error in {func.__name__}")
                 wandb.finish(exit_code=1)
-                raise e
+                # sys.exit raises SystemExit so the finally block still runs.
+                # raise alone doesn't terminate the process in an async context —
+                # the event loop swallows it and the process hangs indefinitely.
+                sys.exit(1)
             finally:
                 if dist.is_initialized():
                     dist.destroy_process_group()
@@ -136,9 +150,11 @@ def clean_exit(func: Callable) -> Callable:
                 ret = func(*args, **kwargs)
                 wandb.finish()
                 return ret
-            except Exception as e:
+            except Exception:
+                get_logger().opt(exception=True).error(f"Fatal error in {func.__name__}")
                 wandb.finish(exit_code=1)
-                raise e
+                # sys.exit raises SystemExit so the finally block still runs.
+                sys.exit(1)
             finally:
                 if dist.is_initialized():
                     dist.destroy_process_group()
@@ -281,14 +297,29 @@ def default_dtype(dtype):
         torch.set_default_dtype(prev)
 
 
+def strip_env_version(env_id: str) -> str:
+    """Strip the @version suffix from an environment ID.
+
+    Environment IDs may include a version (e.g. 'd42me/meow@0.1.5') for installation,
+    but the version must be stripped before loading as a Python module.
+    """
+    return env_id.split("@")[0]
+
+
 def install_env(env_id: str) -> None:
     """Install an environment in subprocess."""
     logger = get_logger()
     logger.info(f"Installing environment {env_id}")
     install_cmd = ["uv", "run", "--no-sync", "prime", "env", "install", env_id]
     result = subprocess.run(install_cmd, capture_output=True, text=True)
+    for line in result.stdout.splitlines():
+        if line.strip():
+            logger.info(line)
+    for line in result.stderr.splitlines():
+        if line.strip():
+            logger.warning(line)
     if result.returncode != 0:
-        raise RuntimeError(f"Failed to install environment {env_id} (stdout={result.stdout}, stderr={result.stderr})")
+        raise RuntimeError(f"Failed to install environment {env_id} (exit code {result.returncode})")
     logger.info(f"Successfully installed environment {env_id}")
 
 

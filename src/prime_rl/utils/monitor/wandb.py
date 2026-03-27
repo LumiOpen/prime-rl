@@ -9,11 +9,12 @@ import pandas as pd
 import verifiers as vf
 import wandb
 from transformers.tokenization_utils import PreTrainedTokenizer
+from wandb.errors import CommError
 
-from prime_rl.utils.config import WandbConfig, WandbWithExtrasConfig
+from prime_rl.configs.shared import WandbConfig, WandbWithExtrasConfig
+from prime_rl.utils.config import BaseConfig
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.monitor.base import Monitor
-from prime_rl.utils.pydantic_config import BaseSettings
 
 
 class WandbMonitor(Monitor):
@@ -24,7 +25,7 @@ class WandbMonitor(Monitor):
         config: WandbConfig | WandbWithExtrasConfig | None,
         output_dir: Path | None = None,
         tokenizer: PreTrainedTokenizer | None = None,
-        run_config: BaseSettings | None = None,
+        run_config: BaseConfig | None = None,
     ):
         self.config = config
         self.logger = get_logger()
@@ -34,6 +35,7 @@ class WandbMonitor(Monitor):
         rank = int(os.environ.get("RANK", os.environ.get("DP_RANK", "0")))
         self.enabled = self.config is not None
         self.is_master = rank == 0
+
         if not self.enabled or not self.is_master:
             if not self.is_master:
                 self.logger.warning(f"Skipping {self.__class__.__name__} initialization from non-master rank ({rank})")
@@ -42,15 +44,52 @@ class WandbMonitor(Monitor):
         assert config is not None
         self.logger.info(f"Initializing {self.__class__.__name__} ({config})")
         self._maybe_overwrite_wandb_command()
-        self.wandb = wandb.init(
-            project=config.project,
-            name=config.name,
-            id=config.id,
-            dir=output_dir,
-            resume="allow",
-            config=run_config.model_dump() if run_config else None,
-            mode="offline" if config.offline else None,
-        )
+
+        shared_mode = os.environ.get("WANDB_SHARED_MODE") == "1"
+        if shared_mode:
+            run_id = os.environ.get("WANDB_SHARED_RUN_ID")
+            label = os.environ.get("WANDB_SHARED_LABEL")
+            primary = label == "orchestrator"
+            settings = wandb.Settings(
+                mode="shared",
+                x_label=label,
+                x_primary=primary,
+                x_update_finish_state=primary,
+            )
+            self.logger.info(
+                f"Using shared W&B mode ({label=}, {primary=}). "
+                "This is an experimental feature. Disable with --wandb.shared False"
+            )
+        else:
+            run_id = None
+            primary = False
+            settings = wandb.Settings(
+                mode="offline" if config.offline else "online",
+            )
+
+        def init_wandb(max_retries: int):
+            for attempt in range(max_retries):
+                try:
+                    return wandb.init(
+                        id=run_id,
+                        project=config.project,
+                        name=config.name,
+                        dir=output_dir,
+                        config=run_config.model_dump() if run_config else None,
+                        settings=settings,
+                    )
+                except CommError:
+                    if attempt + 1 == max_retries:
+                        raise
+                    self.logger.info(
+                        f"Shared W&B run not yet created by primary, retrying in 10s ({attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(10)
+
+        max_retries = 1 if not shared_mode or primary else 30
+        self.wandb = init_wandb(max_retries)
+
+        wandb.define_metric("*", step_metric="step")
 
         # Optionally, initialize sample logging attributes
         if config is not None and isinstance(config, WandbWithExtrasConfig) and config.log_extras:
@@ -71,15 +110,15 @@ class WandbMonitor(Monitor):
             self.logger.debug(f"Found WANDB_ARGS in environment variables {wandb_args}")
             sys.argv = json.loads(wandb_args)
 
-    def log(self, metrics: dict[str, Any], step: int | None = None) -> None:
+    def log(self, metrics: dict[str, Any], step: int) -> None:
         self.history.append(metrics)
         if not self.is_master:
             return
         if not self.enabled:
             return
-        wandb.log(metrics, step=step)
+        wandb.log({**metrics, "step": step})
 
-    def log_samples(self, rollouts: list[vf.State], step: int) -> None:
+    def log_samples(self, rollouts: list[vf.RolloutOutput], step: int) -> None:
         """Logs rollouts to W&B table."""
         if not self.is_master:
             return
@@ -122,7 +161,7 @@ class WandbMonitor(Monitor):
             self.samples_table.add_data(*sample.values())
             self.samples.append(sample)
 
-        wandb.log({"samples": self.samples_table}, step=step)
+        wandb.log({"samples": self.samples_table, "step": step})
         self.last_log_samples_step = step
         self.logger.debug(f"Logged samples at step {step} to W&B table in {time.perf_counter() - start_time:.2f}s")
 

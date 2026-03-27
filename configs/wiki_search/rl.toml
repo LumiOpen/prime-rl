@@ -1,6 +1,3 @@
-inference_gpu_ids = [0]
-trainer_gpu_ids = [1]
-
 max_steps = 500
 seq_len = 4096
 
@@ -17,7 +14,6 @@ weight_decay = 0.0
 
 [trainer.model.lora]
 rank = 8
-alpha = 32
 dropout = 0.0
 target_modules = [
     "q_proj",
@@ -41,8 +37,7 @@ max_tokens = 512
 online_difficulty_filtering = true
 
 [[orchestrator.env]]
-id = "primeintellect/wiki-search"
+id = "wiki-search"
 
 [inference.model]
-enable_auto_tool_choice = true
 tool_call_parser = "hermes"

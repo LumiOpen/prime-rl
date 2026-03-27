@@ -8,9 +8,15 @@ max_steps = 20
 [model]
 name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
 
+[optim]
+lr = 3e-5
+
 [sampling]
 max_tokens = 128
 
 [[env]]
 id = "reverse-text"
 
+[ckpt]
+interval = 10
+resume_step = -1

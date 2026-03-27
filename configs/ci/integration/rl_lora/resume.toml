@@ -1,6 +1,3 @@
-inference_gpu_ids = [0]
-trainer_gpu_ids = [1]
-
 max_steps = 25
 seq_len = 2048
 
@@ -11,7 +8,7 @@ resume_step = 20
 name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
 
 [trainer.optim]
-lr = 1e-4
+lr = 5e-5
 
 [trainer.model.lora]
 rank = 8

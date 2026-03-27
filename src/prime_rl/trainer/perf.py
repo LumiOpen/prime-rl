@@ -75,6 +75,15 @@ class PerfCounter:
         if "B200" in device_name:
             # https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
             return 2.25e15  # This is half of the FLOPS reported in torchtitan
+        # AMD Instinct GPUs
+        if "MI300X" in device_name:
+            # https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html
+            # Peak BF16: 1307.4 TFLOPS (matrix)
+            return 1307.4e12
+        if "MI325X" in device_name:
+            # https://www.amd.com/en/products/accelerators/instinct/mi300/mi325x.html
+            # Peak BF16: 1307.4 TFLOPS (matrix) - same compute dies as MI300X, more HBM3e
+            return 1307.4e12
         else:
             self._logger.warning(f"Peak FLOPS undefined for `{device_name}`. Falling back to A100 (312 TFLOPS)")
             return 312e12
@@ -82,9 +91,13 @@ class PerfCounter:
     @staticmethod
     def get_active_mm_params(config: PretrainedConfig) -> float:
         """Get number of active parameters per token involved in matmuls"""
+        # Handle VLM models with nested text_config (e.g., Qwen3-VL)
+        if hasattr(config, "text_config"):
+            config = config.text_config
+
         vocab_size = config.vocab_size
         hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size
+        intermediate_size = getattr(config, "intermediate_size", getattr(config, "moe_intermediate_size", 0))
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         num_attention_heads = config.num_attention_heads
         num_hidden_layers = config.num_hidden_layers
@@ -142,6 +155,10 @@ class PerfCounter:
         return q_params + kv_params + o_params + dense_mlp_params + sparse_mlp_params + lm_head_params
 
     def _get_num_flop_per_token(self, model_config: PretrainedConfig, seq_len: int) -> int:
+        # Handle VLM models with nested text_config (e.g., Qwen3-VL)
+        if hasattr(model_config, "text_config"):
+            model_config = model_config.text_config
+
         l, h, q, t = (  # noqa: E741
             model_config.num_hidden_layers,
             model_config.num_attention_heads,

@@ -8,11 +8,11 @@ from typing import cast
 
 import verifiers as vf
 from datasets import Dataset
+from verifiers.utils.save_utils import make_serializable
 
-from prime_rl.orchestrator.config import BufferConfig
+from prime_rl.configs.orchestrator import BufferConfig
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.utils import format_num, mean, mean_normalize
-from prime_rl.utils.vf import from_serializable_state, to_serializable_state
 
 
 class Buffer:
@@ -73,7 +73,7 @@ class Buffer:
         self.hard_examples: list[dict] = []
 
         # Initialize rollout buffer (flat list of rollouts)
-        self.rollout_buffer: list[vf.State] = []
+        self.rollout_buffer: list[vf.RolloutOutput] = []
 
         self.reset_step_metrics()
 
@@ -87,16 +87,14 @@ class Buffer:
         """Saves pool assignments and rollout buffer."""
         path.mkdir(parents=True, exist_ok=True)
 
-        def write_jsonl(lst: list[dict], path: Path) -> None:
+        def write_jsonl(lst: list, path: Path) -> None:
             with open(path, "w") as f:
                 for item in lst:
-                    f.write(json.dumps(item) + "\n")
+                    f.write(json.dumps(item, default=make_serializable) + "\n")
 
         write_jsonl(self.easy_examples, path / "easy_examples.jsonl")
         write_jsonl(self.hard_examples, path / "hard_examples.jsonl")
-
-        serializable_rollouts = [to_serializable_state(rollout) for rollout in self.rollout_buffer]
-        write_jsonl(serializable_rollouts, path / "rollout_buffer.jsonl")
+        write_jsonl(self.rollout_buffer, path / "rollout_buffer.jsonl")
 
     def load(self, path: Path) -> None:
         """Loads pool assignments and rollouts."""
@@ -107,9 +105,7 @@ class Buffer:
 
         saved_easy_examples = read_jsonl(path / "easy_examples.jsonl")
         saved_hard_examples = read_jsonl(path / "hard_examples.jsonl")
-        saved_rollout_buffer = [
-            from_serializable_state(rollout) for rollout in read_jsonl(path / "rollout_buffer.jsonl")
-        ]
+        saved_rollout_buffer = cast(list[vf.RolloutOutput], read_jsonl(path / "rollout_buffer.jsonl"))
 
         if any(saved_easy_examples) or any(saved_hard_examples) or any(saved_rollout_buffer):
             # Build hash lookup for example buffer (env -> (example_hash -> example_id))
@@ -211,7 +207,7 @@ class Buffer:
 
         return sampled_examples
 
-    def update(self, rollouts: list[vf.State]):
+    def update(self, rollouts: list[vf.RolloutOutput]):
         """Updates the buffer state with completed rollouts."""
 
         rollouts_by_example = defaultdict(list)
@@ -246,7 +242,7 @@ class Buffer:
             self.num_rollouts_per_step[env_name]["normal"] += len(example_rollouts)
             self.rollout_buffer.extend(example_rollouts)
 
-    def sample_rollouts(self, n: int) -> list[vf.State]:
+    def sample_rollouts(self, n: int) -> list[vf.RolloutOutput]:
         """Samples the latest n rollouts from the buffer."""
         n = min(n, len(self.rollout_buffer))
         sampled_rollouts = self.rollout_buffer[-n:]
@@ -265,6 +261,12 @@ class Buffer:
         """Returns the buffer metrics for the current step."""
 
         metrics = {}
+        easy_examples_per_env = defaultdict(int)
+        hard_examples_per_env = defaultdict(int)
+        for example in self.easy_examples:
+            easy_examples_per_env[example["task"]] += 1
+        for example in self.hard_examples:
+            hard_examples_per_env[example["task"]] += 1
 
         # sum over envs (e.g. log globally)
         num_examples_per_step_per_pool = {
@@ -287,6 +289,31 @@ class Buffer:
         pool_ratios = mean_normalize(pool_counts)
         for pool, pool_ratio in zip(self.POOLS, pool_ratios):
             metrics[f"pool/{pool}"] = pool_ratio
+
+        for env in self.env_names:
+            env_num_examples_per_step_per_pool = self.num_examples_per_step[env]
+            env_num_rollouts_per_step_per_pool = self.num_rollouts_per_step[env]
+            env_num_examples_per_step = sum(env_num_examples_per_step_per_pool.values())
+            env_num_rollouts_per_step = sum(env_num_rollouts_per_step_per_pool.values())
+
+            for pool in ["easy", "hard"]:
+                if env_num_examples_per_step:
+                    metrics[f"evicted_examples/{env}/{pool}"] = (
+                        env_num_examples_per_step_per_pool[pool] / env_num_examples_per_step
+                    )
+                if env_num_rollouts_per_step:
+                    metrics[f"filtered_rollouts/{env}/{pool}"] = (
+                        env_num_rollouts_per_step_per_pool[pool] / env_num_rollouts_per_step
+                    )
+
+            env_pool_counts = [
+                easy_examples_per_env[env],
+                len(self.example_buffer[env]),
+                hard_examples_per_env[env],
+            ]
+            env_pool_ratios = mean_normalize(env_pool_counts)
+            for pool, pool_ratio in zip(self.POOLS, env_pool_ratios):
+                metrics[f"pool/{env}/{pool}"] = pool_ratio
 
         self.reset_step_metrics()
 

@@ -5,18 +5,18 @@ from datetime import timedelta
 # Import environment before any other imports
 # ruff: noqa: I001
 
-from prime_rl.trainer.models.layers.attn import substitute_prime_rl_flash_attn
+from prime_rl.trainer.models.layers.attn import substitute_ring_attn
 from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
 from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
 import torch.distributed as dist
 import torch.distributed.nn as dist_nn
 from torch.profiler import profile, ProfilerActivity, record_function
-from loguru import logger
 from prime_rl.trainer.ckpt import setup_ckpt_managers
+from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
-from prime_rl.trainer.rl.config import RLTrainerConfig
+from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
 from prime_rl.utils.cp import (
     setup_cp_params,
@@ -27,6 +27,7 @@ from prime_rl.trainer.rl.loss import (
     compute_entropy,
     compute_loss,
     selective_log_softmax,
+    setup_loss_fn,
     shift_tensor_left,
     shift_tensor_right,
 )
@@ -42,36 +43,38 @@ from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.utils import (
     MemoryProfiler,
     Tensors,
+    export_benchmark_json,
+    get_zero_gradient_ratio,
     get_ckpt_disk_metrics,
     setup_torch_distributed,
     print_benchmark,
     get_response_lengths,
 )
 from prime_rl.trainer.world import get_world
-from prime_rl.trainer.runs import setup_runs, Progress, get_runs
+from prime_rl.trainer.runs import setup_multi_run_manager, Progress, get_multi_run_manager
 from prime_rl.trainer.models.layers.lora import set_lora_num_tokens
 from prime_rl.utils.heartbeat import Heartbeat
+from prime_rl.utils.metrics_server import HealthServer, MetricsServer, RunStats
 from prime_rl.utils.monitor import setup_monitor
-from prime_rl.utils.pydantic_config import parse_argv
+from prime_rl.utils.config import cli
 from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
 from ring_flash_attn import substitute_hf_flash_attn
+from torchtitan.distributed.utils import clip_grad_norm_
 
 
 @clean_exit
-@logger.catch(reraise=True)
-def train(config: RLTrainerConfig):
+def train(config: TrainerConfig):
     # Setup world and logger
     world = get_world()
     logger = setup_logger(
         config.log.level,
         log_file=config.output_dir / "logs" / "trainer" / f"rank_{world.rank}.log" if config.log.file else None,
+        json_logging=config.log.json_logging,
     )
-    logger.info(f"Starting RL trainer in {world}")
-
     logger.info(f"Starting RL trainer in {world} in {config.output_dir}")
 
     # Print warning if running in benchmark mode
-    if config.bench:
+    if config.bench is not None:
         logger.warning(f"Running in benchmark mode (max_steps={config.max_steps})")
 
     # Setup the monitor
@@ -84,51 +87,49 @@ def train(config: RLTrainerConfig):
         logger.info("Initializing heartbeat")
         heart = Heartbeat(config.heartbeat.url)
 
+    # Setup metrics server (full on master, health-only on other nodes' local rank 0)
+    metrics_server = None
+    health_server = None
+    if config.metrics_server is not None and world.local_rank == 0:
+        if world.is_master:
+            logger.info(f"Initializing metrics server on port {config.metrics_server.port}")
+            metrics_server = MetricsServer(config.metrics_server)
+            metrics_server.start()
+        else:
+            logger.info(f"Initializing health server on port {config.metrics_server.port}")
+            health_server = HealthServer(config.metrics_server.port, config.metrics_server.host)
+            health_server.start()
+
     # Set precision
     setup_torch_distributed(
         timeout=timedelta(seconds=config.dist_timeout_seconds), enable_gloo=config.model.fsdp_cpu_offload
     )
     torch.set_float32_matmul_precision("high")
 
-    # Setup runs and offsets
-    setup_runs(config.output_dir, config.max_concurrent_runs, torch.device("cuda", world.local_rank))
-    runs = get_runs()
-
-    # Register validation and scaling hooks for LoRA
-    if config.model.lora:
-        trainer_lora = config.model.lora
-
-        def validate_lora_rank(orch_config) -> tuple[bool, str]:
-            # Default to trainer's rank if not specified
-            if orch_config.model.lora.rank is None:
-                orch_config.model.lora.rank = trainer_lora.rank
-            if orch_config.model.lora.rank > trainer_lora.rank:
-                return (
-                    False,
-                    f"model.lora.rank ({orch_config.model.lora.rank}) exceeds trainer max rank ({trainer_lora.rank})",
-                )
-            return True, ""
-
-        def compute_scaling(orch_config) -> float:
-            return orch_config.model.lora.alpha / orch_config.model.lora.rank
-
-        runs.register_config_validation_hook(validate_lora_rank)
-        runs.register_scaling_hook(compute_scaling)
+    # Setup multi run manager and offsets (including LoRA validation/scaling hooks if applicable)
+    multi_run_manager = setup_multi_run_manager(
+        config.output_dir, config.max_concurrent_runs, torch.device("cuda", world.local_rank), config.model.lora
+    )
 
     # Initialize parallel dimensions
     parallel_dims = get_parallel_dims(config.model)
 
-    # Set up checkpoint manager
-    logger.info(f"Initializing checkpoint managers ({config.ckpt})")
-    ckpt_manager, weight_ckpt_manager = setup_ckpt_managers(config.output_dir, config.ckpt, config.model.lora)
-
-    # get the checkpoint step to load from
+    # For single-run, check for checkpoint to resume from
     checkpoint_step = None
-    if config.ckpt and config.ckpt.resume_step is not None and ckpt_manager is not None:
-        if config.ckpt.resume_step == -1:
-            checkpoint_step = resolve_latest_ckpt_step(ckpt_manager.ckpt_dir)
-        else:
-            checkpoint_step = config.ckpt.resume_step
+    if config.max_concurrent_runs == 1:
+        # Set up checkpoint manager for single-run
+        logger.info(f"Initializing checkpoint managers ({config.ckpt})")
+        ckpt_manager, weight_ckpt_manager = setup_ckpt_managers(config.output_dir, config.ckpt, config.model.lora)
+
+        if config.ckpt and config.ckpt.resume_step is not None and ckpt_manager is not None:
+            if config.ckpt.resume_step == -1:
+                checkpoint_step = resolve_latest_ckpt_step(ckpt_manager.ckpt_dir)
+            else:
+                checkpoint_step = config.ckpt.resume_step
+    else:
+        # Multi-run uses per-run checkpointing via MultiCheckpointManager
+        ckpt_manager, weight_ckpt_manager = setup_multi_checkpoint_manager(config.output_dir)
+        logger.info("Initialized multi-run checkpoint manager")
 
     # Initialize the model and tokenizer
     logger.info(f"Initializing model ({config.model})")
@@ -138,31 +139,50 @@ def train(config: RLTrainerConfig):
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
 
+    # Set up the loss function
+    logger.info(f"Setting up loss function ({config.loss})")
+    loss_fn = setup_loss_fn(config.loss)
+
     # Set up the optimizer
     logger.info(f"Initializing optimizer ({config.optim})")
-    logger.info(f"Using `{config.loss.ratio_type}` importance ratio ({config.loss})")
 
     if config.max_concurrent_runs == 1:
         optimizer = setup_optimizer(
             config.optim,
             list(model.named_parameters()),
-            parallel_dims.world_mesh["dp_shard_cp"],
+            parallel_dims,
             lora=config.model.lora is not None,
+            cpu_offload=config.model.optim_cpu_offload,
         )
         scheduler = setup_scheduler(optimizer, config.scheduler, config.max_steps, config.optim.lr)
     else:
-        optimizer = setup_multi_optimizer(config.optim, parallel_dims.world_mesh["dp_shard_cp"])
+        optimizer = setup_multi_optimizer(config.optim, parallel_dims)
         scheduler = setup_multi_scheduler(optimizer, config.scheduler, config.max_steps)
+
+        # Register checkpoint loading callback at index 1 (after scheduler creation at index 0)
+        def load_run_checkpoint(_optimizer, idx: int) -> None:
+            ckpt_manager.load_run(idx, optimizer, scheduler)
+
+        optimizer.register_post_creation_callback(load_run_checkpoint, index=1)
 
     logger.info(f"Using `{config.scheduler.type}` scheduler ({config.scheduler})")
 
-    # Set up weight broadcast
-    logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
-    weight_broadcast = setup_weight_broadcast(config.output_dir, config.weight_broadcast, config.model.lora)
+    # Set up weight broadcast (skip when using fake data since there's no inference server)
+    if config.data.fake:
+        weight_broadcast = None
+        logger.info("Skipping weight broadcast setup (fake data mode)")
+    else:
+        logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
+        weight_broadcast = setup_weight_broadcast(config.output_dir, config.weight_broadcast, config.model.lora)
 
     if parallel_dims.cp_enabled:
-        substitute_hf_flash_attn(parallel_dims.world_mesh["cp"].get_group(), heads_k_stride=1)
-        substitute_prime_rl_flash_attn(parallel_dims.world_mesh["cp"].get_group(), heads_k_stride=1)
+        cp_group = parallel_dims.world_mesh["cp"].get_group()
+        cp_rank = parallel_dims.world_mesh["cp"].get_local_rank()
+        substitute_hf_flash_attn(cp_group, heads_k_stride=1)
+        substitute_ring_attn(cp_group, heads_k_stride=1, attn_impl=config.model.attn)
+        from prime_rl.utils.cp import setup_hybrid_cp
+
+        setup_hybrid_cp(model, cp_group, cp_rank, parallel_dims.cp)
 
     # Optionally, resume training from a checkpoint
     progress = Progress()
@@ -177,12 +197,12 @@ def train(config: RLTrainerConfig):
     # Set up the data loader (Optionally, use a fake data loader for debugging)
     logger.info(f"Initializing data loader ({config.data})")
     if config.data.fake:
-        dataloader = FakeDataLoader(config.data.fake, config.model.seq_len, parallel_dims.world_mesh["dp"].size())
+        dataloader = FakeDataLoader(config.data.fake, config.model.seq_len, parallel_dims.get_mesh("dp").size())
     else:
         dataloader = DataLoader(
             config.output_dir,
             progress.step,
-            parallel_dims.world_mesh["dp"].size(),
+            parallel_dims.get_mesh("dp").size(),
             config.model.seq_len,
             config.model.cp,
             tokenizer,
@@ -203,21 +223,24 @@ def train(config: RLTrainerConfig):
 
         # Broadcast weights at every step, (except step 0, because no need to broadcast the base model)
         # Also, with NCCL broadcast, we do not broadcast weights the last async level step as the orchestrator is already finished and will not initialize the receive on the inference; for filesystem broadcast, we do "broadcast" until the final step to allow to resume from the broadcast directory
-        last_async_level_steps = config.max_steps and progress.step >= config.max_steps - config.max_async_level
-        if progress.step > 0 and (not last_async_level_steps or config.weight_broadcast.type == "filesystem"):
-            broadcast_weights_start_time = time.perf_counter()
-            weight_broadcast.broadcast_weights(model, step=progress.step)
-            broadcast_weights_time = time.perf_counter() - broadcast_weights_start_time
-            # Clean up old broadcast directories (unless at ckpt interval if using filesystem weight broadcast)
-            ckpt_interval = config.ckpt and config.ckpt.interval
-            interval_to_keep = ckpt_interval if config.weight_broadcast.type == "filesystem" else None
-            if config.weight_broadcast.type == "filesystem":
-                weight_broadcast.maybe_clean(config.max_async_level, interval_to_keep)
-        else:
+        if weight_broadcast is None:
             broadcast_weights_time = 0
-            # Usually the broadcast will set this. If broadcast is skipped, we need to reset this here.
-            for idx in runs.used_idxs:
-                runs.ready_to_update[idx] = False
+        else:
+            last_async_level_steps = config.max_steps and progress.step >= config.max_steps - config.max_async_level
+            if progress.step > 0 and (not last_async_level_steps or config.weight_broadcast.type == "filesystem"):
+                broadcast_weights_start_time = time.perf_counter()
+                weight_broadcast.broadcast_weights(model, step=progress.step)
+                broadcast_weights_time = time.perf_counter() - broadcast_weights_start_time
+                # Clean up old broadcast directories (unless at ckpt interval if using filesystem weight broadcast)
+                ckpt_interval = config.ckpt and config.ckpt.interval
+                interval_to_keep = ckpt_interval if config.weight_broadcast.type == "filesystem" else None
+                if config.weight_broadcast.type == "filesystem":
+                    weight_broadcast.maybe_clean(config.max_async_level, interval_to_keep)
+            else:
+                broadcast_weights_time = 0
+                # Usually the broadcast will set this. If broadcast is skipped, we need to reset this here.
+                for idx in multi_run_manager.used_idxs:
+                    multi_run_manager.ready_to_update[idx] = False
 
         if (
             ckpt_manager is not None
@@ -225,22 +248,30 @@ def train(config: RLTrainerConfig):
             and not (is_first_step or is_last_step)
             and progress.step % config.ckpt.interval == 0
         ):
-            # Save full checkpoint
-            logger.info(f"Saving checkpoint at step {progress.step}")
-            save_ckpt_start_time = time.perf_counter()
-            ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress)
-            save_ckpt_time = time.perf_counter() - save_ckpt_start_time
+            save_ckpt_time = 0
 
-            # Maybe clean up old checkpoints
+            if not config.ckpt.weights_only:
+                # Single-run: Save full checkpoint
+                logger.info(f"Saving checkpoint at step {progress.step}")
+                save_ckpt_start_time = time.perf_counter()
+                ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress)
+                save_ckpt_time += time.perf_counter() - save_ckpt_start_time
+
             ckpt_manager.maybe_clean()
 
             # Save weight checkpoint
             if weight_ckpt_manager is not None:
                 logger.info(f"Saving weight checkpoint at step {progress.step}")
+                save_ckpt_start_time = time.perf_counter()
                 weight_ckpt_manager.save(progress.step, model, tokenizer)
-
-                # Maybe clean up old weight checkpoint
+                save_ckpt_time += time.perf_counter() - save_ckpt_start_time
                 weight_ckpt_manager.maybe_clean()
+        elif config.max_concurrent_runs > 1:
+            # Multi-run: Save per-run checkpoints (each run has its own interval from orchestrator config)
+            save_ckpt_start_time = time.perf_counter()
+            ckpt_manager.save(optimizer, scheduler)
+            save_ckpt_time = time.perf_counter() - save_ckpt_start_time
+            ckpt_manager.maybe_clean()
         else:
             save_ckpt_time = 0
 
@@ -274,10 +305,7 @@ def train(config: RLTrainerConfig):
         seq_len = micro_batches[0]["input_ids"].shape[1]
 
         # Normalize by the local number of unmasked tokens in the batch (per-batch length normalization)
-        if config.loss.ratio_type == "token":
-            loss_scale = sum(micro_batch["loss_mask"].sum().item() for micro_batch in micro_batches)
-        elif config.loss.ratio_type == "sequence":
-            loss_scale = batch_size
+        loss_scale = sum(micro_batch["loss_mask"].sum().item() for micro_batch in micro_batches)
         loss_scale = max(loss_scale, 1)
 
         logger.debug(f"Starting forward and backward pass ({batch_size=})")
@@ -296,20 +324,45 @@ def train(config: RLTrainerConfig):
             teacher_logprobs = (
                 micro_batch["teacher_logprobs"].to("cuda") if micro_batch["teacher_logprobs"] is not None else None
             )
+            routed_experts = (
+                micro_batch["routed_experts"].to("cuda") if micro_batch["routed_experts"] is not None else None
+            )
+
+            if routed_experts is None and config.enable_router_replay:
+                raise ValueError(
+                    "You must set `enable_return_routed_experts=True` in the inference config or pass `--enable-return-routed-experts` to vLLM server to use router replay."
+                )
+
+            if routed_experts is not None and not config.enable_router_replay:
+                # we could've gotten routed experts from the inference server, but we didn't enable router replay
+                routed_experts = None
+
+            # Multimodal fields (Qwen3-VL) - only present for VLM training
+            pixel_values = (
+                micro_batch["pixel_values"].to("cuda") if micro_batch.get("pixel_values") is not None else None
+            )
+            image_grid_thw = (
+                micro_batch["image_grid_thw"].to("cuda") if micro_batch.get("image_grid_thw") is not None else None
+            )
 
             labels = shift_tensor_left(input_ids)
+
+            # VLM + CP is not supported: MRoPE requires global positions but CP shards the sequence
+            if cp_enabled and pixel_values is not None:
+                raise NotImplementedError("Context parallelism is not supported with VLM/multimodal training")
 
             if cp_enabled:
                 input_ids, forward_position_ids = setup_cp_params(input_ids, position_ids, cp_rank, cp_size, cp_group)
                 labels = shard_for_cp(labels, cp_rank=cp_rank, cp_world_size=cp_size)
+                if routed_experts is not None:
+                    routed_experts = shard_for_cp(routed_experts, cp_rank=cp_rank, cp_world_size=cp_size)
             else:
                 forward_position_ids = position_ids
 
             if config.model.lora:
                 lora_num_tokens = micro_batch["lora_num_tokens"].to("cuda")
                 if cp_enabled:
-                    chunk_size = input_ids.shape[1]  # We pad to multiple of cp so this should be fine
-                    logger.debug(f"[Rank {world.rank}] {cp_rank=} {cp_size=} {cp_group=} {chunk_size=}")
+                    chunk_size = input_ids.shape[1]
                     # Convert to cumsum, adjust for CP chunk, convert back to num_tokens
                     cu_offsets = lora_num_tokens.cumsum(dim=0, dtype=torch.int32)
                     adjusted_cu = torch.clip(cu_offsets - chunk_size * cp_rank, min=0, max=chunk_size)
@@ -318,17 +371,34 @@ def train(config: RLTrainerConfig):
                     )
                 set_lora_num_tokens(lora_num_tokens)
 
-            temperature = micro_batch["temperature"]
+            temperatures = micro_batch["temperatures"].to("cuda")
 
-            # Forward pass
+            # Shard temperatures for context parallelism if enabled
+            if cp_enabled:
+                temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
+
+            # Forward pass with per-token temperatures
             with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
-                out = forward(model, input_ids, forward_position_ids, labels=labels, temperature=temperature)
+                out = forward(
+                    model,
+                    input_ids,
+                    forward_position_ids,
+                    labels=labels,
+                    temperature=temperatures,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    routed_experts=routed_experts,
+                )
 
             if out.get("logprobs") is None:
+                # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
                 assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
-                logits = out["logits"] / float(temperature)
-                out["logprobs"] = selective_log_softmax(logits, labels)
-                out["entropy"] = compute_entropy(logits)
+                logits = out["logits"]
+                # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
+                scaled_logits = logits / temperatures.unsqueeze(-1)
+                out["logprobs"] = selective_log_softmax(scaled_logits, labels)
+                out["entropy"] = compute_entropy(scaled_logits)
+            # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures
 
             if cp_enabled:
                 logprobs = dist_nn.all_gather(out["logprobs"], group=cp_group)
@@ -338,10 +408,14 @@ def train(config: RLTrainerConfig):
                 dist.all_gather(entropies, out["entropy"], group=cp_group)
                 out["entropy"] = torch.cat(entropies, dim=1)
 
-            vocab_size = model.config.vocab_size
+            vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
             # This is not really necessary as the first token should be masked out, but we do it anyway to be sure
-            out["logprobs"] = shift_tensor_right(out["logprobs"], pad_value=torch.log(torch.tensor(1.0 / vocab_size)).item())
-            out["entropy"] = shift_tensor_right(out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item())
+            out["logprobs"] = shift_tensor_right(
+                out["logprobs"], pad_value=torch.log(torch.tensor(1.0 / vocab_size)).item()
+            )
+            out["entropy"] = shift_tensor_right(
+                out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
+            )
 
             # Compute loss
             response_lengths = get_response_lengths(position_ids)
@@ -353,7 +427,7 @@ def train(config: RLTrainerConfig):
                 else None,
                 advantages=advantages.squeeze().split(response_lengths),
                 loss_mask=loss_mask.squeeze().split(response_lengths),
-                loss_config=config.loss,
+                loss_fn=loss_fn,
                 loss_scale=loss_scale,
             )
 
@@ -379,17 +453,21 @@ def train(config: RLTrainerConfig):
                 tensors[key].append(loss_tensor)
 
             # Debug log with *local, micro step* stats
-            micro_step_message = f"Micro Step {micro_step}/{len(micro_batches)} | Loss: {tensors['loss'][-1].mean().item():.4f} | Entropy: {tensors['entropy'][-1].mean().item():.4f} | Mismatch KL: {tensors['mismatch_kl'][-1].mean().item():.4f}"
+            micro_step_message = f"Micro Step {micro_step}/{len(micro_batches)} | Loss: {tensors['loss'][-1].mean().item():.4f} | Entropy: {tensors['entropy'][-1].mean().item():.4f}"
+            if "mismatch_kl" in tensors:
+                micro_step_message += f" | Mismatch KL: {tensors['mismatch_kl'][-1].mean().item():.4f}"
             if "max_vio" in tensors:
                 micro_step_message += f" | Max Vio: {tensors['max_vio'][-1].mean().item():.4f}"
             logger.debug(micro_step_message)
 
         # Optionally, clip the gradients
-        grad_norm_dtensor = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optim.max_norm)
-        # Convert to CUDA if on CPU (needed for FSDP CPU offloading)
-        if grad_norm_dtensor.device.type == "cpu":
-            grad_norm_dtensor = grad_norm_dtensor.to(torch.device("cuda"))
-        grad_norm = grad_norm_dtensor.full_tensor()
+
+        grad_norm = clip_grad_norm_(
+            model.parameters(), max_norm=config.optim.max_norm, ep_enabled=parallel_dims.ep_enabled
+        )
+        if grad_norm.device.type == "cpu":
+            grad_norm = grad_norm.to(torch.device("cuda"))
+        zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
         # Update the model parameters
         optimizer.step()
@@ -413,7 +491,7 @@ def train(config: RLTrainerConfig):
 
         # Compute step metrics
         num_local_tokens = seq_len * batch_size
-        num_tokens = parallel_dims.world_mesh["dp"].size() * num_local_tokens
+        num_tokens = parallel_dims.get_mesh("dp").size() * num_local_tokens
         progress.total_tokens += num_tokens
         progress.total_samples += batch_size
         perf_counter = get_perf_counter(model, seq_len)
@@ -424,7 +502,10 @@ def train(config: RLTrainerConfig):
 
         # Log step metrics
         step_time = time.perf_counter() - step_start_time
-        step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Loss: {tensor_stats['loss/mean']:.4f} | Entropy: {tensor_stats['entropy/mean']:.4f} | Mismatch KL: {tensor_stats['mismatch_kl/mean']:.4f} | Grad. Norm: {grad_norm:.4f} | LR: {current_lr:.2e} | Throughput: {throughput:.0f} tokens/s | MFU: {mfu:.1f}% | Peak Mem.: {peak_memory:.1f} GiB"
+        step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Loss: {tensor_stats['loss/mean']:.4f} | Entropy: {tensor_stats['entropy/mean']:.4f}"
+        if "mismatch_kl/mean" in tensor_stats:
+            step_message += f" | Mismatch KL: {tensor_stats['mismatch_kl/mean']:.4f}"
+        step_message += f" | Grad. Norm: {grad_norm:.4f} | LR: {current_lr:.2e} | Throughput: {throughput:.0f} tokens/s | MFU: {mfu:.1f}% | Peak Mem.: {peak_memory:.1f} GiB"
         if "max_vio/mean" in tensor_stats:
             step_message += f" | Max Vio: {tensor_stats['max_vio/mean']:.4f}"
         logger.success(step_message)
@@ -443,9 +524,16 @@ def train(config: RLTrainerConfig):
         optim_metrics = {
             "optim/lr": current_lr,
             "optim/grad_norm": grad_norm.item(),
+            "optim/zero_grad_ratio": zero_grad_ratio,
             "step": progress.step,
         }
         monitor.log(optim_metrics, step=progress.step)
+
+        # Compute derived metrics
+        entropy_mean = tensor_stats.get("entropy/mean", 0.0)
+        mismatch_kl_mean = tensor_stats.get("mismatch_kl/mean")
+        if mismatch_kl_mean is not None and entropy_mean > 0:
+            tensor_stats["kl_ent_ratio/mean"] = mismatch_kl_mean / entropy_mean
 
         # Log tensor stats
         tensor_stats["step"] = progress.step
@@ -468,6 +556,46 @@ def train(config: RLTrainerConfig):
         disk_metrics["step"] = progress.step
         monitor.log(disk_metrics, step=progress.step)
 
+        # Update Prometheus metrics if configured
+        if metrics_server is not None:
+            metrics_server.update(
+                step=progress.step,
+                loss=tensor_stats["loss/mean"],
+                throughput=throughput,
+                grad_norm=grad_norm.item(),
+                peak_memory_gib=peak_memory,
+                learning_rate=current_lr,
+                mfu=mfu,
+                entropy=tensor_stats.get("entropy/mean", 0.0),
+                mismatch_kl=tensor_stats.get("mismatch_kl/mean", 0.0),
+                zero_grad_ratio=zero_grad_ratio,
+            )
+            # Update run/LoRA metrics
+            multi_run_manager = get_multi_run_manager()
+            runs_discovered = len(list(config.output_dir.glob("run_*")))
+            run_stats = []
+            for idx in multi_run_manager.used_idxs:
+                run_id = multi_run_manager.idx_2_id[idx]
+                run_progress = multi_run_manager.progress[idx]
+                if config.max_concurrent_runs == 1:
+                    lr = optimizer.param_groups[0]["lr"]
+                else:
+                    lr = optimizer.get_current_lr(idx) if optimizer.optimizers[idx] else 0.0
+                run_stats.append(
+                    RunStats(
+                        run_id=run_id,
+                        step=run_progress.step,
+                        total_tokens=run_progress.total_tokens,
+                        learning_rate=lr,
+                        ready=multi_run_manager.ready_to_update[idx],
+                    )
+                )
+            metrics_server.update_runs(
+                runs_discovered=runs_discovered,
+                runs_max=multi_run_manager.max_runs,
+                run_stats=run_stats,
+            )
+
         progress.step += 1
         is_first_step = False
 
@@ -483,14 +611,14 @@ def train(config: RLTrainerConfig):
         prof.export_chrome_trace(trace_file)
         logger.info(f"Saved trace to {trace_file}")
 
-    # Write final checkpoint
-    if ckpt_manager is not None:
-        logger.info("Writing final checkpoint")
-        ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress)
+    # Write final checkpoint (only for single-run mode; multi-run checkpoints are managed by MultiCheckpointManager)
+    if config.max_concurrent_runs == 1 and ckpt_manager is not None:
+        if not (config.ckpt and config.ckpt.weights_only):
+            logger.info("Writing final checkpoint")
+            ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress)
         ckpt_manager.maybe_clean()
 
-    # Write final checkpoint
-    if weight_ckpt_manager is not None:
+    if config.max_concurrent_runs == 1 and weight_ckpt_manager is not None:
         logger.info("Writing final weight checkpoint")
         weight_ckpt_manager.save(progress.step, model, tokenizer)
         weight_ckpt_manager.maybe_clean()
@@ -498,15 +626,25 @@ def train(config: RLTrainerConfig):
     logger.info(f"Peak memory: {max(to_col_format(monitor.history)['perf/peak_memory']):.1f} GiB")
     logger.success("RL trainer finished!")
 
-    # Optionally, print benchmark table
-    if config.bench and world.is_master:
-        print_benchmark(to_col_format(monitor.history))
+    # Stop metrics/health server if configured
+    if metrics_server is not None:
+        metrics_server.stop()
+    if health_server is not None:
+        health_server.stop()
+
+    # Optionally, print benchmark table and export JSON
+    if config.bench is not None and world.is_master:
+        history = to_col_format(monitor.history)
+        print_benchmark(history)
+        if config.bench.output_json:
+            export_benchmark_json(history, config.bench.output_json)
+            logger.info(f"Benchmark results written to {config.bench.output_json}")
 
 
 def main():
     """Main entry-point for RL trainer. Run using `uv run trainer`"""
 
-    train(parse_argv(RLTrainerConfig))
+    train(cli(TrainerConfig))
 
 
 if __name__ == "__main__":
