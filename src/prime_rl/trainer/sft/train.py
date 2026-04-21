@@ -81,7 +81,7 @@ def train(config: SFTConfig):
     setup_torch_distributed(
         timeout=timedelta(seconds=config.dist_timeout_seconds), enable_gloo=config.model.fsdp_cpu_offload
     )
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision(config.matmul_precision)
 
     if config.model.lora is not None:
         setup_multi_run_manager(config.output_dir, 1, torch.device("cuda", world.local_rank), config.model.lora)

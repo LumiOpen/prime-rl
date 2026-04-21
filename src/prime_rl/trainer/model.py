@@ -238,6 +238,9 @@ def get_model(
             ),
             None,
         )
+        # Normalize list to scalar before assignment (strict validation in hf-hub>=1.0)
+        if isinstance(pad_token_id, list):
+            pad_token_id = pad_token_id[0]
         model_config.pad_token_id = pad_token_id
 
     # Some HF configs (e.g. Llama 3.2) set pad_token_id to a list, which crashes

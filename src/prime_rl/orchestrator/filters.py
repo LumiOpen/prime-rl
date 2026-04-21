@@ -95,6 +95,21 @@ class RepetitionFilter:
         return FilterResult(detected=False)
 
 
+@dataclass
+class GenerationTruncatedFilter:
+    """Flags rollouts that were truncated due to hitting max_tokens."""
+
+    name: str
+    enforce: bool = False
+
+    def check(self, rollout: vf.RolloutOutput) -> FilterResult:
+        stop_condition = rollout.get("stop_condition", "")
+        is_truncated = stop_condition == "length" or rollout.get("is_truncated", False)
+        if stop_condition == "prompt_too_long":
+            is_truncated = False
+        return FilterResult(detected=is_truncated)
+
+
 def setup_filter(config: FilterConfig, vocab_size: int) -> RolloutFilter:
     """Create a RolloutFilter from a filter config."""
     if config.type == "gibberish":
@@ -109,6 +124,11 @@ def setup_filter(config: FilterConfig, vocab_size: int) -> RolloutFilter:
             name="repetition",
             window=config.window,
             logprob_threshold=math.log(config.prob_threshold),
+            enforce=config.enforce,
+        )
+    elif config.type == "generation_truncated":
+        return GenerationTruncatedFilter(
+            name="generation_truncated",
             enforce=config.enforce,
         )
     raise ValueError(f"Unknown filter type: {config.type}")

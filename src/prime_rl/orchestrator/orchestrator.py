@@ -12,6 +12,7 @@ from prime_rl.orchestrator.advantage import compute_advantages
 from prime_rl.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
 from prime_rl.orchestrator.event_loop_lag import EventLoopLagMonitor
 from prime_rl.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
+from prime_rl.orchestrator.prefix_token_patch import apply_prefix_token_patch
 from prime_rl.orchestrator.trajectories import (
     build_vlm_image_cache,
     interleave_rollout,
@@ -27,6 +28,10 @@ monkey_patch_oai_iterable_types()
 
 # This monkey patch is necessary to avoid heavy CPU overhead from constructing the OAI ChatCompletion Pydantic model with logprobs, for more info see https://github.com/PrimeIntellect-ai/prime-rl/pull/1189
 monkey_patch_chat_completion_logprobs()
+
+# PrefixRL: patch TITO client to support exact token-prefix continuation
+# Enables passing prefix tokens directly to vLLM for constrained generation
+apply_prefix_token_patch()
 
 # Import environment before any other imports
 

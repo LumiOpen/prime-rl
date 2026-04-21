@@ -74,6 +74,8 @@ uv run rl @ configs/deepscaler/stage3.toml \
 
 They evaluate on a series of math benchmarks, including Math500, AIME24, AMC23, Minerva Math and Olympiad Math. We will focus on `math500` and `aime2024` for the reproduction, as these are already implemented as evaluation environments on the Environment Hub and also the most prominent benchmarks. We uploaded the weight checkpoints to HF as `DeepSeek-R1-Distill-Qwen-1.5B-DeepScaleR-XXX` and evaluate the base model and each checkpoint.
 
+For the current `agentica-org/DeepScaleR-Preview-Dataset`, the gold answer lives in the `answer` field. The `solution` field is empty for most rows and should not be used as `answer_key`.
+
 ![Evals](eval.png)
 
 | Model | AIME 2024 | MATH 500 | 

@@ -701,6 +701,13 @@ class TrainerConfig(BaseConfig):
 
     trace_path: Annotated[Path | None, Field(description="Path to write pytorch profiler trace to.")] = None
 
+    matmul_precision: Annotated[
+        Literal["highest", "high", "medium"],
+        Field(
+            description="Precision for float32 matrix multiplications. Use highest for ROCm/AMD GPUs, high for NVIDIA TF32.",
+        ),
+    ] = "highest"
+
     dist_timeout_seconds: Annotated[
         int,
         Field(

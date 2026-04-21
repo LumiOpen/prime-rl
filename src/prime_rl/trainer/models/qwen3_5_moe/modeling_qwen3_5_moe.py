@@ -40,7 +40,7 @@ except ImportError:
 
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_4_varlen_func
-except ImportError:
+except (ImportError, OSError):  # OSError on ROCm where flash_attn.cute .so is CUDA-only
     flash_attn_4_varlen_func = None  # type: ignore
 
 # Flash linear attention imports (for GatedDeltaNet fast path)

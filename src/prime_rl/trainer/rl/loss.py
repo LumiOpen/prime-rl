@@ -38,8 +38,8 @@ Expected signature:
 """
 
 
+# NOTE: @torch.compile(dynamic=True) removed — causes graph-break hangs on ROCm/MI300X
 @jaxtyped(typechecker=typechecker)
-@torch.compile(dynamic=True)
 def selective_log_softmax(
     logits: Float[Tensor, "batch seq vocab"], index: Int[Tensor, "batch seq"]
 ) -> Float[Tensor, "batch seq"]:
@@ -47,8 +47,8 @@ def selective_log_softmax(
     return torch.gather(logprobs, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
 
 
+# NOTE: @torch.compile(dynamic=True) removed — same ROCm issue as above
 @jaxtyped(typechecker=typechecker)
-@torch.compile(dynamic=True)
 def compute_entropy(shifted_logits: Float[Tensor, "batch seq vocab"]) -> Float[Tensor, "batch seq"]:
     with torch.no_grad():
         pd = torch.nn.functional.softmax(shifted_logits, dim=-1)
@@ -156,6 +156,10 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
         "is_masked": _safe_mean(is_masked, loss_mask),
         "is_masked_low": _safe_mean(is_masked_low, loss_mask),
         "is_masked_high": _safe_mean(is_masked_high, loss_mask),
+        # Extra training diagnostics for per-component loss tracking
+        "pg_loss": _safe_mean(pg_loss, keep_mask),
+        "kl_loss": _safe_mean(kl_loss, loss_mask),
+        "adv_magnitude": _safe_mean(advantages.abs(), loss_mask),
     }
     if teacher_kl is not None:
         metrics["teacher_kl"] = _safe_mean(teacher_kl, loss_mask)

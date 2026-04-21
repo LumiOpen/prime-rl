@@ -636,8 +636,22 @@ class RepetitionFilterConfig(BaseModel):
     ] = 0.99
 
 
+class GenerationTruncatedFilterConfig(BaseModel):
+    """Flags rollouts that were truncated due to hitting max_tokens."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["generation_truncated"] = "generation_truncated"
+    enforce: Annotated[
+        bool,
+        Field(
+            description="If True, mask truncated rollouts so they do not contribute to training."
+        ),
+    ] = False
+
+
 FilterConfig: TypeAlias = Annotated[
-    GibberishFilterConfig | RepetitionFilterConfig,
+    GibberishFilterConfig | RepetitionFilterConfig | GenerationTruncatedFilterConfig,
     Field(discriminator="type"),
 ]
 
