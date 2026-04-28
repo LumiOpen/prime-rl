@@ -22,6 +22,7 @@ dependencies = [
     "vllm>=0.17.0",
     "wandb>=0.24.2",
     "ring-flash-attn>=0.1.8",
+    "flash-attn",
     "prime>=0.5.37",
     "pyzmq>=27.1.0",
     "aiolimiter>=1.2.1",
@@ -81,14 +82,17 @@ environments = [
 ]
 override-dependencies = [
     "torch==2.10.0+rocm7.0",
+    "torchvision==0.25.0+rocm7.0",
     "triton-rocm==3.6.0",
     "transformers>=5.1.0.dev0",
 ]
 
 [tool.uv.sources]
 torch = { index = "pytorch-rocm" }
+torchvision = { index = "pytorch-rocm" }
 triton-rocm = { index = "pytorch-rocm" }
-vllm = { path = "/shared_silo/scratch/dzautner/wheels/vllm-0.17.0+rocm700-cp312-cp312-linux_x86_64.whl" }
+flash-attn = { path = "/shared_silo/scratch/prime-rl/wheels/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl" }
+vllm = { path = "/shared_silo/scratch/prime-rl/wheels/vllm-0.17.0+rocm700-cp312-cp312-linux_x86_64.whl" }
 verifiers = { git = "https://github.com/PrimeIntellect-ai/verifiers.git", rev = "0db45e6" }
 torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "a1fdd7e" }
 dion = { git = "https://github.com/samsja/dion.git", rev = "d891eeb" }
