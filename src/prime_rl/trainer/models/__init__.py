@@ -7,7 +7,6 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.auto_factory import _BaseAutoModelClass, _LazyAutoMapping, auto_class_update
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
 from prime_rl.trainer.models.afmoe import AfmoeConfig, AfmoeForCausalLM
 from prime_rl.trainer.models.base import PreTrainedModelPrimeRL
@@ -31,14 +30,6 @@ AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeConfig, exist_ok=True)
 
 _CUSTOM_CAUSAL_LM_MAPPING = _LazyAutoMapping(CONFIG_MAPPING_NAMES, OrderedDict())
 _CUSTOM_CAUSAL_LM_MAPPING.register(LlamaConfig, LlamaForCausalLM, exist_ok=True)
-# Qwen2 uses bias=True for QKV attention projections, bias=False for MLP
-# These attrs are hardcoded in HF's Qwen2 model but not in Qwen2Config,
-# so we set class-level defaults so LlamaDecoderLayer can read them.
-if not hasattr(Qwen2Config, "attention_bias"):
-    Qwen2Config.attention_bias = True
-if not hasattr(Qwen2Config, "mlp_bias"):
-    Qwen2Config.mlp_bias = False
-_CUSTOM_CAUSAL_LM_MAPPING.register(Qwen2Config, LlamaForCausalLM, exist_ok=True)
 _CUSTOM_CAUSAL_LM_MAPPING.register(AfmoeConfig, AfmoeForCausalLM, exist_ok=True)
 _CUSTOM_CAUSAL_LM_MAPPING.register(Glm4MoeConfig, Glm4MoeForCausalLM, exist_ok=True)
 _CUSTOM_CAUSAL_LM_MAPPING.register(GlmMoeDsaConfig, GlmMoeDsaForCausalLM, exist_ok=True)

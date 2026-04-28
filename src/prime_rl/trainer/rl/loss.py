@@ -156,10 +156,6 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
         "is_masked": _safe_mean(is_masked, loss_mask),
         "is_masked_low": _safe_mean(is_masked_low, loss_mask),
         "is_masked_high": _safe_mean(is_masked_high, loss_mask),
-        # Extra training diagnostics for per-component loss tracking
-        "pg_loss": _safe_mean(pg_loss, keep_mask),
-        "kl_loss": _safe_mean(kl_loss, loss_mask),
-        "adv_magnitude": _safe_mean(advantages.abs(), loss_mask),
     }
     if teacher_kl is not None:
         metrics["teacher_kl"] = _safe_mean(teacher_kl, loss_mask)
