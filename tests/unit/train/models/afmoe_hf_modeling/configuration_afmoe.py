@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
-from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
+
 
 class AfmoeConfig(PretrainedConfig):
     """
@@ -25,6 +25,7 @@ class AfmoeConfig(PretrainedConfig):
     topk_group (`int`, *optional*, defaults to 1):
         Number of selected groups for each token(for each token, ensuring the selected experts is only within `topk_group` groups).
     """
+
     model_type = "afmoe"
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
@@ -68,6 +69,7 @@ class AfmoeConfig(PretrainedConfig):
         attention_dropout: float = 0.0,
         n_group: int = 1,
         topk_group: int = 1,
+        pad_token_id: int | None = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -84,8 +86,7 @@ class AfmoeConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
-        
-        
+
         # MoE specific
         self.moe_intermediate_size = moe_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -101,7 +102,6 @@ class AfmoeConfig(PretrainedConfig):
         self.load_balance_coeff = load_balance_coeff
         self.use_grouped_mm = use_grouped_mm
 
-
         # Attention specific
         self.attention_dropout = attention_dropout
         self.global_attn_every_n_layers = global_attn_every_n_layers
@@ -109,7 +109,8 @@ class AfmoeConfig(PretrainedConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention" if bool((i + 1) % global_attn_every_n_layers) else "full_attention" for i in range(self.num_hidden_layers)
+                "sliding_attention" if bool((i + 1) % global_attn_every_n_layers) else "full_attention"
+                for i in range(self.num_hidden_layers)
             ]
         layer_type_validation(self.layer_types)
 
@@ -120,12 +121,7 @@ class AfmoeConfig(PretrainedConfig):
             num_key_value_heads = num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
-
-
-        # Validate rope configs
-        if self.rope_scaling is not None and "type" in self.rope_scaling:
-            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-        rope_config_validation(self)
+        self.pad_token_id = pad_token_id
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,

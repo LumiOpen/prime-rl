@@ -13,12 +13,12 @@ import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 
+from prime_rl.configs.trainer import CheckpointConfig
 from prime_rl.trainer.ckpt import CheckpointManager
-from prime_rl.trainer.config import CheckpointConfig
-from prime_rl.trainer.runs import Progress, get_runs
+from prime_rl.trainer.runs import Progress, get_multi_run_manager
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.logger import get_logger
-from prime_rl.utils.utils import resolve_latest_ckpt_step
+from prime_rl.utils.pathing import get_stable_ckpt_steps
 
 if TYPE_CHECKING:
     from prime_rl.trainer.optim import MultiLoRAOptimizer
@@ -72,12 +72,12 @@ class MultiCheckpointManager:
 
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
-        self.runs = get_runs()
+        self.multi_run_manager = get_multi_run_manager()
         self.world = get_world()
         self.logger = get_logger()
-        self.managers: list[CheckpointManager | None] = [None] * self.runs.max_runs
-        self.runs.register_deletion_hook(self._run_deletion_hook)
-        self.runs.register_creation_hook(self._run_creation_hook)
+        self.managers: list[CheckpointManager | None] = [None] * self.multi_run_manager.max_runs
+        self.multi_run_manager.register_deletion_hook(self._run_deletion_hook)
+        self.multi_run_manager.register_creation_hook(self._run_creation_hook)
 
     def _run_deletion_hook(self, idx: int, run_id: str) -> None:
         self.managers[idx] = None
@@ -86,7 +86,7 @@ class MultiCheckpointManager:
         self.managers[idx] = self._maybe_create_manager(idx)
 
     def _maybe_create_manager(self, idx: int) -> CheckpointManager | None:
-        ckpt_config = self.runs.config[idx].ckpt
+        ckpt_config = self.multi_run_manager.config[idx].ckpt
         if ckpt_config is None:
             return None
 
@@ -95,14 +95,14 @@ class MultiCheckpointManager:
             keep_last=ckpt_config.keep_last,
             keep_interval=ckpt_config.keep_interval,
         )
-        run_dir = self.runs.get_run_dir(idx)
+        run_dir = self.multi_run_manager.get_run_dir(idx)
         manager = CheckpointManager(run_dir, config)
         self.managers[idx] = manager
         return manager
 
     def _should_save(self, idx: int, step: int) -> bool:
         """Determine if a checkpoint should be saved for a given run and step."""
-        ckpt_config = self.runs.config[idx].ckpt
+        ckpt_config = self.multi_run_manager.config[idx].ckpt
         if ckpt_config is None or ckpt_config.interval is None:
             return False
         if step <= 0 or step % ckpt_config.interval != 0:
@@ -115,8 +115,8 @@ class MultiCheckpointManager:
         optimizer: "MultiLoRAOptimizer",
         scheduler: "MultiLoRAScheduler",
     ) -> None:
-        for idx in self.runs.used_idxs:
-            step = self.runs.progress[idx].step
+        for idx in self.multi_run_manager.used_idxs:
+            step = self.multi_run_manager.progress[idx].step
             if not self._should_save(idx, step):
                 continue
 
@@ -124,12 +124,14 @@ class MultiCheckpointManager:
 
             # We have a very wide try-except because we dont want to crash the trainer over one run having issues
             try:
-                model_state_dict = {k: v.data.detach().clone() for k, v in self.runs.get_named_parameters_for_run(idx)}
+                model_state_dict = {
+                    k: v.data.detach().clone() for k, v in self.multi_run_manager.get_named_parameters_for_run(idx)
+                }
                 run_state = RunState(
                     model_state_dict,
                     optimizer.optimizers[idx],
                     scheduler.schedulers[idx],
-                    self.runs.progress[idx],
+                    self.multi_run_manager.progress[idx],
                 )
                 ckpt_path = manager.get_ckpt_path(step)
                 ckpt_path.mkdir(parents=True, exist_ok=True)
@@ -141,7 +143,7 @@ class MultiCheckpointManager:
                 # Copy broadcast folder to checkpoint
                 # This way, we only need to save the checkpoint folder
                 if self.world.is_master:
-                    run_dir = self.runs.get_run_dir(idx)
+                    run_dir = self.multi_run_manager.get_run_dir(idx)
                     broadcast_src = run_dir / "broadcasts" / f"step_{step}"
                     weight_dst = run_dir / "checkpoints" / f"step_{step}" / "weight"
                     try:
@@ -150,13 +152,26 @@ class MultiCheckpointManager:
                         self.logger.error(
                             f"Broadcast folder not found for run {idx} at step {step}. Looking for it in {broadcast_src}"
                         )
+                dist.barrier()
+                manager.mark_stable(step)
+                manager.ckpt_steps.append(step)
             except FileNotFoundError:
                 self.logger.warning(f"Run {idx} deleted during checkpoint, skipping")
             except Exception as e:
                 self.logger.error(f"Error checkpointing run {idx}: {e}")
             dist.barrier()
-            manager.mark_stable(step)
-            manager.ckpt_steps.append(step)
+            # If the run is deleted, remove the run directory
+            # This is avoid the creation of zombie runs when the directory is deleted while we are checkpointing which recreates the directory
+            # Ideally we move this to discover but lets have here for now
+            if (
+                self.multi_run_manager.get_orchestrator_config(self.multi_run_manager.idx_2_id[idx]) is None
+                and self.world.is_master
+            ):
+                try:
+                    self.logger.warning(f"Run {idx} deleted during checkpoint, removing run directory")
+                    shutil.rmtree(self.multi_run_manager.get_run_dir(idx))
+                except Exception as e:
+                    self.logger.error(f"Error removing run directory for run {idx}: {e}")
         dist.barrier()
 
     def load_run(
@@ -165,26 +180,30 @@ class MultiCheckpointManager:
         optimizer: "MultiLoRAOptimizer",
         scheduler: "MultiLoRAScheduler",
     ) -> bool:
-        if self.runs.config[idx].ckpt is None or self.runs.config[idx].ckpt.resume_step is None:
+        if (
+            self.multi_run_manager.config[idx].ckpt is None
+            or self.multi_run_manager.config[idx].ckpt.resume_step is None
+        ):
             return False
 
         manager = self.managers[idx]
         if manager is None:
             return False
 
-        step = self.runs.config[idx].ckpt.resume_step
+        step = self.multi_run_manager.config[idx].ckpt.resume_step
         if step == -1:
-            step = resolve_latest_ckpt_step(manager.ckpt_dir)
-            if step is None:
+            stable_steps = get_stable_ckpt_steps(manager.ckpt_dir)
+            if not stable_steps:
                 return False
+            step = max(stable_steps)
 
         try:
-            model_state_dict = dict(self.runs.get_named_parameters_for_run(idx))
+            model_state_dict = dict(self.multi_run_manager.get_named_parameters_for_run(idx))
             run_state = RunState(
                 model_state_dict,
                 optimizer.optimizers[idx],
                 scheduler.schedulers[idx],
-                self.runs.progress[idx],
+                self.multi_run_manager.progress[idx],
             )
             ckpt_path = manager.get_ckpt_path(step)
             if not ckpt_path.exists():
@@ -193,7 +212,7 @@ class MultiCheckpointManager:
             state_dict = torch.load(ckpt_path / f"rank_{self.world.rank}.pt")
             run_state.load_state_dict(state_dict)
 
-            self.logger.info(f"Resumed run {self.runs.idx_2_id[idx]} from step {step}")
+            self.logger.info(f"Resumed run {self.multi_run_manager.idx_2_id[idx]} from step {step}")
             return True
         except Exception as e:
             self.logger.error(f"Error loading checkpoint for run {idx}: {e}")
@@ -202,7 +221,7 @@ class MultiCheckpointManager:
     def maybe_clean(self) -> None:
         if not self.world.is_master:
             return
-        for idx in self.runs.used_idxs:
+        for idx in self.multi_run_manager.used_idxs:
             if self.managers[idx] is None:
                 continue
             self.managers[idx].maybe_clean()

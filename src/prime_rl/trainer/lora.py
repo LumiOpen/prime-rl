@@ -4,11 +4,11 @@ from typing import Dict, List
 import torch
 import torch.nn as nn
 
-from prime_rl.trainer.config import LoRAConfig
+from prime_rl.configs.trainer import LoRAConfig
 from prime_rl.trainer.models.layers.lora import MultiLoRALinear, MultiLoRAModule
 from prime_rl.trainer.models.layers.lora.multi_moe import MultiLoRAGroupedExperts
 from prime_rl.trainer.models.layers.moe import GroupedExperts
-from prime_rl.trainer.runs import get_runs
+from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.utils.logger import get_logger
 
 
@@ -137,7 +137,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
         config: LoRA configuration
     """
     logger = get_logger()
-    n_loras = get_runs().max_runs
+    n_loras = get_multi_run_manager().max_runs
 
     from torch.distributed.fsdp import FSDPModule
 
@@ -185,7 +185,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
             )
             continue
 
-        lora_module.register_with_runs(get_runs(), module_name)
+        lora_module.register_with_runs(get_multi_run_manager(), module_name)
         _set_module_by_name(model, module_name, lora_module)
 
     freeze_all_except_lora_and_specified(model, config)
@@ -234,14 +234,16 @@ def clean_lora_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torc
     return clean_state_dict
 
 
-def save_lora_config(config: LoRAConfig, model: nn.Module, save_path) -> None:
+def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropout: float) -> None:
     """
     Save LoRA configuration as JSON for adapter portability.
 
     Args:
-        config: LoRA configuration to save
         model: Model with LoRA layers to introspect
         save_path: Path object or string pointing to directory where adapter_config.json will be saved
+        rank: LoRA rank
+        alpha: LoRA alpha scaling parameter
+        dropout: LoRA dropout rate
     """
     import json
     from pathlib import Path
@@ -266,9 +268,9 @@ def save_lora_config(config: LoRAConfig, model: nn.Module, save_path) -> None:
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
         "base_model_name_or_path": model.config._name_or_path,
-        "r": config.rank,
-        "lora_alpha": config.alpha,
-        "lora_dropout": config.dropout,
+        "r": rank,
+        "lora_alpha": alpha,
+        "lora_dropout": dropout,
         "bias": "none",
         "target_modules": sorted(list(target_modules)),
         "modules_to_save": sorted(list(modules_to_save)) if modules_to_save else None,

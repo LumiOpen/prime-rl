@@ -3,6 +3,7 @@ import pickle
 import shutil
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,8 @@ from rich import print as rich_print
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
-from torch import Tensor
+from torch import Tensor, nn
+from torch.distributed.tensor import DTensor
 from transformers.tokenization_utils import PreTrainedTokenizer
 
 from prime_rl.trainer.world import get_world
@@ -23,6 +25,62 @@ from prime_rl.utils.pathing import get_ckpt_dir
 from prime_rl.utils.utils import format_num, format_time, get_step_path
 
 DEFAULT_TIMEOUT = timedelta(seconds=600)
+
+
+def _to_local_tensor(tensor: Tensor | DTensor) -> Tensor:
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+
+def count_zero_gradient_elements(parameters: Iterable[nn.Parameter]) -> tuple[Tensor, Tensor]:
+    """Count zero-gradient parameter elements on the local distributed shards.
+
+    Parameters that require gradients but did not receive one in the current step
+    are counted as fully zero. This makes inactive MoE experts visible in the
+    metric instead of silently dropping them from the count.
+    """
+
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    num_zeros = torch.zeros((), dtype=torch.long, device=device)
+    num_tracked = torch.zeros((), dtype=torch.long, device=device)
+
+    for param in parameters:
+        if not param.requires_grad:
+            continue
+
+        local_param = _to_local_tensor(param.detach())
+        if local_param.numel() == 0:
+            continue
+
+        if local_param.device != num_zeros.device:
+            num_zeros = num_zeros.to(local_param.device)
+            num_tracked = num_tracked.to(local_param.device)
+
+        local_numel = torch.tensor(local_param.numel(), dtype=torch.long, device=local_param.device)
+        num_tracked += local_numel
+
+        if param.grad is None:
+            num_zeros += local_numel
+            continue
+
+        local_grad = _to_local_tensor(param.grad.detach())
+        if local_grad.numel() != local_param.numel():
+            raise ValueError("Local gradient shape does not match the local parameter shape")
+
+        num_zeros += local_numel - torch.count_nonzero(local_grad)
+
+    return num_zeros, num_tracked
+
+
+def get_zero_gradient_ratio(parameters: Iterable[nn.Parameter], dp_replicate: int = 1) -> float:
+    num_zero_grad, num_grad_elements = count_zero_gradient_elements(parameters)
+    dist.all_reduce(num_zero_grad, op=dist.ReduceOp.SUM)
+    dist.all_reduce(num_grad_elements, op=dist.ReduceOp.SUM)
+    if dp_replicate > 1:
+        num_zero_grad = torch.div(num_zero_grad, dp_replicate, rounding_mode="floor")
+        num_grad_elements = torch.div(num_grad_elements, dp_replicate, rounding_mode="floor")
+    return (num_zero_grad.float() / num_grad_elements.clamp_min(1).float()).item()
 
 
 def get_ckpt_disk_metrics(output_dir: Path) -> dict[str, float]:
@@ -45,7 +103,8 @@ def get_ckpt_disk_metrics(output_dir: Path) -> dict[str, float]:
 
 
 def setup_torch_distributed(timeout: timedelta = DEFAULT_TIMEOUT, enable_gloo: bool = False):
-    torch.cuda.set_device(get_world().local_rank)
+    device_id = get_world().local_rank
+    torch.cuda.set_device(device_id)
     # Use Gloo backend for CPU and NCCL for GPU when CPU offloading is enabled
     # Otherwise use NCCL for better GPU performance
     backend = None  # by default nccl
@@ -53,7 +112,7 @@ def setup_torch_distributed(timeout: timedelta = DEFAULT_TIMEOUT, enable_gloo: b
         get_logger().info("Using Gloo backend for CPU and NCCL backend for GPU")
         backend = "cpu:gloo,cuda:nccl"
 
-    dist.init_process_group(backend=backend, timeout=timeout)
+    dist.init_process_group(backend=backend, timeout=timeout, device_id=device_id)
 
 
 def get_response_lengths(position_ids: torch.Tensor) -> list[int]:

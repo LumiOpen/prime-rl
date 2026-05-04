@@ -187,7 +187,7 @@ class LlamaModel(LlamaPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
-        if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3"):
+        if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3", "fa4"):
             flat_position_ids = position_ids.view(-1)
             seqlens = torch.cat(
                 [
@@ -222,7 +222,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
 @auto_docstring
 class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
@@ -248,15 +248,15 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        temperature: Optional[float] = 1.0,
+        temperature: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> PrimeLmOutput:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels used by PrimeRL's wrapped LM head to optionally compute per-token logprobs/entropy.
             If not provided, the wrapped LM head returns logits only.
-        temperature (`float`, *optional*, defaults to 1.0):
-            Temperature used for the logprobs/entropy computation when `labels` are provided.
+        temperature (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Per-token temperatures for logprobs/entropy computation when `labels` are provided.
 
         Example:
 
@@ -307,3 +307,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
                 rotary_emb.config, rotary_emb.inv_freq.device
             )
             rotary_emb.inv_freq.copy_(inv_freq)
+            # LongRoPE models store original_inv_freq for frequency updates;
+            # FSDP leaves it on the meta device, so materialise it here.
+            if hasattr(rotary_emb, "original_inv_freq") and rotary_emb.original_inv_freq.is_meta:
+                rotary_emb.original_inv_freq = inv_freq.clone()

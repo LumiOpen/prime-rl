@@ -1,7 +1,7 @@
 import pickle
 import time
 from pathlib import Path
-from typing import Generator, cast
+from typing import Callable, Generator, cast
 
 import torch
 import torch.nn as nn
@@ -10,15 +10,16 @@ from torch.distributed.tensor import DTensor
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 
+from prime_rl.configs.trainer import NCCLWeightBroadcastConfig
 from prime_rl.trainer.models import PreTrainedModelPrimeRL
 from prime_rl.trainer.rl.broadcast.base import WeightBroadcast
-from prime_rl.trainer.rl.config import NCCLWeightBroadcastConfig
-from prime_rl.trainer.runs import get_runs
+from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.utils import get_world
 from prime_rl.trainer.weights import get_max_layer_num
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.pathing import sync_wait_for_path
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
+from prime_rl.utils.vlm import get_layer_prefix
 
 NCCL_READY_MARKER = "NCCL_READY"
 
@@ -67,20 +68,44 @@ def broadcast_state_dict(state_dict: dict[str, Tensor], communicator: PyNcclComm
 
 
 def filter_state_dict_by_layers(
-    state_dict: dict[str, torch.Tensor], num_layers: int
+    state_dict: dict[str, torch.Tensor], num_layers: int, layer_prefix: str
 ) -> Generator[tuple[int, dict[str, torch.Tensor]], None, None]:
-    """Yield a generator of state dicts for each layer as well as the remaining weights."""
-    yield 0, {key: value for key, value in state_dict.items() if "model.layers" not in key}
+    """Yield non-layer weights first, then each layer's weights.
 
-    for i in range(1, num_layers + 1):  # +1 because layer indices start from 1
+    Yields (layer_idx, layer_state_dict) where layer_idx is -1 for the non-layer
+    dict and the actual layer index (0, 1, ...) for layer dicts.
+    """
+    yield -1, {key: value for key, value in state_dict.items() if not key.startswith(layer_prefix)}
+
+    for i in range(num_layers):
         yield (
             i,
-            {
-                key: value
-                for key, value in state_dict.items()
-                if key.startswith(f"model.layers.{i}.") or key == f"model.layers.{i}"
-            },
+            {key: value for key, value in state_dict.items() if key.startswith(f"{layer_prefix}{i}.")},
         )
+
+
+def preprocess_layer_checkpoint(
+    model: nn.Module,
+    layer_state_dict: dict[str, Tensor],
+    layer_idx: int,
+) -> dict[str, Tensor]:
+    if isinstance(model, PreTrainedModelPrimeRL) and model.is_prime_state_dict(layer_state_dict):
+        model.convert_layer_to_hf(layer_state_dict, layer_idx)
+        return layer_state_dict
+
+    from transformers.core_model_loading import revert_weight_conversion
+
+    return revert_weight_conversion(model, layer_state_dict)
+
+
+def preprocess_layer_quantized(
+    model: nn.Module,
+    layer_state_dict: dict[str, Tensor],
+    layer_idx: int,
+) -> dict[str, Tensor]:
+    if layer_idx < 0:
+        return layer_state_dict
+    return model.convert_layer_to_vllm_kernel(layer_state_dict, layer_idx, quantize_fp8=True)
 
 
 class NCCLWeightBroadcastSender:
@@ -93,10 +118,12 @@ class NCCLWeightBroadcastSender:
         device: int | str | torch.device,
         timeout: int,
         dtype: torch.dtype = torch.bfloat16,
+        quantize_in_weight_transfer: bool = False,
     ):
         self.logger = get_logger()
         self.world = get_world()
         self.dtype = dtype
+        self.quantize_in_weight_transfer = quantize_in_weight_transfer
 
         if self.world.is_master:
             # Trainer is on rank 0 in process group with all inference GPUs
@@ -112,26 +139,31 @@ class NCCLWeightBroadcastSender:
     def broadcast_weights(self, model: nn.Module, step: int) -> None:
         """Broadcast the state dict of a model into the inference pool using NCCL."""
         state_dict = model.state_dict()
-        num_layers = get_max_layer_num(state_dict)
+        layer_prefix = get_layer_prefix(model.config)
+        num_layers = get_max_layer_num(state_dict, layer_prefix)
         num_state_dict_to_send = num_layers + 1  # we send all layer plus the remaining weights
 
         if self.world.is_master:
             broadcast_integer(num_state_dict_to_send, self.communicator)
 
         self.logger.debug(f"Broadcasting {num_state_dict_to_send} layer state dicts")
+        preprocess_fn: Callable[[nn.Module, dict[str, Tensor], int], dict[str, Tensor]]
+        if self.quantize_in_weight_transfer:
+            preprocess_fn = preprocess_layer_quantized
+        else:
+            preprocess_fn = preprocess_layer_checkpoint
 
-        for layer_id, state_dict in filter_state_dict_by_layers(state_dict, num_layers):
-            for key, value in list(state_dict.items()):
-                if isinstance(value, DTensor):
-                    value = cast(DTensor, value.to(self.dtype)).full_tensor()
-                state_dict[key] = value
-
-            # Convert PrimeRL format to HF format for this layer if needed
-            if isinstance(model, PreTrainedModelPrimeRL) and model.is_prime_state_dict(state_dict):
-                model.convert_layer_to_hf(state_dict, layer_id)
-
+        for layer_id, layer_state_dict in filter_state_dict_by_layers(state_dict, num_layers, layer_prefix):
+            layer_state_dict = self._resolve_dtensors(layer_state_dict)
+            layer_state_dict = preprocess_fn(model, layer_state_dict, layer_id)
             if self.world.is_master:
-                broadcast_state_dict(state_dict, self.communicator)
+                broadcast_state_dict(layer_state_dict, self.communicator)
+
+    def _resolve_dtensors(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        for key, value in list(state_dict.items()):
+            if isinstance(value, DTensor):
+                state_dict[key] = cast(DTensor, value.to(self.dtype)).full_tensor()
+        return state_dict
 
 
 class NCCLWeightBroadcast(WeightBroadcast):
@@ -147,9 +179,16 @@ class NCCLWeightBroadcast(WeightBroadcast):
         super().__init__(output_dir)
         self.logger = get_logger()
         self.world = get_world()
-        self.runs = get_runs()
+        self.multi_run_manager = get_multi_run_manager()
         self.nccl_broadcast_sender = NCCLWeightBroadcastSender(
-            config.host, config.port, 0, config.inference_world_size + 1, device, config.timeout, dtype
+            config.host,
+            config.port,
+            0,
+            config.inference_world_size + 1,
+            device,
+            config.timeout,
+            dtype,
+            quantize_in_weight_transfer=config.quantize_in_weight_transfer,
         )
 
     @torch.no_grad()
@@ -173,13 +212,14 @@ class NCCLWeightBroadcast(WeightBroadcast):
         """
         notified_runs: list[tuple[int, Path]] = []
         if self.world.is_master:
-            for idx in self.runs.used_idxs:
-                if not self.runs.ready_to_update[idx]:
+            for idx in self.multi_run_manager.used_idxs:
+                if not self.multi_run_manager.ready_to_update[idx]:
                     continue
 
                 try:
                     save_dir = get_step_path(
-                        get_broadcast_dir(self.runs.get_run_dir(idx)), self.runs.progress[idx].step
+                        get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
+                        self.multi_run_manager.progress[idx].step,
                     )
                     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -191,7 +231,7 @@ class NCCLWeightBroadcast(WeightBroadcast):
                 except Exception as e:
                     self.logger.error(f"Error broadcasting weights for run {idx}: {e}")
                 finally:
-                    self.runs.ready_to_update[idx] = False
+                    self.multi_run_manager.ready_to_update[idx] = False
         return notified_runs
 
     def _wait_for_nccl_ready(self, notified_runs: list[tuple[int, Path]]):

@@ -202,13 +202,14 @@ class TokenChoiceTopKRouter(nn.Module):
         self.route_scale = route_scale
 
     def forward(
-        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
+        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None, routed_experts: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x (torch.Tensor): Input tensor with shape ``(bs*slen, dim)``.
             expert_bias (torch.Tensor | None, optional): Optional bias tensor for experts with shape ``(num_experts,)``.
                 Used for load balancing. Defaults to None.
+            routed_experts (torch.Tensor | None, optional): Optional tensor with shape ``(bs * slen, top_k)``.
 
         Returns:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -220,6 +221,9 @@ class TokenChoiceTopKRouter(nn.Module):
                     Number of tokens assigned to each expert with shape ``(num_experts,)``.
         """
         # scores shape (bs*slen, num_experts)
+        assert routed_experts is None or routed_experts.shape[-1] == self.top_k, (
+            f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
+        )
         scores = self.gate(x)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
@@ -233,7 +237,11 @@ class TokenChoiceTopKRouter(nn.Module):
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
-        if expert_bias is not None:
+
+        if routed_experts is not None:
+            top_scores = scores.gather(dim=1, index=routed_experts)
+            selected_experts_indices = routed_experts
+        elif expert_bias is not None:
             _, selected_experts_indices = torch.topk(scores + expert_bias, k=self.top_k, dim=1)
             top_scores = scores.gather(dim=1, index=selected_experts_indices)
         else:
@@ -246,7 +254,7 @@ class TokenChoiceTopKRouter(nn.Module):
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
         num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
+            selected_experts_indices.reshape(-1),
             bins=self.num_experts,
             min=0,
             max=self.num_experts,
@@ -296,8 +304,9 @@ class TokenReorderer(nn.Module):
                 - num_tokens_per_expert: Number of tokens assigned to each expert
         """
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
+        selected_experts_indices = selected_experts_indices.reshape(-1)
         num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
+            selected_experts_indices,
             bins=self.num_experts,
             min=0,
             max=self.num_experts,
@@ -305,7 +314,7 @@ class TokenReorderer(nn.Module):
 
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
-        token_indices_experts_sorted = torch.argsort(selected_experts_indices.view(-1), stable=True)
+        token_indices_experts_sorted = torch.argsort(selected_experts_indices, stable=True)
 
         top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
         token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
@@ -322,11 +331,6 @@ class MoE(nn.Module):
         super().__init__()
 
         num_experts = moe_args.num_experts
-        if torch.cuda.is_available():
-            cc_major, _ = torch.cuda.get_device_capability()
-            # As of PyTorch 2.9, grouped_mm is supported on Hopper and Blackwell.
-            if cc_major < 9:
-                moe_args.use_grouped_mm = False
         self.experts = GroupedExperts(
             dim=dim,
             hidden_dim=hidden_dim,
@@ -371,10 +375,11 @@ class MoE(nn.Module):
             persistent=False,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, routed_experts: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): Input tensor with shape ``(bs, slen, dim)``.
+            routed_experts (torch.Tensor | None, optional): Optional tensor with shape ``(bs, slen, top_k)``.
 
         Returns:
             out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.
@@ -382,13 +387,19 @@ class MoE(nn.Module):
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
 
+        if routed_experts is not None:
+            _, _, top_k = routed_experts.shape
+            routed_experts = routed_experts.reshape(
+                -1, top_k
+            )  # we have to reshape here because the original is non-contiguous
+
         # top_scores and selected_experts_indices shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
         (
             top_scores,
             selected_experts_indices,
             num_tokens_per_expert,
-        ) = self.router(x, self.expert_bias)
+        ) = self.router(x, self.expert_bias, routed_experts=routed_experts)
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # and also to count the expert usage
@@ -446,6 +457,285 @@ class MoE(nn.Module):
         self.router.init_weights(init_std)
         if self.shared_expert is not None:
             self.shared_expert.init_weights(init_std)
+
+        with torch.device(buffer_device):
+            self.tokens_per_expert = torch.zeros(self.experts.num_experts, dtype=torch.float32)
+            if self.load_balance_coeff is not None:
+                self.expert_bias = torch.zeros(self.experts.num_experts, dtype=torch.float32)
+
+
+def relu2(x: torch.Tensor) -> torch.Tensor:
+    return F.relu(x).square()
+
+
+@expert_parallel
+def _run_nongated_experts_for_loop(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    _w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    num_tokens_per_expert = num_tokens_per_expert.tolist()
+    num_padding = x.shape[0] - sum(num_tokens_per_expert)
+
+    x = torch.split(
+        x[: sum(num_tokens_per_expert)],
+        split_size_or_sections=num_tokens_per_expert,
+        dim=0,
+    )
+    out_experts_splits = []
+    for expert_idx, x_expert in enumerate(x):
+        h = relu2(torch.matmul(x_expert, w1[expert_idx].transpose(-2, -1)))
+        h = torch.matmul(h, w2[expert_idx].transpose(-2, -1))
+        out_experts_splits.append(h)
+    out = torch.cat(out_experts_splits, dim=0)
+    out = torch.vstack((out, out.new_zeros((num_padding, out.shape[-1]))))
+    return out
+
+
+@expert_parallel
+def _run_nongated_experts_grouped_mm(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    _w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    assert x.dim() == 2
+
+    h = relu2(torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets))
+    out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
+    return out
+
+
+class NonGatedGroupedExperts(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        intermediate_dim: int,
+        num_experts: int,
+        use_grouped_mm: bool,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.w1 = nn.Parameter(torch.empty(num_experts, intermediate_dim, input_dim))
+        self.w2 = nn.Parameter(torch.empty(num_experts, input_dim, intermediate_dim))
+        # Dummy w3 for @expert_parallel decorator compatibility (expects w1, w2, w3 signature)
+        self.w3 = nn.Parameter(torch.empty(0))
+        self.use_grouped_mm = use_grouped_mm
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.use_grouped_mm:
+            return _run_nongated_experts_grouped_mm(self.w1, self.w2, self.w3, x, num_tokens_per_expert)
+        else:
+            return _run_nongated_experts_for_loop(self.w1, self.w2, self.w3, x, num_tokens_per_expert)
+
+    def init_weights(self, init_std: float):
+        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.w2, mean=0.0, std=init_std)
+
+
+class NemotronHRouter(nn.Module):
+    """Sigmoid router with group-based expert selection and e_score_correction_bias.
+
+    Follows the DeepseekV3 routing pattern: sigmoid scoring, group-based top-k selection,
+    and bias correction for load balancing.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_experts: int,
+        top_k: int,
+        n_group: int,
+        topk_group: int,
+        norm_topk_prob: bool,
+    ):
+        super().__init__()
+        self.gate = nn.Parameter(torch.empty(num_experts, dim))
+        self.register_buffer("e_score_correction_bias", torch.zeros(num_experts))
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.n_group = n_group
+        self.topk_group = topk_group
+        self.norm_topk_prob = norm_topk_prob
+
+    def forward(
+        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        scores = F.linear(x.float(), self.gate.float()).sigmoid()
+        scores_for_choice = scores + self.e_score_correction_bias
+
+        if expert_bias is not None:
+            scores_for_choice = scores_for_choice + expert_bias
+
+        # Group-based routing
+        if self.n_group > 1:
+            group_scores = (
+                scores_for_choice.view(-1, self.n_group, self.num_experts // self.n_group)
+                .topk(2, dim=-1)[0]
+                .sum(dim=-1)
+            )
+            group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+            group_mask = torch.zeros_like(group_scores)
+            group_mask.scatter_(1, group_idx, 1)
+            score_mask = (
+                group_mask.unsqueeze(-1)
+                .expand(-1, self.n_group, self.num_experts // self.n_group)
+                .reshape(-1, self.num_experts)
+            )
+            scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+
+        selected_experts_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+        top_scores = scores.gather(1, selected_experts_indices)
+
+        if self.norm_topk_prob:
+            denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
+            top_scores = top_scores / denominator
+
+        num_tokens_per_expert = torch.histc(
+            selected_experts_indices.reshape(-1).float(),
+            bins=self.num_experts,
+            min=0,
+            max=self.num_experts,
+        )
+
+        return top_scores, selected_experts_indices, num_tokens_per_expert
+
+    def init_weights(self, init_std: float):
+        nn.init.trunc_normal_(self.gate, mean=0.0, std=init_std)
+
+
+class BCNonGatedFeedForward(nn.Module):
+    """Non-gated feed-forward network used as the shared expert in NemotronH.
+
+    Uses relu2 activation: down_proj(relu2(up_proj(x))).
+    """
+
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(relu2(self.up_proj(x)))
+
+
+class LatentMoE(nn.Module):
+    """NemotronH-style Mixture of Experts with latent projections.
+
+    The input is projected to a latent space before expert computation,
+    and the output is projected back. Experts use relu2 activation without gating.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        latent_dim: int | None,
+        moe_intermediate_size: int,
+        shared_expert_intermediate_size: int,
+        num_experts: int,
+        top_k: int,
+        n_group: int,
+        topk_group: int,
+        norm_topk_prob: bool,
+        routed_scaling_factor: float,
+        use_grouped_mm: bool,
+        load_balance_coeff: float | None,
+    ):
+        super().__init__()
+        effective_latent_dim = latent_dim if latent_dim is not None else dim
+
+        self.router = NemotronHRouter(
+            dim=dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            norm_topk_prob=norm_topk_prob,
+        )
+        self.experts = NonGatedGroupedExperts(
+            input_dim=effective_latent_dim,
+            intermediate_dim=moe_intermediate_size,
+            num_experts=num_experts,
+            use_grouped_mm=use_grouped_mm,
+        )
+        self.reorderer = TokenReorderer(num_experts=num_experts, top_k=top_k)
+        self.shared_expert = BCNonGatedFeedForward(dim=dim, hidden_dim=shared_expert_intermediate_size)
+
+        if latent_dim is not None:
+            self.fc1_latent_proj = nn.Linear(dim, latent_dim, bias=False)
+            self.fc2_latent_proj = nn.Linear(latent_dim, dim, bias=False)
+        else:
+            self.fc1_latent_proj = nn.Identity()
+            self.fc2_latent_proj = nn.Identity()
+
+        self.routed_scaling_factor = routed_scaling_factor
+        self.load_balance_coeff = load_balance_coeff
+        if self.load_balance_coeff is not None:
+            assert self.load_balance_coeff > 0.0
+            self.register_buffer(
+                "expert_bias",
+                torch.zeros(num_experts, dtype=torch.float32),
+                persistent=True,
+            )
+        else:
+            self.expert_bias = None
+        self.register_buffer(
+            "tokens_per_expert",
+            torch.zeros(num_experts, dtype=torch.float32),
+            persistent=False,
+        )
+
+    def forward(self, x: torch.Tensor, routed_experts: torch.Tensor | None = None) -> torch.Tensor:
+        bs, slen, dim = x.shape
+        x_flat = x.view(-1, dim)
+
+        top_scores, selected_experts_indices, num_tokens_per_expert = self.router(x_flat, self.expert_bias)
+
+        with torch.no_grad():
+            self.tokens_per_expert.add_(num_tokens_per_expert)
+
+        (
+            top_scores_experts_sorted,
+            token_indices_experts_sorted,
+            num_tokens_per_expert,
+        ) = self.reorderer(top_scores, selected_experts_indices)
+
+        token_indices_expanded = token_indices_experts_sorted.reshape(-1, 1).expand(-1, dim)
+        routed_input = torch.gather(x_flat, dim=0, index=token_indices_expanded)
+
+        # Apply latent projection before expert computation
+        routed_input = self.fc1_latent_proj(routed_input)
+
+        routed_output = self.experts(routed_input, num_tokens_per_expert)
+
+        # Apply scores after expert computation (matches vLLM's fused kernel behavior)
+        routed_output = (routed_output.float() * top_scores_experts_sorted.reshape(-1, 1)).to(routed_output.dtype)
+
+        # Apply routed_scaling_factor after expert output
+        routed_output = routed_output * self.routed_scaling_factor
+
+        # Project back from latent space
+        routed_output = self.fc2_latent_proj(routed_output)
+
+        # Shared expert
+        out = self.shared_expert(x_flat)
+
+        token_indices_full = token_indices_experts_sorted.reshape(-1, 1).expand(-1, dim)
+        out = out.scatter_add(dim=0, index=token_indices_full, src=routed_output)
+        out = out.reshape(bs, slen, dim)
+        return out
+
+    def init_weights(self, init_std: float, buffer_device: torch.device):
+        self.experts.init_weights(init_std)
+        self.router.init_weights(init_std)
 
         with torch.device(buffer_device):
             self.tokens_per_expert = torch.zeros(self.experts.num_experts, dtype=torch.float32)
