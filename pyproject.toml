@@ -33,6 +33,8 @@ dependencies = [
     "torchtitan",
     "verifiers",
     "dion",
+    "flash-attn>=2.8.3",
+    "amdsmi",
 ]
 
 [project.scripts]
@@ -76,23 +78,24 @@ dev = [
 
 
 [tool.uv]
+no-build-isolation-package = ["flash-attn"]
 preview = true
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 override-dependencies = [
-    "torch==2.10.0+rocm7.0",
-    "torchvision==0.25.0+rocm7.0",
+    "torch==2.11.0+rocm7.2",
+    "torchvision==0.26.0+rocm7.2",
     "triton-rocm==3.6.0",
     "transformers>=5.1.0.dev0",
 ]
 
 [tool.uv.sources]
+amdsmi = { path = "/shared_silo/scratch/kahakala/lib/prime-rl-fresh/amd_smi" }
 torch = { index = "pytorch-rocm" }
-torchvision = { index = "pytorch-rocm" }
+torchvision = {index = "pytorch-rocm"}
 triton-rocm = { index = "pytorch-rocm" }
-flash-attn = { path = "/shared_silo/scratch/prime-rl/wheels/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl" }
-vllm = { path = "/shared_silo/scratch/prime-rl/wheels/vllm-0.17.0+rocm700-cp312-cp312-linux_x86_64.whl" }
+vllm = { path = "/shared_silo/scratch/kahakala/lib/wheels/vllm-0.17.0+rocm722-cp312-cp312-linux_x86_64.whl" }
 verifiers = { git = "https://github.com/PrimeIntellect-ai/verifiers.git", rev = "0db45e6" }
 torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "a1fdd7e" }
 dion = { git = "https://github.com/samsja/dion.git", rev = "d891eeb" }
@@ -118,7 +121,7 @@ explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-rocm"
-url = "https://download.pytorch.org/whl/rocm7.0"
+url = "https://download.pytorch.org/whl/rocm7.2"
 explicit = true
 
 
