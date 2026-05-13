@@ -3,26 +3,27 @@ import copy
 from prime_rl.transport.types import MicroBatch, TrainingSample
 
 
-def prepare_sample(
-    training_example: TrainingSample,
-    seq_len: int,
-    temperature: float,
-) -> MicroBatch:
+def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch:
     """
     Prepare a problem for sequence packing training.
     Tokenize and prepare tensors.
     """
-    # Prepare input_ids, loss_mask, position_ids, inference_logprobs, and advantages
     input_ids = training_example.prompt_ids + training_example.completion_ids
     loss_mask = training_example.prompt_mask + training_example.completion_mask
-    # Inference logprobs only cover completion tokens, so prepend zeros for prompt tokens
     inference_logprobs = [0.0] * len(training_example.prompt_ids) + training_example.completion_logprobs
     advantages = [training_example.advantage] * len(input_ids)
     position_ids = list(range(len(input_ids)))
+    mm_token_type_ids = training_example.mm_token_type_ids
+
+    # Per-token temperatures: prompt tokens use first completion temp (masked out anyway)
+    # Default to 1.0 if completion is empty (e.g., model generated only tool calls with no text)
+    prompt_temp = training_example.completion_temperatures[0] if training_example.completion_temperatures else 1.0
+    temperatures = [prompt_temp] * len(training_example.prompt_ids) + training_example.completion_temperatures
 
     # Teacher logprobs already cover the full sequence (prompt + completion),
     # computed via prefill in the orchestrator when a teacher model is configured
     teacher_logprobs = training_example.teacher_logprobs
+    routed_experts = training_example.routed_experts
 
     if len(input_ids) > seq_len:
         input_ids = input_ids[:seq_len]
@@ -30,8 +31,13 @@ def prepare_sample(
         inference_logprobs = inference_logprobs[:seq_len]
         position_ids = position_ids[:seq_len]
         advantages = advantages[:seq_len]
+        temperatures = temperatures[:seq_len]
         if teacher_logprobs is not None:
             teacher_logprobs = teacher_logprobs[:seq_len]
+        if routed_experts is not None:
+            routed_experts = routed_experts[:seq_len]
+        if mm_token_type_ids is not None:
+            mm_token_type_ids = mm_token_type_ids[:seq_len]
 
     assert (
         len(input_ids)
@@ -39,11 +45,23 @@ def prepare_sample(
         == len(loss_mask)
         == len(position_ids)
         == len(inference_logprobs)
+        == len(temperatures)
     ), (
-        f"input_ids: {len(input_ids)}, advantages: {len(advantages)}, loss_mask: {len(loss_mask)}, position_ids: {len(position_ids)}, inference_logprobs: {len(inference_logprobs)}"
+        f"input_ids: {len(input_ids)}, advantages: {len(advantages)}, loss_mask: {len(loss_mask)}, position_ids: {len(position_ids)}, inference_logprobs: {len(inference_logprobs)}, temperatures: {len(temperatures)}"
     )
     if teacher_logprobs is not None:
         assert len(teacher_logprobs) == len(input_ids), f"teacher_logprobs: {len(teacher_logprobs)}"
+
+    if routed_experts is not None:
+        assert len(routed_experts) == len(input_ids), (
+            f"routed_experts: {len(routed_experts)}, input_ids: {len(input_ids)}"
+        )
+
+    if mm_token_type_ids is not None:
+        assert len(mm_token_type_ids) == len(input_ids), (
+            f"mm_token_type_ids: {len(mm_token_type_ids)}, input_ids: {len(input_ids)}"
+        )
+
     return MicroBatch(
         input_ids=input_ids,
         advantages=advantages,
@@ -51,8 +69,20 @@ def prepare_sample(
         position_ids=position_ids,
         inference_logprobs=inference_logprobs,
         teacher_logprobs=teacher_logprobs,
-        temperature=temperature,
+        temperatures=temperatures,
+        routed_experts=routed_experts,
+        mm_token_type_ids=mm_token_type_ids,
+        # Multimodal fields (Qwen3-VL) - passed through without modification
+        pixel_values=training_example.pixel_values,
+        pixel_values_shape=training_example.pixel_values_shape,
+        image_grid_thw=training_example.image_grid_thw,
+        sft_loss=training_example.sft_loss,
     )
+
+
+def _is_multimodal_sample(sample: MicroBatch) -> bool:
+    """Check if a sample contains multimodal data (images)."""
+    return sample.pixel_values is not None
 
 
 def packed_samples_into_micro_bs(
@@ -61,25 +91,52 @@ def packed_samples_into_micro_bs(
     """
     Pack samples into micro_batch efficiently.
     We follow the First Fit Decreasing algorithm to pack the samples into bins and minimize potential padding while never truncating.
+    With per-token temperatures, samples can be packed together regardless of their temperature values.
+
+    NOTE: Multimodal samples (with pixel_values) are NOT packed together as they have variable-sized
+    vision data that doesn't pack well. Each multimodal sample becomes its own micro batch.
     """
+    # Sort by (lora_idx, -length) for packing efficiency
     samples.sort(key=lambda x: (x[0], -len(x[1].input_ids)))
 
     ## we create bins
     micro_batches: list[MicroBatch] = []
 
     for idx, sample in samples:
-        # Try to find a bin that can fit this sequence
+        # Multimodal samples cannot be packed - each becomes its own micro batch
+        if _is_multimodal_sample(sample):
+            sample.lora_num_tokens = [0] * num_loras
+            sample.lora_num_tokens[idx] = len(sample.input_ids)
+            micro_batches.append(sample)
+            continue
+
+        # Try to find a bin that can fit this sequence (only pack text-only samples)
         for bin_content in micro_batches:
+            # Don't pack into multimodal micro batches
+            if _is_multimodal_sample(bin_content):
+                continue
             # Check if sequence fits in this bin
-            if len(bin_content.input_ids) + len(sample.input_ids) <= max_seq_len:
+            if (
+                len(bin_content.input_ids) + len(sample.input_ids) <= max_seq_len
+                and bin_content.sft_loss == sample.sft_loss
+            ):
                 bin_content.input_ids.extend(sample.input_ids)
                 bin_content.loss_mask.extend(sample.loss_mask)
                 bin_content.advantages.extend(sample.advantages)
                 bin_content.inference_logprobs.extend(sample.inference_logprobs)
+                bin_content.temperatures.extend(sample.temperatures)
                 if sample.teacher_logprobs is not None:
                     if bin_content.teacher_logprobs is None:
                         bin_content.teacher_logprobs = []
                     bin_content.teacher_logprobs.extend(sample.teacher_logprobs)
+                if sample.routed_experts is not None:
+                    if bin_content.routed_experts is None:
+                        bin_content.routed_experts = []
+                    bin_content.routed_experts.extend(sample.routed_experts)
+                if sample.mm_token_type_ids is not None:
+                    if bin_content.mm_token_type_ids is None:
+                        bin_content.mm_token_type_ids = []
+                    bin_content.mm_token_type_ids.extend(sample.mm_token_type_ids)
                 bin_content.position_ids.extend(sample.position_ids)
                 bin_content.lora_num_tokens[idx] += len(sample.input_ids)
                 break
@@ -112,18 +169,38 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.loss_mask.extend([False] * padding_size)
     micro_batch.position_ids.extend(list(range(padding_size)))
     micro_batch.inference_logprobs.extend([0.0] * padding_size)
+    # Use temperature 1.0 for padding tokens (doesn't matter since loss_mask is False)
+    micro_batch.temperatures.extend([1.0] * padding_size)
     if micro_batch.teacher_logprobs is not None:
         micro_batch.teacher_logprobs.extend([0.0] * padding_size)
     micro_batch.lora_num_tokens[-1] += (
         padding_size  # We send padding to the last lora so that tokens have ascending lora idx
     )
+    if micro_batch.mm_token_type_ids is not None:
+        micro_batch.mm_token_type_ids.extend([0] * padding_size)
 
     return micro_batch
 
 
+def _make_dummy_batch(source: MicroBatch) -> MicroBatch:
+    """Create a zero-loss dummy batch from an existing batch, preserving its modality."""
+    dummy = copy.deepcopy(source)
+    dummy.advantages = [0.0] * len(dummy.input_ids)
+    dummy.loss_mask = [False] * len(dummy.input_ids)
+    return dummy
+
+
+def _pad_group_for_distribution(group: list[MicroBatch], num_train_workers: int) -> list[MicroBatch]:
+    """Pad a group of micro batches so its length is divisible by num_train_workers."""
+    num_padding = -len(group) % num_train_workers
+    if num_padding > 0 and len(group) > 0:
+        dummy = _make_dummy_batch(group[0])
+        group.extend([dummy] * num_padding)
+    return group
+
+
 def prepare_batch(
     rollouts: list[TrainingSample],
-    temperature: float,
     seq_len: int,
     num_train_workers: int,
     idxs: list[int],
@@ -133,34 +210,34 @@ def prepare_batch(
     """
     Prepare a batch of problems for each GPU. Each batch is a list of micro batches.
     Each micro batch is shape [1, seq_len], the number of samples is not fixed per micro batch.
+
+    FSDP requires all ranks to execute the same operations at each step. If one rank
+    processes a multimodal batch (triggering the vision encoder) while another processes
+    a text-only batch, the all-gather will hang. We separate micro batches by modality
+    and distribute them so that at each step index, all ranks see the same modality.
     """
-    max_seq_len = seq_len
+    all_samples = [(idx, prepare_sample(rollout, seq_len)) for idx, rollout in zip(idxs, rollouts)]
 
-    all_samples = [(idx, prepare_sample(rollout, max_seq_len, temperature)) for idx, rollout in zip(idxs, rollouts)]
-
-    micro_batches = packed_samples_into_micro_bs(all_samples, max_seq_len, num_loras)
+    micro_batches = packed_samples_into_micro_bs(all_samples, seq_len, num_loras)
     micro_batches = [pad_micro_batch(micro_batch, pad_to_multiple_of) for micro_batch in micro_batches]
 
-    num_padding_batch = -len(micro_batches) % num_train_workers
+    # Separate by modality so each step index has uniform modality across all ranks
+    mm_batches = [b for b in micro_batches if _is_multimodal_sample(b)]
+    text_batches = [b for b in micro_batches if not _is_multimodal_sample(b)]
 
-    # because of fsdp we need to make sure that each data ran has the same number of micro batches otherwise training will hang.
-    # We create fake micro batches to fill the gap with real data but zero advantages, they would not contribute to the loss.
-    if num_train_workers > 1 and num_padding_batch > 0:
-        padded_batch = copy.deepcopy(micro_batches[0])
-        padded_batch.advantages = [0.0] * len(padded_batch.input_ids)
-        padded_batch.loss_mask = [False] * len(padded_batch.input_ids)
-        micro_batches.extend([padded_batch for _ in range(num_padding_batch)])
+    # Pad each group independently so its count is divisible by num_train_workers
+    mm_batches = _pad_group_for_distribution(mm_batches, num_train_workers)
+    text_batches = _pad_group_for_distribution(text_batches, num_train_workers)
 
-    assert len(micro_batches) % num_train_workers == 0, (
-        "Number of micro batches is not divisible by number of data ranks"
-    )
+    # Combine: all multimodal first, then all text-only. Since each group's length is
+    # divisible by num_train_workers, the modality boundary aligns with distribution rows.
+    ordered = mm_batches + text_batches
 
-    per_gpu_micro_batches = len(micro_batches) // num_train_workers
-    batches_per_gpu = []
-    for _ in range(num_train_workers):
-        batches = []
-        for _ in range(per_gpu_micro_batches):
-            batches.append(micro_batches.pop(0))
-        batches_per_gpu.append(batches)
+    assert len(ordered) % num_train_workers == 0, "Number of micro batches is not divisible by number of data ranks"
+
+    # Distribute in strided order so each step index has the same modality across ranks
+    batches_per_gpu: list[list[MicroBatch]] = [[] for _ in range(num_train_workers)]
+    for i, batch in enumerate(ordered):
+        batches_per_gpu[i % num_train_workers].append(batch)
 
     return batches_per_gpu

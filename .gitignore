@@ -5,6 +5,9 @@ configs/endpoints.py
 
 # Artifacts
 **/slurm
+!src/prime_rl/slurm
+!examples/slurm
+!docs/slurm.md
 **/torchrun
 **/weights
 **/checkpoints
@@ -196,3 +199,5 @@ debug_I2_zero_band
 .idea
 
 outputs/
+
+third_party/

@@ -1,12 +1,14 @@
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
-from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
+
 class AfmoeConfig(PretrainedConfig):
     """Configuration for AFMoE."""
+
     model_type = "afmoe"
+    attribute_map = {"num_local_experts": "num_experts"}
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
@@ -88,7 +90,8 @@ class AfmoeConfig(PretrainedConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention" if bool((i + 1) % global_attn_every_n_layers) else "full_attention" for i in range(self.num_hidden_layers)
+                "sliding_attention" if bool((i + 1) % global_attn_every_n_layers) else "full_attention"
+                for i in range(self.num_hidden_layers)
             ]
         layer_type_validation(self.layer_types)
 
@@ -102,7 +105,7 @@ class AfmoeConfig(PretrainedConfig):
         # Validate rope configs
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-        rope_config_validation(self)
+        self.standardize_rope_params()
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,

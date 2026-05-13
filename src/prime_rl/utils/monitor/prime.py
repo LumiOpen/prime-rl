@@ -1,34 +1,129 @@
 import asyncio
+import io
+import json
+import math
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
 from typing import Any
 
 import httpx
+import pyarrow as pa
+import pyarrow.parquet as pq
 import verifiers as vf
+from prime_cli.core.config import Config as PrimeConfig
 from transformers.tokenization_utils import PreTrainedTokenizer
 
-from prime_rl.utils.config import PrimeMonitorConfig
+from prime_rl.configs.shared import PrimeMonitorConfig
+from prime_rl.utils.config import BaseConfig
 from prime_rl.utils.logger import get_logger
-from prime_rl.utils.monitor.base import Monitor
-from prime_rl.utils.pydantic_config import BaseSettings
+from prime_rl.utils.monitor.base import Monitor, sample_items_for_logging
+
+
+def _json(val: Any) -> str:
+    """JSON-serialize dicts/lists, pass strings through, default to empty string for None."""
+    if isinstance(val, str):
+        return val
+    if val is None:
+        return ""
+    return json.dumps(val)
+
+
+_SAMPLE_SCHEMA = pa.schema(
+    [
+        ("run_id", pa.string()),
+        ("step", pa.int64()),
+        ("tag", pa.string()),
+        ("problem_id", pa.int64()),
+        ("sample_id", pa.int64()),
+        ("prompt", pa.string()),
+        ("completion", pa.string()),
+        ("trajectory", pa.string()),
+        ("answer", pa.string()),
+        ("env_name", pa.string()),
+        ("task", pa.string()),
+        ("info", pa.string()),
+        ("reward", pa.float64()),
+        ("advantage", pa.float64()),
+        ("metrics", pa.string()),
+        ("timing", pa.string()),
+        ("num_input_tokens", pa.int64()),
+        ("num_output_tokens", pa.int64()),
+        ("created_at", pa.timestamp("us", tz="UTC")),
+    ]
+)
+
+
+_DROPPED_JSON_VALUE = object()
+
+
+def _drop_non_finite_json_values(value: Any, dropped_paths: list[str], path: str = "") -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        dropped_paths.append(path)
+        return _DROPPED_JSON_VALUE
+
+    if isinstance(value, dict):
+        return {
+            key: sanitized_item
+            for key, item in value.items()
+            if (
+                sanitized_item := _drop_non_finite_json_values(
+                    item,
+                    dropped_paths,
+                    f"{path}.{key}" if path else str(key),
+                )
+            )
+            is not _DROPPED_JSON_VALUE
+        }
+
+    if isinstance(value, list):
+        return [
+            sanitized_item
+            for idx, item in enumerate(value)
+            if (sanitized_item := _drop_non_finite_json_values(item, dropped_paths, f"{path}[{idx}]"))
+            is not _DROPPED_JSON_VALUE
+        ]
+
+    return value
 
 
 class PrimeMonitor(Monitor):
     """Logs to Prime Intellect API."""
+
+    def _sanitize_json_payload(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Drop non-finite floats before sending JSON payloads to the public API."""
+        dropped_paths: list[str] = []
+        sanitized_payload = _drop_non_finite_json_values(payload, dropped_paths)
+        if not dropped_paths:
+            return payload
+
+        preview = ", ".join(dropped_paths[:5])
+        suffix = " ..." if len(dropped_paths) > 5 else ""
+        self.logger.warning(
+            f"Dropping {len(dropped_paths)} non-finite value(s) from Prime monitor {endpoint} payload: "
+            f"{preview}{suffix}"
+        )
+        return sanitized_payload
 
     def __init__(
         self,
         config: PrimeMonitorConfig | None,
         output_dir: Path | None = None,
         tokenizer: PreTrainedTokenizer | None = None,
-        run_config: BaseSettings | None = None,
+        run_config: BaseConfig | None = None,
+        keep_full_history: bool = True,
     ):
         self.config = config
         self.logger = get_logger()
         self.history: list[dict[str, Any]] = []
+        self._keep_full_history = keep_full_history
         self.output_dir = output_dir
+        self._registered = False
+        self._finalized = False
+        self._closed = False
+        self._owner_pid = os.getpid()
 
         rank = int(os.environ.get("RANK", os.environ.get("DP_RANK", "0")))
         self.enabled = self.config is not None
@@ -41,24 +136,36 @@ class PrimeMonitor(Monitor):
         assert config is not None
         self.logger.info(f"Initializing {self.__class__.__name__} ({config})")
 
-        # Get API key from environment variable
         api_key = os.getenv(config.api_key_var)
+        if api_key is None:
+            prime_config = PrimeConfig()
+            api_key = prime_config.api_key
+
         if not api_key:
             self.logger.warning(
-                f"API key not found. Set {config.api_key_var} environment variable. PrimeMonitor will not be able to upload data."
+                f"API key not found. Set {config.api_key_var} environment variable or run `prime login`. "
+                "PrimeMonitor will not be able to upload data."
             )
             self.enabled = False
             return
 
         self.api_key = api_key
-        self.base_url = config.base_url
+        self.base_url = config.base_url.rstrip("/")
+        self._headers = {
+            "Authorization": f"Bearer {api_key}",
+            "x-api-key": api_key,
+            "Content-Type": "application/json",
+        }
 
-        # Get run_id from environment variable (check before allocating resources)
         run_id = os.getenv("RUN_ID")
         if not run_id:
-            self.logger.warning("RUN_ID environment variable not set. PrimeMonitor will not be able to upload data.")
-            self.enabled = False
-            return
+            run_id = self._register_run(config, run_config)
+            if run_id:
+                os.environ["RUN_ID"] = run_id
+            else:
+                self.enabled = False
+                return
+
         self.run_id = run_id
 
         # Set up async HTTP client with background event loop.
@@ -71,15 +178,102 @@ class PrimeMonitor(Monitor):
         os.register_at_fork(after_in_child=self._reinit_after_fork)
 
         # Optionally, initialize sample logging attributes
-        if config is not None and config.log_extras:
+        if config.log_extras:
             if config.log_extras.samples:
                 self.last_log_samples_step = -1
+                self._pending_sample_steps: set[int] = set()
                 self.tokenizer = tokenizer
             if config.log_extras.distributions:
                 self.last_log_distributions_step = -1
 
-    def log(self, metrics: dict[str, Any], step: int | None = None) -> None:
-        self.history.append(metrics)
+    def _register_run(self, config: PrimeMonitorConfig, run_config: BaseConfig | None) -> str | None:
+        """Register an external run with the platform. Returns run_id on success, None on failure."""
+        prime_config = None
+        team_id = config.team_id
+        frontend_url = config.frontend_url
+        if team_id is None or frontend_url is None:
+            prime_config = PrimeConfig()
+        if team_id is None:
+            team_id = prime_config.team_id
+        if frontend_url is None:
+            frontend_url = prime_config.frontend_url
+
+        model = getattr(run_config, "model", None) if run_config else None
+        environments = getattr(run_config, "env", None) if run_config else None
+        wandb = getattr(run_config, "wandb", None) if run_config else None
+
+        payload: dict = {
+            "base_model": model.name if model else "unknown",
+            "max_steps": getattr(run_config, "max_steps", None) or 0,
+        }
+        if config.run_name:
+            payload["name"] = config.run_name
+        if team_id:
+            payload["team_id"] = team_id
+        if environments:
+            payload["environments"] = [{"id": env.id} for env in environments if hasattr(env, "id")]
+        if wandb and getattr(wandb, "project", None):
+            payload["wandb_project"] = wandb.project
+
+        try:
+            response = httpx.post(
+                f"{self.base_url}/external-runs",
+                headers=self._headers,
+                json=payload,
+                timeout=30,
+            )
+        except httpx.HTTPError as e:
+            self.logger.warning(f"Failed to register platform run: {e}. PrimeMonitor will not be able to upload data.")
+            return None
+
+        if response.status_code != 201:
+            self.logger.warning(
+                f"Failed to create platform run (HTTP {response.status_code}): {response.text}. "
+                "PrimeMonitor will not be able to upload data."
+            )
+            return None
+
+        run_id = response.json()["run"]["id"]
+        if frontend_url:
+            dashboard_url = f"{frontend_url.rstrip('/')}/dashboard/training/{run_id}"
+            self.logger.success(f"Monitor run at: {dashboard_url}")
+        else:
+            self.logger.success(f"Registered platform run {run_id}")
+        self._registered = True
+        return run_id
+
+    def _finalize_run(self, success: bool) -> None:
+        """Mark the run as completed or failed on the platform."""
+        if not self._registered:
+            return
+
+        payload: dict = {"status": "completed" if success else "failed"}
+        status_label = "completed" if success else "failed"
+        self.logger.info(f"Finalizing platform run {self.run_id} as {status_label}")
+
+        try:
+            response = httpx.put(
+                f"{self.base_url}/external-runs/{self.run_id}/status",
+                headers=self._headers,
+                json=payload,
+                timeout=30,
+            )
+        except httpx.HTTPError as e:
+            self.logger.warning(f"Failed to finalize platform run {self.run_id}: {e}")
+            return
+
+        if response.status_code != 200:
+            self.logger.warning(
+                f"Failed to finalize platform run {self.run_id} (HTTP {response.status_code}): {response.text}"
+            )
+            return
+        self.logger.info(f"Platform run {self.run_id} marked as {status_label}")
+
+    def log(self, metrics: dict[str, Any], step: int) -> None:
+        if self._keep_full_history:
+            self.history.append(metrics)
+        else:
+            self.history = [metrics]
         if not self.is_master:
             return
         if not self.enabled:
@@ -92,8 +286,8 @@ class PrimeMonitor(Monitor):
             },
         )
 
-    def log_samples(self, rollouts: list[vf.State], step: int) -> None:
-        """Logs rollouts to Prime Intellect API."""
+    def log_samples(self, rollouts: list[vf.RolloutOutput], step: int) -> None:
+        """Logs rollouts to Prime Intellect API using presigned URLs for direct R2 upload."""
         if not self.is_master:
             return
         if not self.enabled:
@@ -104,82 +298,201 @@ class PrimeMonitor(Monitor):
             or not self.config.log_extras.samples
             or step % self.config.log_extras.interval != 0
         ):
-            # Do not log samples if not enabled or not log interval step
+            return
+
+        rollouts = sample_items_for_logging(
+            rollouts,
+            self.config.log_extras.sample_ratio,
+        )
+        if not rollouts:
             return
 
         assert self.last_log_samples_step <= step, "Step must be greater than last logged step"
+        assert step not in self._pending_sample_steps, f"Step {step} upload already in progress"
         assert self.logger is not None, "Logger is required for sample logging"
 
-        self.logger.info(f"Logging samples to Prime Intellect API at step {step}")
+        self.logger.info(f"Logging {len(rollouts)} samples to Prime Intellect API at step {step}")
         start_time = time.perf_counter()
 
-        # Prepare samples for API
-        samples = []
-        for rollout in rollouts:
-            # Extract prompt and completion separately from the last trajectory step
-            trajectory = rollout["trajectory"]
-            if not trajectory:
-                continue
-            last_step = trajectory[-1]
-            prompt_messages = last_step["prompt"]
-            completion_messages = last_step["completion"]
+        parquet_bytes = self._rollouts_to_parquet_bytes(rollouts, step)
 
-            # Serialize full trajectory array (excluding large response objects and token arrays)
-            trajectory_data = []
-            for traj_step in rollout["trajectory"]:
-                trajectory_data.append(
-                    {
-                        "prompt": traj_step["prompt"],
-                        "completion": traj_step["completion"],
-                        "reward": traj_step.get("reward"),
-                        "advantage": traj_step.get("advantage"),
-                        "extras": traj_step.get("extras", {}),
-                        "num_input_tokens": len(traj_step.get("tokens", {}).get("prompt_ids", []))
-                        if traj_step.get("tokens")
-                        else None,
-                        "num_output_tokens": len(traj_step.get("tokens", {}).get("completion_ids", []))
-                        if traj_step.get("tokens")
-                        else None,
-                    }
-                )
+        if not parquet_bytes:
+            self.logger.warning(f"No samples to log at step {step}")
+            return
 
-            # Get info, timing, and metrics fields - send raw data, backend will serialize
-            info = rollout.get("info")
-            timing = rollout.get("timing")
-            metrics = rollout.get("metrics")
+        self._pending_sample_steps.add(step)
 
-            sample = {
-                "step": step,
-                "example_id": rollout.get("example_id"),
-                "prompt": prompt_messages,
-                "completion": completion_messages,
-                "trajectory": trajectory_data,
-                "reward": rollout.get("reward"),
-                "advantage": rollout.get("advantage"),
-                "answer": rollout.get("answer"),
-                "task": rollout.get("task"),
-                "info": info,
-                "metrics": metrics,
-                "timing": timing,
-            }
-            samples.append(sample)
+        # Use presigned URL flow for uploading samples
+        self._upload_samples_via_presigned_url(parquet_bytes, step)
 
-        # Upload samples
-        self._make_request(
-            "samples",
-            {
-                "run_id": self.run_id,
-                "step": step,
-                "samples": samples,
-            },
-        )
-        self.last_log_samples_step = step
         self.logger.debug(
-            f"Logged samples at step {step} to Prime Intellect API in {time.perf_counter() - start_time:.2f}s"
+            f"Initiated samples upload at step {step} to Prime Intellect API in {time.perf_counter() - start_time:.2f}s"
         )
 
-    def log_final_samples(self) -> None:
-        """Log final samples (no-op - samples are logged per-step only)."""
+    def _rollouts_to_parquet_bytes(self, rollouts: list[vf.RolloutOutput], step: int) -> bytes | None:
+        """Convert rollouts directly to Parquet bytes for upload."""
+        now = datetime.now(timezone.utc)
+        rows = []
+
+        for sample_id, rollout in enumerate(rollouts):
+            prompt = rollout.get("prompt")
+            completion = rollout.get("completion")
+            trajectory = rollout.get("trajectory") or []
+            if prompt is None or completion is None or not trajectory:
+                continue
+
+            example_id = rollout.get("example_id")
+            try:
+                problem_id = int(example_id) if example_id is not None else sample_id
+            except (TypeError, ValueError):
+                problem_id = sample_id
+
+            trajectory_data = [
+                {
+                    "prompt": ts["prompt"],
+                    "completion": ts["completion"],
+                    "reward": ts.get("reward"),
+                    "advantage": ts.get("advantage"),
+                    "extras": ts.get("extras", {}),
+                    "num_input_tokens": len(ts["tokens"]["prompt_ids"]) if ts.get("tokens") else None,
+                    "num_output_tokens": len(ts["tokens"]["completion_ids"]) if ts.get("tokens") else None,
+                }
+                for ts in trajectory
+            ]
+
+            rows.append(
+                {
+                    "run_id": self.run_id,
+                    "step": step,
+                    "tag": "",
+                    "problem_id": problem_id,
+                    "sample_id": sample_id,
+                    "prompt": json.dumps(prompt),
+                    "completion": json.dumps(completion),
+                    "trajectory": json.dumps(trajectory_data),
+                    "answer": rollout.get("answer") or "",
+                    "env_name": rollout.get("env_name") or "",
+                    "task": rollout.get("task") or "",
+                    "info": _json(rollout.get("info")),
+                    "reward": rollout.get("reward"),
+                    "advantage": rollout.get("advantage"),
+                    "metrics": _json(rollout.get("metrics")),
+                    "timing": _json(rollout.get("timing")),
+                    "num_input_tokens": 0,
+                    "num_output_tokens": 0,
+                    "created_at": now,
+                }
+            )
+
+        if not rows:
+            return None
+
+        table = pa.Table.from_pylist(rows, schema=_SAMPLE_SCHEMA)
+        buf = io.BytesIO()
+        pq.write_table(table, buf, compression="snappy", use_dictionary=True, write_statistics=True)
+        return buf.getvalue()
+
+    def _upload_samples_via_presigned_url(self, parquet_bytes: bytes, step: int) -> None:
+        """Upload Parquet samples using presigned URL flow (fire-and-forget)."""
+        future = asyncio.run_coroutine_threadsafe(
+            self._upload_samples_via_presigned_url_async(parquet_bytes, step),
+            self._loop,
+        )
+        self._pending_futures.append(future)
+        # Clean up completed futures to avoid memory growth
+        self._pending_futures = [f for f in self._pending_futures if not f.done()]
+
+    async def _upload_samples_via_presigned_url_async(
+        self, parquet_bytes: bytes, step: int, max_retries: int = 3
+    ) -> None:
+        """Upload Parquet bytes via presigned URL flow."""
+        try:
+            presign_data = await self._request_presigned_url(step)
+            if not presign_data:
+                self.logger.warning(f"Failed to get presigned URL for samples at step {step}")
+                return
+
+            presigned_url = presign_data["presigned_url"]
+            s3_key = presign_data["s3_key"]
+
+            upload_success = await self._upload_to_r2(
+                presigned_url, parquet_bytes, content_type="application/parquet", max_retries=max_retries
+            )
+            if not upload_success:
+                self.logger.warning(f"Failed to upload samples to R2 at step {step}")
+                return
+
+            confirm_success = await self._confirm_samples_upload(step, s3_key)
+            if not confirm_success:
+                self.logger.warning(f"Failed to confirm samples upload at step {step}")
+                return
+
+            self.last_log_samples_step = step
+            self.logger.debug(f"Successfully completed samples upload at step {step}")
+
+        except Exception as e:
+            self.logger.warning(f"Failed to upload samples via presigned URL at step {step}: {type(e).__name__}: {e}")
+        finally:
+            self._pending_sample_steps.discard(step)
+
+    async def _request_presigned_url(self, step: int) -> dict[str, Any] | None:
+        """Request a presigned URL from the backend."""
+        try:
+            response = await self._client.post(
+                f"{self.base_url}/samples/presign",
+                headers=self._headers,
+                json={"run_id": self.run_id, "step": step},
+            )
+            response.raise_for_status()
+            response_data = response.json()["data"]
+            return {
+                "presigned_url": response_data["presignedUrl"],
+                "s3_key": response_data["s3Key"],
+            }
+        except Exception as e:
+            self.logger.warning(f"Failed to request presigned URL: {type(e).__name__}: {e}")
+            return None
+
+    async def _upload_to_r2(
+        self, presigned_url: str, data: bytes, content_type: str = "application/json", max_retries: int = 3
+    ) -> bool:
+        """Upload data to R2 using presigned URL."""
+        for attempt in range(max_retries):
+            try:
+                response = await self._client.put(presigned_url, content=data, headers={"Content-Type": content_type})
+                response.raise_for_status()
+                return True
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    self.logger.warning(f"Failed to upload to R2 after {max_retries} attempts: {type(e).__name__}: {e}")
+                    return False
+                delay = 2**attempt
+                self.logger.debug(f"Retrying R2 upload in {delay}s (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(delay)
+
+    async def _confirm_samples_upload(self, step: int, s3_key: str, max_retries: int = 3) -> bool:
+        """Confirm samples upload with the backend. Returns True on success."""
+        for attempt in range(max_retries):
+            try:
+                response = await self._client.post(
+                    f"{self.base_url}/samples/confirm",
+                    headers=self._headers,
+                    json={"run_id": self.run_id, "step": step, "s3_key": s3_key},
+                )
+                response.raise_for_status()
+                return True
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    self.logger.warning(
+                        f"Failed to confirm samples upload after {max_retries} attempts: {type(e).__name__}: {e}"
+                    )
+                    return False
+                delay = 2**attempt
+                self.logger.debug(f"Retrying samples confirm in {delay}s (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(delay)
+        return False
+
+    def log_eval_samples(self, rollouts: list[vf.RolloutOutput], env_name: str, step: int) -> None:
         pass
 
     def log_distributions(self, distributions: dict[str, list[float]], step: int) -> None:
@@ -217,24 +530,65 @@ class PrimeMonitor(Monitor):
             f"Logged distributions at step {step} to Prime Intellect API in {time.perf_counter() - start_time:.2f}s"
         )
 
+    def _submit_final_summary(self, summary: dict[str, Any]) -> bool:
+        """Submit the final summary/finalize request synchronously."""
+        payload = self._sanitize_json_payload(
+            "finalize",
+            {"run_id": self.run_id, "summary": summary},
+        )
+
+        try:
+            response = httpx.post(
+                f"{self.base_url}/finalize",
+                headers=self._headers,
+                json=payload,
+                timeout=30,
+            )
+        except httpx.HTTPError as e:
+            self.logger.warning(f"Failed to submit final summary for platform run {self.run_id}: {e}")
+            return False
+
+        if response.status_code != 200:
+            self.logger.warning(
+                f"Failed to submit final summary for platform run {self.run_id} "
+                f"(HTTP {response.status_code}): {response.text}"
+            )
+            return False
+
+        return True
+
     def save_final_summary(self, filename: str = "final_summary.json") -> None:
         """Save final summary to Prime Intellect API."""
         if not self.is_master or not self.enabled:
             return
 
         self.logger.info("Saving final summary to Prime Intellect API")
-        self._make_request(
-            "finalize",
-            {
-                "run_id": self.run_id,
-                "summary": self.history[-1] if self.history else {},
-            },
-        )
+        summary = self.history[-1] if self.history else {}
+        finalized_via_summary = self._submit_final_summary(summary)
+
+        if os.getpid() != self._owner_pid:
+            return
+
+        if finalized_via_summary:
+            self._finalized = True
+            return
+
+        self._finalize_run(success=True)
+        self._finalized = True
 
     def close(self) -> None:
         """Close the HTTP client and stop the background event loop."""
-        if not hasattr(self, "_client"):
+        if self._closed or not hasattr(self, "_client"):
             return
+
+        self._closed = True
+
+        should_finalize = self.is_master and self.enabled and not self._finalized and os.getpid() == self._owner_pid
+        if should_finalize:
+            self._finalize_run(success=False)
+            self._finalized = True
+
+        self._flush()
 
         # Close the async client within the event loop
         async def _close_client() -> None:
@@ -260,6 +614,9 @@ class PrimeMonitor(Monitor):
         self._thread = Thread(target=self._run_event_loop, daemon=True)
         self._thread.start()
         self._client = httpx.AsyncClient(timeout=30)
+        self._pending_futures: list[asyncio.Future] = []
+        if hasattr(self, "_pending_sample_steps") and self._pending_sample_steps:
+            self._pending_sample_steps.clear()
 
     def _reinit_after_fork(self) -> None:
         """Reinitialize thread and event loop after fork."""
@@ -270,20 +627,34 @@ class PrimeMonitor(Monitor):
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
+    def _flush(self, timeout: float = 30.0) -> None:
+        """Wait for all pending async requests to complete."""
+        if not self.enabled or not hasattr(self, "_loop"):
+            return
+
+        if not self._pending_futures:
+            return
+
+        self.logger.debug(f"Flushing {len(self._pending_futures)} pending request(s)")
+        for future in self._pending_futures:
+            try:
+                future.result(timeout=timeout)
+            except Exception as e:
+                self.logger.debug(f"Pending request completed with error: {e}")
+
+        self._pending_futures.clear()
+
     async def _make_request_async(self, endpoint: str, data: dict[str, Any], max_retries: int = 3) -> None:
         """Make an async POST request to the Prime Intellect API with retries."""
-        headers = {
-            "x-api-key": self.api_key,
-            "Content-Type": "application/json",
-        }
         full_endpoint = f"{self.base_url}/{endpoint}"
+        sanitized_data = self._sanitize_json_payload(endpoint, data)
 
         for attempt in range(max_retries):
             try:
                 response = await self._client.post(
                     full_endpoint,
-                    headers=headers,
-                    json=data,
+                    headers=self._headers,
+                    json=sanitized_data,
                 )
                 response.raise_for_status()
                 return  # Success
@@ -306,7 +677,10 @@ class PrimeMonitor(Monitor):
         if not self.enabled:
             return
 
-        asyncio.run_coroutine_threadsafe(
+        future = asyncio.run_coroutine_threadsafe(
             self._make_request_async(endpoint, data),
             self._loop,
         )
+        self._pending_futures.append(future)
+        # Clean up completed futures to avoid memory growth
+        self._pending_futures = [f for f in self._pending_futures if not f.done()]

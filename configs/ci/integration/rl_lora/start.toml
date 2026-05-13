@@ -1,6 +1,3 @@
-inference_gpu_ids = [0]
-trainer_gpu_ids = [1]
-
 max_steps = 20
 seq_len = 2048
 
@@ -25,10 +22,10 @@ rollouts_per_example = 16
 [orchestrator.model.lora]
 name = "r8-1e-4"
 
-[orchestrator.sampling]
-max_tokens = 128
+[orchestrator.train.sampling]
+max_completion_tokens = 128
 
-[[orchestrator.env]]
+[[orchestrator.train.env]]
 id = "reverse-text"
 
 [inference]

@@ -1,11 +1,10 @@
-from functools import partial
 from pathlib import Path
 from typing import Callable
 
 import pytest
 
 from tests.conftest import ProcessResult
-from tests.utils import check_no_error, check_number_goes_up_or_down, check_number_in_range, strip_escape_codes
+from tests.utils import check_no_error, check_reward_goes_up, check_reward_in_range, strip_escape_codes
 
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
 
@@ -39,10 +38,6 @@ def rl_process(
     return run_process(cmd)
 
 
-check_reward_goes_up = partial(check_number_goes_up_or_down, go_up=True, pattern=r"Reward:\s*(\d+\.\d{4})")
-check_reward_in_range = partial(check_number_in_range, pattern=r"Reward:\s*(\d+\.\d{4})")
-
-
 @pytest.fixture(scope="module")
 def test_no_error(rl_process: ProcessResult, output_dir: Path):
     """Tests that the RL process does not fail."""
@@ -51,13 +46,13 @@ def test_no_error(rl_process: ProcessResult, output_dir: Path):
 
 def test_reward_goes_up(rl_process: ProcessResult, test_no_error, output_dir: Path):
     """Tests that the reward goes up in the RL process"""
-    with open(output_dir / "logs" / "orchestrator.stdout", "r") as f:
+    with open(output_dir / "logs" / "orchestrator.log", "r") as f:
         orchestrator_stdout = strip_escape_codes(f.read()).splitlines()
     check_reward_goes_up(orchestrator_stdout)
 
 
 def test_reward_reaches_threshold(rl_process: ProcessResult, test_no_error, output_dir: Path):
     """Tests that the reward goes up in the RL process"""
-    with open(output_dir / "logs" / "orchestrator.stdout", "r") as f:
+    with open(output_dir / "logs" / "orchestrator.log", "r") as f:
         orchestrator_stdout = strip_escape_codes(f.read()).splitlines()
     check_reward_in_range(orchestrator_stdout, min_threshold=0.65)

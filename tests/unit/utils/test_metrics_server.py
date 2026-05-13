@@ -7,8 +7,8 @@ from contextlib import closing
 
 import pytest
 
-from prime_rl.utils.config import MetricsServerConfig
-from prime_rl.utils.metrics_server import PROMETHEUS_AVAILABLE, HealthServer, MetricsServer, RunStats
+from prime_rl.configs.shared import MetricsServerConfig
+from prime_rl.utils.metrics_server import HealthServer, MetricsServer, RunStats
 
 
 def find_free_port() -> int:
@@ -88,22 +88,23 @@ def test_server_update_metrics():
     response = urllib.request.urlopen(f"http://localhost:{port}/metrics", timeout=2)
     content = response.read().decode()
 
-    if PROMETHEUS_AVAILABLE:
-        assert "trainer_step" in content
-        assert "trainer_loss" in content
-        assert "trainer_last_step_timestamp_seconds" in content
-        assert "trainer_mismatch_kl" in content
+    assert "trainer_step" in content
+    assert "trainer_loss" in content
+    assert "trainer_last_step_timestamp_seconds" in content
+    assert "trainer_mismatch_kl" in content
+    assert "trainer_kl_ent_ratio" in content
 
     server.stop()
 
 
-@pytest.mark.skipif(not PROMETHEUS_AVAILABLE, reason="prometheus_client not installed")
 def test_server_metrics_values_are_correct():
     port = find_free_port()
     server = MetricsServer(MetricsServerConfig(port=port))
     server.start()
     time.sleep(0.1)
 
+    entropy = 1.5
+    mismatch_kl = 0.045
     server.update(
         step=100,
         loss=0.123,
@@ -111,7 +112,8 @@ def test_server_metrics_values_are_correct():
         grad_norm=2.5,
         peak_memory_gib=16.0,
         learning_rate=3e-5,
-        mismatch_kl=0.045,
+        entropy=entropy,
+        mismatch_kl=mismatch_kl,
     )
 
     response = urllib.request.urlopen(f"http://localhost:{port}/metrics", timeout=2)
@@ -120,6 +122,7 @@ def test_server_metrics_values_are_correct():
     assert "trainer_step 100.0" in content
     assert "trainer_loss 0.123" in content
     assert "trainer_mismatch_kl 0.045" in content
+    assert f"trainer_kl_ent_ratio {mismatch_kl / entropy}" in content
 
     server.stop()
 
@@ -138,11 +141,10 @@ def test_server_isolated_registry():
 
     server1.update(step=999, loss=0.1, throughput=100, grad_norm=1, peak_memory_gib=1, learning_rate=1e-3)
 
-    if PROMETHEUS_AVAILABLE:
-        resp1 = urllib.request.urlopen(f"http://localhost:{port1}/metrics", timeout=2).read().decode()
-        resp2 = urllib.request.urlopen(f"http://localhost:{port2}/metrics", timeout=2).read().decode()
-        assert "999.0" in resp1
-        assert "999.0" not in resp2
+    resp1 = urllib.request.urlopen(f"http://localhost:{port1}/metrics", timeout=2).read().decode()
+    resp2 = urllib.request.urlopen(f"http://localhost:{port2}/metrics", timeout=2).read().decode()
+    assert "999.0" in resp1
+    assert "999.0" not in resp2
 
     server1.stop()
     server2.stop()
@@ -161,7 +163,6 @@ def test_server_port_conflict_raises():
     server1.stop()
 
 
-@pytest.mark.skipif(not PROMETHEUS_AVAILABLE, reason="prometheus_client not installed")
 def test_server_update_runs():
     port = find_free_port()
     server = MetricsServer(MetricsServerConfig(port=port))
@@ -194,7 +195,6 @@ def test_server_update_runs():
     server.stop()
 
 
-@pytest.mark.skipif(not PROMETHEUS_AVAILABLE, reason="prometheus_client not installed")
 def test_server_update_runs_cleanup():
     """Test that removed runs are cleaned up from metrics."""
     port = find_free_port()

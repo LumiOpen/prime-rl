@@ -1,6 +1,3 @@
-inference_gpu_ids = [0]
-trainer_gpu_ids = [1]
-
 max_steps = 500
 seq_len = 4096
 
@@ -33,15 +30,14 @@ batch_size = 512
 rollouts_per_example = 16
 oversampling_factor = 2.0
 
-[orchestrator.sampling]
-max_tokens = 512
+[orchestrator.train.sampling]
+max_completion_tokens = 512
 
 [orchestrator.buffer]
 online_difficulty_filtering = true
 
-[[orchestrator.env]]
-id = "primeintellect/wiki-search"
+[[orchestrator.train.env]]
+id = "wiki-search"
 
 [inference.model]
-enable_auto_tool_choice = true
 tool_call_parser = "hermes"

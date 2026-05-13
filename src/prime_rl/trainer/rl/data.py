@@ -6,11 +6,11 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from transformers.tokenization_utils import PreTrainedTokenizer
 
-from prime_rl.trainer.rl.config import FakeDataLoaderConfig
+from prime_rl.configs.trainer import FakeDataLoaderConfig
 from prime_rl.trainer.rl.packer import BasePacker, setup_packer
-from prime_rl.trainer.runs import get_runs
+from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.world import get_world
-from prime_rl.transport import MicroBatch, MicroBatchReceiver, TransportConfigType, setup_micro_batch_receiver
+from prime_rl.transport import MicroBatch, MicroBatchReceiver, TransportConfig, setup_micro_batch_receiver
 
 
 class TensorMicroBatch(TypedDict):
@@ -23,10 +23,24 @@ class TensorMicroBatch(TypedDict):
     inference_logprobs: Float[Tensor, "batch seq"]
     teacher_logprobs: Float[Tensor, "batch seq"] | None
     loss_mask: Bool[Tensor, "batch seq"]
+    temperatures: Float[Tensor, "batch seq"]  # Per-token temperatures
 
     # Batch level
-    temperature: float
     lora_num_tokens: Int[Tensor, "n_loras"]
+
+    # MoE router replay
+    routed_experts: Int[Tensor, "batch seq layers topk"] | None
+
+    # Multimodal fields (Qwen3-VL)
+    # pixel_values: flattened image patches [num_patches, patch_dim] where patch_dim=1176 for Qwen3-VL
+    pixel_values: Float[Tensor, "num_patches patch_dim"] | None
+    # image_grid_thw: grid dimensions [num_images, 3] where each entry is [temporal, height, width]
+    image_grid_thw: Int[Tensor, "num_images 3"] | None
+    # mm_token_type_ids: token type per token [batch seq], int64 (0=text, 1=image, 2=video)
+    mm_token_type_ids: Int[Tensor, "batch seq"] | None
+
+    # When True, trainer uses SFT loss instead of RL loss for this batch
+    sft_loss: bool
 
 
 class FakeDataLoader:
@@ -41,7 +55,7 @@ class FakeDataLoader:
         self.seq_len = seq_len
         self.generate_samples = config.generate_samples
         self.batch_counter = 0
-        self.runs = get_runs()
+        self.multi_run_manager = get_multi_run_manager()
 
     def wait_for_batch(self) -> None:
         return
@@ -84,7 +98,7 @@ class FakeDataLoader:
         loss_mask = torch.ones(input_ids.shape[0], dtype=torch.bool)
         advantages = torch.randn(input_ids.shape[0], generator=generator)
         inference_logprobs = torch.randn(input_ids.shape[0], generator=generator)
-        lora_num_tokens = torch.zeros(self.runs.max_runs, dtype=torch.int32)
+        lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
         lora_num_tokens[0] = input_ids.shape[0]
 
         return {
@@ -93,13 +107,18 @@ class FakeDataLoader:
             "advantages": advantages.unsqueeze(0),
             "inference_logprobs": inference_logprobs.unsqueeze(0),
             "teacher_logprobs": None,
-            "temperature": 1.0,
+            "temperatures": torch.ones(input_ids.shape[0]).unsqueeze(0),
             "loss_mask": loss_mask.unsqueeze(0),
             "lora_num_tokens": lora_num_tokens,
+            "routed_experts": None,
+            "pixel_values": None,
+            "image_grid_thw": None,
+            "mm_token_type_ids": None,
+            "sft_loss": False,
         }
 
     def _get_micro_batch(self, generator: torch.Generator) -> TensorMicroBatch:
-        lora_num_tokens = torch.zeros(self.runs.max_runs, dtype=torch.int32)
+        lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
         lora_num_tokens[0] = self.seq_len
         return {
             "input_ids": torch.randint(
@@ -115,9 +134,14 @@ class FakeDataLoader:
             "advantages": torch.randn(self.seq_len, generator=generator).unsqueeze(0),
             "inference_logprobs": torch.randn(self.seq_len, generator=generator).unsqueeze(0),
             "teacher_logprobs": None,
-            "temperature": 1.0,
+            "temperatures": torch.ones(self.seq_len).unsqueeze(0),
             "loss_mask": torch.ones(self.seq_len, dtype=torch.bool).unsqueeze(0),
             "lora_num_tokens": lora_num_tokens,
+            "routed_experts": None,
+            "pixel_values": None,
+            "image_grid_thw": None,
+            "mm_token_type_ids": None,
+            "sft_loss": False,
         }
 
 
@@ -132,7 +156,7 @@ class DataLoader:
         seq_len: int,
         pad_to_multiple_of: int,
         tokenizer: PreTrainedTokenizer,
-        config: TransportConfigType,
+        config: TransportConfig,
     ):
         self.world = get_world()
 
@@ -148,15 +172,19 @@ class DataLoader:
 
         non_dp_world_size = self.world.world_size // dp_world_size
         dp_rank = self.world.rank // non_dp_world_size
-        self.runs = get_runs()
+        self.multi_run_manager = get_multi_run_manager()
 
         self.receiver: MicroBatchReceiver = setup_micro_batch_receiver(output_dir, dp_rank, start_step, config)
 
     def wait_for_batch(self) -> None:
         if self.world.is_master:
-            self.packer.pack()
+            self.packer._arm_watchdog()
+            try:
+                self.packer.pack()
+            finally:
+                self.packer._disarm_watchdog()
         self.receiver.wait()
-        self.runs.sync_runs()
+        self.multi_run_manager.synchronize_state()
 
     def get_batch(self) -> list[TensorMicroBatch]:
         micro_batches = self.receiver.receive()
@@ -165,7 +193,7 @@ class DataLoader:
     def _micro_batch_to_tensor(self, micro_batch: MicroBatch) -> TensorMicroBatch:
         """Convert a MicroBatch (msgspec struct with lists) to a TensorMicroBatch (dict with tensors)."""
         if micro_batch.lora_num_tokens is None:
-            micro_batch.lora_num_tokens = [0] * self.runs.max_runs
+            micro_batch.lora_num_tokens = [0] * self.multi_run_manager.max_runs
             micro_batch.lora_num_tokens[0] = len(micro_batch.input_ids)
         return TensorMicroBatch(
             input_ids=torch.tensor(micro_batch.input_ids, dtype=torch.long).unsqueeze(0),
@@ -176,6 +204,24 @@ class DataLoader:
             if micro_batch.teacher_logprobs is not None
             else None,
             loss_mask=torch.tensor(micro_batch.loss_mask, dtype=torch.bool).unsqueeze(0),
-            temperature=micro_batch.temperature,
+            temperatures=torch.tensor(micro_batch.temperatures, dtype=torch.float).unsqueeze(0),
             lora_num_tokens=torch.tensor(micro_batch.lora_num_tokens, dtype=torch.int32),
+            # Multimodal fields - no batch dimension for these as they are variable-sized
+            pixel_values=torch.frombuffer(bytearray(micro_batch.pixel_values), dtype=torch.float32).reshape(
+                micro_batch.pixel_values_shape
+            )
+            if micro_batch.pixel_values is not None
+            else None,
+            image_grid_thw=torch.tensor(micro_batch.image_grid_thw, dtype=torch.long)
+            if micro_batch.image_grid_thw is not None
+            else None,
+            mm_token_type_ids=torch.tensor(micro_batch.mm_token_type_ids, dtype=torch.long).unsqueeze(0)
+            if micro_batch.mm_token_type_ids is not None
+            else None,
+            routed_experts=torch.tensor(micro_batch.routed_experts, dtype=torch.int32).unsqueeze(
+                0
+            )  # [1, seq_len, layers, topk]
+            if micro_batch.routed_experts is not None
+            else None,
+            sft_loss=micro_batch.sft_loss,
         )

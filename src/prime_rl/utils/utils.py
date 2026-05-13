@@ -1,7 +1,9 @@
 import asyncio
 import functools
+import importlib
 import os
 import subprocess
+import sys
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
@@ -11,7 +13,7 @@ import torch
 import torch.distributed as dist
 import wandb
 
-from prime_rl.orchestrator.config import EnvConfig, EvalEnvConfig
+from prime_rl.configs.orchestrator import EnvConfig, EvalEnvConfig
 from prime_rl.utils.logger import get_logger
 
 # TODO: Change all imports to use utils.pathing
@@ -23,6 +25,7 @@ from prime_rl.utils.pathing import (
     get_eval_dir,
     get_log_dir,
     get_rollout_dir,
+    get_stable_ckpt_steps,
     get_step_path,
     get_weights_dir,
     resolve_latest_ckpt_step,
@@ -31,75 +34,11 @@ from prime_rl.utils.pathing import (
 )
 
 
-def rgetattr(obj: Any, attr_path: str) -> Any:
-    """
-    Try to get a (nested) attribute from an object. For example:
-
-    ```python
-    class Foo:
-        bar = "baz"
-
-    class Bar:
-        foo = Foo()
-
-    foo = Foo()
-    bar = Bar()
-    ```
-
-    Here, the following holds:
-    - `getattr(foo, "bar")` will return `"baz"`.
-    - `getattr(bar, "foo)` will return an object of type `Foo`.
-    - `getattr(bar, "foo.bar")` will error
-
-    This function solves this. `rgetattr(bar, "foo.bar")` will return `"baz"`.
-
-    Args:
-        obj: The object to get the attribute from.
-        attr_path: The path to the attribute, nested using `.` as separator.
-
-    Returns:
-        The attribute
-    """
-    attrs = attr_path.split(".")
-    current = obj
-
-    for attr in attrs:
-        if not hasattr(current, attr):
-            raise AttributeError(f"'{type(current).__name__}' object has no attribute '{attr}'")
-        current = getattr(current, attr)
-
-    return current
-
-
-def rsetattr(obj: Any, attr_path: str, value: Any) -> None:
-    """
-    Try to set a (nested) attribute from an object. For example:
-
-    ```python
-    class Foo:
-        bar = "baz"
-
-    class Bar:
-        foo = Foo()
-
-    foo = Foo()
-    bar = Bar()
-    ```
-
-    Here, the following holds:
-    - `rsetattr(bar, "foo.bar", "qux")` will set `bar.foo.bar` to `"qux"`.
-    - `rsetattr(bar, "foo.bar", "qux")` will set `bar.foo.bar` to `"qux"`.
-
-    Args:
-        obj: The object to set the attribute on.
-        attr_path: The path to the attribute, nested using `.` as separator.
-        value: The value to set the attribute to.
-    """
-    if "." not in attr_path:
-        return setattr(obj, attr_path, value)
-    attr_path, attr = attr_path.rsplit(".", 1)
-    obj = rgetattr(obj, attr_path)
-    setattr(obj, attr, value)
+def import_object(dotted_path: str) -> Any:
+    """Import an object from a dotted path like 'my_module.submodule.MyClass'."""
+    module_path, _, name = dotted_path.rpartition(".")
+    module = importlib.import_module(module_path)
+    return getattr(module, name)
 
 
 def capitalize(s: str) -> str:
@@ -120,9 +59,13 @@ def clean_exit(func: Callable) -> Callable:
                 ret = await func(*args, **kwargs)
                 wandb.finish()
                 return ret
-            except Exception as e:
+            except Exception:
+                get_logger().opt(exception=True).error(f"Fatal error in {func.__name__}")
                 wandb.finish(exit_code=1)
-                raise e
+                # sys.exit raises SystemExit so the finally block still runs.
+                # raise alone doesn't terminate the process in an async context —
+                # the event loop swallows it and the process hangs indefinitely.
+                sys.exit(1)
             finally:
                 if dist.is_initialized():
                     dist.destroy_process_group()
@@ -136,9 +79,11 @@ def clean_exit(func: Callable) -> Callable:
                 ret = func(*args, **kwargs)
                 wandb.finish()
                 return ret
-            except Exception as e:
+            except Exception:
+                get_logger().opt(exception=True).error(f"Fatal error in {func.__name__}")
                 wandb.finish(exit_code=1)
-                raise e
+                # sys.exit raises SystemExit so the finally block still runs.
+                sys.exit(1)
             finally:
                 if dist.is_initialized():
                     dist.destroy_process_group()
@@ -190,27 +135,32 @@ def to_row_format(dict_of_lists: dict[str, list[Any]]) -> list[dict[str, Any]]:
     return [dict(zip(dict_of_lists.keys(), values)) for values in zip(*dict_of_lists.values())]
 
 
-def format_time(time_in_seconds: float) -> str:
-    """Format a time in seconds to a human-readable format."""
-    from datetime import timedelta
-
-    td = timedelta(seconds=time_in_seconds)
-    days = td.days
-    hours, remainder = divmod(td.seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-
-    # Format based on magnitude
-    if days > 0:
-        total_hours = days * 24 + hours
-        return f"{total_hours + minutes / 60:.2f}h"
-    elif hours > 0:
-        return f"{hours + minutes / 60:.2f}h"
-    elif minutes > 0:
-        return f"{minutes + seconds / 60:.2f}m"
+def format_time(time_s: float) -> str:
+    """
+    Format a time in seconds to a human-readable format:
+    - >1d -> Xd Yh
+    - >1h -> Xh Ym
+    - >1m -> Xm Ys
+    - <1s -> Xms
+    - Else: Xs
+    """
+    if time_s >= 86400:
+        d = time_s // 86400
+        h = (time_s % 86400) // 3600
+        return f"{d:.0f}d" + (f" {h:.0f}h" if h > 0 else "")
+    elif time_s >= 3600:
+        h = time_s // 3600
+        m = (time_s % 3600) // 60
+        return f"{h:.0f}h" + (f" {m:.0f}m" if m > 0 else "")
+    elif time_s >= 60:
+        m = time_s // 60
+        s = (time_s % 60) // 1
+        return f"{m:.0f}m" + (f" {s:.0f}s" if s > 0 else "")
+    elif time_s < 1:
+        ms = time_s * 1e3
+        return f"{ms:.0f}ms"
     else:
-        # Include microseconds for sub-second precision
-        total_seconds = seconds + td.microseconds / 1_000_000
-        return f"{total_seconds:.2f}s"
+        return f"{time_s:.0f}s"
 
 
 def format_num(num: float | int, precision: int = 2) -> str:
@@ -281,14 +231,22 @@ def default_dtype(dtype):
         torch.set_default_dtype(prev)
 
 
-def install_env(env_id: str) -> None:
+def install_env(env_id: str, prerelease: bool = False) -> None:
     """Install an environment in subprocess."""
     logger = get_logger()
     logger.info(f"Installing environment {env_id}")
     install_cmd = ["uv", "run", "--no-sync", "prime", "env", "install", env_id]
+    if prerelease:
+        install_cmd.insert(-1, "--prerelease")
     result = subprocess.run(install_cmd, capture_output=True, text=True)
+    for line in result.stdout.splitlines():
+        if line.strip():
+            logger.info(line)
+    for line in result.stderr.splitlines():
+        if line.strip():
+            logger.warning(line)
     if result.returncode != 0:
-        raise RuntimeError(f"Failed to install environment {env_id} (stdout={result.stdout}, stderr={result.stderr})")
+        raise RuntimeError(f"Failed to install environment {env_id} (exit code {result.returncode})")
     logger.info(f"Successfully installed environment {env_id}")
 
 

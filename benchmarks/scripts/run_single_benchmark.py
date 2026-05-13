@@ -19,7 +19,7 @@ from typing import Annotated, Literal
 import torch
 from pydantic import Field
 
-from prime_rl.utils.pydantic_config import BaseSettings, parse_argv
+from prime_rl.utils.config import BaseConfig, cli
 
 MAX_LORAS = 4
 
@@ -46,7 +46,7 @@ def extract_oom_error_reason(output: str) -> str | None:
     return None
 
 
-class BenchmarkConfig(BaseSettings):
+class BenchmarkConfig(BaseConfig):
     """Configuration for running a single benchmark."""
 
     type: Annotated[
@@ -62,12 +62,18 @@ class BenchmarkConfig(BaseSettings):
 
     seq_len: Annotated[int, Field(ge=1, description="Sequence length")] = 512
 
-    ac: Annotated[Literal["Recompute", "Offload", "None"], Field(description="Activation checkpointing type")] = (
-        "Recompute"
-    )
+    ac: Annotated[
+        Literal["Recompute", "Selective", "Offload"] | None,
+        Field(description="Activation checkpointing type"),
+    ] = "Recompute"
+
+    selective_targets: Annotated[
+        list[str] | None,
+        Field(description="Selective activation checkpoint targets when ac=Selective"),
+    ] = None
 
     attention: Annotated[
-        Literal["sdpa", "flash_attention_2", "flash_attention_3"],
+        Literal["sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4"],
         Field(description="Attention implementation"),
     ] = "flash_attention_2"
 
@@ -82,6 +88,11 @@ class BenchmarkConfig(BaseSettings):
     ep: Annotated[int, Field(ge=1, description="Expert parallelism size (1 = no EP)")] = 1
 
     cp: Annotated[int, Field(ge=1, description="Context parallelism size (1 = no CP)")] = 1
+
+    fused_lm_head_token_chunk_size: Annotated[
+        int | None,
+        Field(description="Fused LM head token chunk size (None uses trainer default)"),
+    ] = None
 
     docker_image: Annotated[str | None, Field(description="Docker image used for the benchmark")] = None
 
@@ -136,6 +147,10 @@ def build_command(config: BenchmarkConfig) -> list[str]:
     # Add activation checkpointing if enabled
     if config.ac == "Recompute":
         cmd.append("--model.ac")
+    elif config.ac == "Selective":
+        cmd.extend(["--model.ac", "--model.ac.mode", "selective"])
+        if config.selective_targets:
+            cmd.extend(["--model.ac.targets", json.dumps(config.selective_targets)])
     elif config.ac == "Offload":
         cmd.append("--model.ac-offloading")
 
@@ -151,6 +166,10 @@ def build_command(config: BenchmarkConfig) -> list[str]:
     # Add context parallelism if enabled
     if config.cp > 1:
         cmd.extend(["--model.cp", str(config.cp)])
+
+    # Fused LM head chunk size
+    if config.fused_lm_head_token_chunk_size is not None:
+        cmd.extend(["--model.fused-lm-head-token-chunk-size", str(config.fused_lm_head_token_chunk_size)])
 
     # Data configuration differs between RL and SFT
     if config.type.startswith("rl"):
@@ -239,7 +258,7 @@ def run_benchmark(config: BenchmarkConfig) -> None:
 
 
 def main():
-    config = parse_argv(BenchmarkConfig)
+    config = cli(BenchmarkConfig)
     run_benchmark(config)
 
 
