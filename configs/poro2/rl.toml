@@ -1,0 +1,72 @@
+# Poro2 bilingual (English + Finnish) math RL — 8B Llama, 4 nodes MI325X.
+# Final recipe from the "p2-klear-s0-2env-32k" campaign.
+
+max_steps = 10000
+seq_len = 24576
+
+[deployment]
+type = "multi_node"
+num_train_nodes = 1
+num_infer_nodes = 3
+
+[model]
+name = "LumiOpen/Poro2-Longrope-132en111fi"
+
+[wandb]
+project = "poro-language-rl"
+name = "poro2-rl"
+
+[ckpt]
+interval = 10
+keep_last = 30
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 8
+max_async_level = 1
+
+[orchestrator.train.sampling]
+temperature = 1.0
+max_completion_tokens = 24576
+
+[orchestrator.buffer]
+online_difficulty_filtering = true
+
+[[orchestrator.train.env]]
+id = "math-env"
+name = "english-math"
+args = { dataset_name = "klear_math_30k_en", dataset_subset = "default", question_key = "problem", answer_key = "answer", math_verify_max_workers = 64, math_verify_timeout = 60 }
+
+[[orchestrator.train.env]]
+id = "math-env"
+name = "finnish-math"
+args = { dataset_name = "klear_math_30k_fi", dataset_subset = "default", question_key = "translated_problem", answer_key = "answer", math_verify_max_workers = 64, math_verify_timeout = 60 }
+
+[trainer]
+matmul_precision = "highest"
+
+[trainer.loss]
+type = "default"
+kl_tau = 0.01
+ipo_mask_low = 0.2
+ipo_mask_high = 0.2
+adv_tau = 2.0
+
+[trainer.optim]
+lr = 1e-6
+max_grad_norm = 1.0
+
+[trainer.scheduler]
+type = "constant"
+
+[trainer.model.ac]
+freq = 1
+
+[inference]
+gpu_memory_utilization = 0.7
+
+[inference.parallel]
+dp = 24
+
+[inference.model]
+max_model_len = 32768
