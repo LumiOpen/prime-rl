@@ -14,7 +14,7 @@ def _extract_text(completion) -> str:
     if isinstance(completion, str):
         return completion
     if isinstance(completion, list):
-        parts = [msg.get("content", "") for msg in completion if isinstance(msg, dict) and msg.get("role") == "assistant"]
+        parts = [msg.get("content") or "" for msg in completion if msg.get("role") == "assistant"]
         return "\n".join(parts)
     return str(completion)
 
