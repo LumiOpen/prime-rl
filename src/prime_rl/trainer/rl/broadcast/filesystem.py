@@ -51,6 +51,16 @@ class FileSystemWeightBroadcast(WeightBroadcast):
 
                 state_dict = revert_weight_conversion(model, state_dict)
 
+                # revert_weight_conversion follows HF convention and drops lm_head.weight for
+                # tied-embedding models (tie_word_embeddings=True), but vLLM needs it explicitly
+                # during hot-reload (update_weights_from_path) — it does not re-tie weights.
+                cfg = getattr(model, "config", None)
+                if cfg and getattr(cfg, "tie_word_embeddings", False):
+                    embed_key = "model.embed_tokens.weight"
+                    lm_head_key = "lm_head.weight"
+                    if embed_key in state_dict and lm_head_key not in state_dict:
+                        state_dict[lm_head_key] = state_dict[embed_key]
+
         for idx in self.multi_run_manager.ready_to_update_idxs:
             self.logger.debug(
                 f"Broadcasting weights for run {idx} (ready_to_update={self.multi_run_manager.ready_to_update[idx]})"

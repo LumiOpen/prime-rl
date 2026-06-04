@@ -305,6 +305,13 @@ class EnvConfig(BaseConfig):
             description="Maximum number of times the environment will retry a failed rollout.",
         ),
     ] = 0
+    reward_weight: Annotated[
+        float,
+        Field(
+            gt=0,
+            description="Scalar multiplier applied to rewards from this environment before advantage computation. Use to balance reward scales across envs (e.g. 7.0 for RM env and 1.0 for IFEval).",
+        ),
+    ] = 1.0
 
     @property
     def resolved_name(self) -> str:

@@ -476,7 +476,12 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     # Only master loads the full state dict when conversion is actually needed.
     if isinstance(model, PreTrainedModelPrimeRL):
         snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
-        model_keys = dict.fromkeys(model.state_dict().keys())
+        # Avoid model.state_dict() here: on ROCm, calling state_dict() on an FSDP-wrapped
+        # CUDA model dispatches a vectorized_gather_kernel that crashes with
+        # HSA_STATUS_ERROR_EXCEPTION before any training data is processed.
+        # named_parameters() is sufficient for format detection; buffers like inv_freq
+        # are computed from config and don't appear in any checkpoint format.
+        model_keys = dict.fromkeys(k for k, _ in model.named_parameters())
 
         if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
             logger.warning(
@@ -511,10 +516,17 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
     logger.info(f"Loading weights using HF DCP from {snapshot_path}")
     load_dcp_start_time = time.perf_counter()
-    state_dict = model.state_dict()
+    # Build the state dict from named_parameters() + named_buffers() instead of
+    # model.state_dict(): on ROCm, state_dict() on an FSDP2-wrapped model triggers
+    # an unshard (all-gather) even on single-rank, dispatching vectorized_gather_kernel
+    # which crashes with HSA_STATUS_ERROR_EXCEPTION. named_parameters() returns the
+    # local DTensor shards directly with no GPU gather.
+    state_dict = {name: param.data for name, param in model.named_parameters()}
+    # Buffers like rotary_emb.inv_freq are computed from config, not stored in HF checkpoints.
+    # Including them here causes DCP to raise "Missing key in checkpoint state_dict".
     state_dict = strip_lora_from_state_dict(state_dict)
     if model.config.tie_word_embeddings:
-        del state_dict["lm_head.weight"]
+        state_dict.pop("lm_head.weight", None)
     dcp_load(
         state_dict,
         storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
@@ -779,8 +791,10 @@ def forward(
     image_grid_thw: Int[Tensor, "num_images 3"] | None = None,
 ) -> PrimeLmOutput:
     # Build kwargs for model forward
+    # Cast to int32: ROCm's vectorized_gather_kernel has a bug with int64 indices
+    # against bfloat16 embedding weights (hits HSA_STATUS_ERROR_EXCEPTION on first forward).
     kwargs = {
-        "input_ids": input_ids,
+        "input_ids": input_ids.to(torch.int32),
         "labels": labels,
         "temperature": temperature,
     }

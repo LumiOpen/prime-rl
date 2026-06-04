@@ -62,6 +62,9 @@ envs = [
     "math500",
     "aime2024",
     "aime2025",
+    "if-env",
+    "if-eval-env",
+    "rubric-judge-env",
 ]
 
 [dependency-groups]
@@ -91,11 +94,11 @@ override-dependencies = [
 ]
 
 [tool.uv.sources]
-amdsmi = { path = "/shared_silo/scratch/kahakala/lib/prime-rl-fresh/amd_smi" }
+amdsmi = { path = "/shared_silo/scratch/mmelnik/lib/rocm72/prime-rl/amd_smi" }
 torch = { index = "pytorch-rocm" }
 torchvision = {index = "pytorch-rocm"}
 triton-rocm = { index = "pytorch-rocm" }
-vllm = { path = "/shared_silo/scratch/kahakala/lib/wheels/vllm-0.17.0+rocm722-cp312-cp312-linux_x86_64.whl" }
+vllm = { path = "/shared_silo/scratch/mmelnik/lib/wheels/vllm-0.17.0+rocm722-cp312-cp312-linux_x86_64.whl" }
 verifiers = { git = "https://github.com/PrimeIntellect-ai/verifiers.git", rev = "0db45e6" }
 torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "a1fdd7e" }
 dion = { git = "https://github.com/samsja/dion.git", rev = "d891eeb" }
@@ -113,6 +116,9 @@ color-codeword = { index = "primeintellect" }
 math500 = { index = "primeintellect" }
 aime2024 = { index = "primeintellect" }
 aime2025 = { index = "primeintellect" }
+if-env = { path = "envs/if_env", editable = true }
+if-eval-env = { path = "envs/if_eval_env", editable = true }
+rubric-judge-env = { path = "envs/rubric_judge_env", editable = true }
 
 [[tool.uv.index]]
 name = "primeintellect"

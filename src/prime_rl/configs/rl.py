@@ -170,14 +170,15 @@ class SingleNodeDeploymentConfig(BaseDeploymentConfig):
     num_train_gpus: Annotated[int, Field(description="Number of training GPUs")] = 1
     num_infer_gpus: Annotated[int, Field(description="Number of inference GPUs")] = 1
     num_teacher_gpus: Annotated[int | None, Field(description="Number of teacher inference GPUs")] = None
+    num_rm_gpus: Annotated[int | None, Field(description="Number of reward model inference GPUs")] = None
 
     @model_validator(mode="after")
     def validate_gpu_count(self):
-        total = self.num_train_gpus + self.num_infer_gpus + (self.num_teacher_gpus or 0)
+        total = self.num_train_gpus + self.num_infer_gpus + (self.num_teacher_gpus or 0) + (self.num_rm_gpus or 0)
         if total > self.gpus_per_node:
             raise ValueError(
                 f"Total GPU count ({total} = {self.num_train_gpus} train + {self.num_infer_gpus} infer"
-                f" + {self.num_teacher_gpus or 0} teacher) exceeds gpus_per_node ({self.gpus_per_node})."
+                f" + {self.num_teacher_gpus or 0} teacher + {self.num_rm_gpus or 0} rm) exceeds gpus_per_node ({self.gpus_per_node})."
             )
         return self
 
@@ -243,6 +244,13 @@ class RLConfig(BaseConfig):
         InferenceConfig | None,
         Field(
             description="Teacher inference config. If None, will use the same config as inference or a default config. Only used when teacher GPUs or nodes are set."
+        ),
+    ] = None
+
+    rm_inference: Annotated[
+        InferenceConfig | None,
+        Field(
+            description="Reward model inference config for vLLM-hosted RM scoring. If None, the rl entrypoint will not start an RM server. Only used when deployment.num_rm_gpus is set."
         ),
     ] = None
 
@@ -863,6 +871,66 @@ class RLConfig(BaseConfig):
         port = self.teacher_inference.server.port
         self.orchestrator.teacher_model.client.base_url = [f"http://{host}:{port}/v1"]
         self.orchestrator.teacher_model.model.name = self.teacher_inference.model.name
+
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_rm_inference(self):
+        """Auto-configure RM inference server and inject rm_server_url into matching env args."""
+        if self.deployment.type != "single_node":
+            return self
+        if not self.deployment.num_rm_gpus:
+            return self
+
+        import copy
+
+        # Auto-build rm_inference config if not explicitly set
+        if self.rm_inference is None:
+            self.rm_inference = InferenceConfig()
+
+        # Auto-assign port unless the user explicitly set it
+        port_explicitly_set = "port" in self.rm_inference.server.model_fields_set
+        if not port_explicitly_set:
+            base_port = self.inference.server.port if self.inference else 8000
+            teacher_port_offset = 1 if (self.deployment.num_teacher_gpus or 0) > 0 else 0
+            self.rm_inference.server.port = base_port + 1 + teacher_port_offset
+        else:
+            # Validate no port collision when port was explicitly set
+            if self.inference is not None and self.rm_inference.server.port == self.inference.server.port:
+                raise ValueError(
+                    f"rm_inference.server.port ({self.rm_inference.server.port}) conflicts with "
+                    f"inference.server.port ({self.inference.server.port})."
+                )
+            if self.teacher_inference is not None and self.rm_inference.server.port == self.teacher_inference.server.port:
+                raise ValueError(
+                    f"rm_inference.server.port ({self.rm_inference.server.port}) conflicts with "
+                    f"teacher_inference.server.port ({self.teacher_inference.server.port})."
+                )
+
+        # Set DP from GPU count
+        tp = self.rm_inference.parallel.tp
+        num_rm_gpus = self.deployment.num_rm_gpus
+        if num_rm_gpus != self.rm_inference.parallel.dp * tp:
+            assert num_rm_gpus % tp == 0, "Number of RM GPUs must be divisible by tensor parallel size"
+            self.rm_inference.parallel.dp = num_rm_gpus // tp
+
+        # Ensure vLLM is told this is a reward model server
+        if self.rm_inference.vllm_extra is None:
+            self.rm_inference.vllm_extra = {}
+        self.rm_inference.vllm_extra.setdefault("task", "reward")
+
+        # Inject rm_server_url into any env that has rm_model_path but no rm_server_url
+        host = self.rm_inference.server.host or "localhost"
+        port = self.rm_inference.server.port
+        rm_server_url = f"http://{host}:{port}"
+        for env in self.orchestrator.env:
+            args = env.args or {}
+            if "rm_model_path" in args and "rm_server_url" not in args:
+                # Sync model name from env args so the server serves the right model
+                if self.rm_inference.model.name == "Qwen/Qwen3-0.6B":  # default placeholder
+                    self.rm_inference.model.name = args["rm_model_path"]
+                args["rm_server_url"] = rm_server_url
+                env.args = args
 
         return self
 

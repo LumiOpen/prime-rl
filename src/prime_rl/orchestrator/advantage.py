@@ -46,8 +46,9 @@ def default_advantage_fn(
         length_shaping = (1 + length_shaping_alpha * lengths_normalized) ** -1
         rewards = rewards * length_shaping
     baseline = rewards.mean(dim=1, keepdim=True)
+    std = rewards.std(dim=1, keepdim=True)
 
-    return AdvantageOutputs(advantages=rewards - baseline)
+    return AdvantageOutputs(advantages=(rewards - baseline) / (std + 1e-8))
 
 
 def setup_advantage_fn(config: AdvantageConfig) -> AdvantageFn:

@@ -8,7 +8,6 @@ from pathlib import Path
 from subprocess import Popen
 from threading import Event, Thread
 
-import pynvml
 import tomli_w
 
 from prime_rl.configs.rl import RLConfig
@@ -28,15 +27,37 @@ TRAINER_TOML = "trainer.toml"
 ORCHESTRATOR_TOML = "orchestrator.toml"
 INFERENCE_TOML = "inference.toml"
 TEACHER_INFERENCE_TOML = "teacher_inference.toml"
+RM_INFERENCE_TOML = "rm_inference.toml"
 
 
 def get_physical_gpu_ids() -> list[int]:
     """Return physical GPU IDs visible to the launcher."""
-    raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if raw_visible is None:
+    raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("ROCR_VISIBLE_DEVICES")
+    if raw_visible is not None:
+        return [int(token.strip()) for token in raw_visible.split(",") if token.strip()]
+    try:
+        import pynvml
+
         pynvml.nvmlInit()
         return list(range(pynvml.nvmlDeviceGetCount()))
-    return [int(token.strip()) for token in raw_visible.split(",") if token.strip()]
+    except ModuleNotFoundError:
+        import torch
+
+        return list(range(torch.cuda.device_count()))
+
+
+def make_gpu_env(gpu_ids: list[int]) -> dict[str, str]:
+    """Return env vars that restrict a subprocess to the given physical GPU IDs.
+
+    On ROCm, ROCR_VISIBLE_DEVICES selects physical GPUs and re-indexes them starting
+    from 0, so CUDA_VISIBLE_DEVICES must use those local indices.  On NVIDIA,
+    ROCR_VISIBLE_DEVICES is ignored and CUDA_VISIBLE_DEVICES takes physical IDs directly.
+    """
+    physical = ",".join(map(str, gpu_ids))
+    local = ",".join(map(str, range(len(gpu_ids))))
+    if os.path.exists("/dev/kfd"):  # ROCm driver present
+        return {"ROCR_VISIBLE_DEVICES": physical, "CUDA_VISIBLE_DEVICES": local}
+    return {"CUDA_VISIBLE_DEVICES": physical}
 
 
 def write_config(config: RLConfig, output_dir: Path, exclude: set[str] | None = None) -> None:
@@ -68,9 +89,19 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
         with open(output_dir / TEACHER_INFERENCE_TOML, "wb") as f:
             tomli_w.dump(teacher_inference.model_dump(exclude_none=True, mode="json"), f)
 
+    rm_inference = getattr(config, "rm_inference", None)
+    if rm_inference is not None:
+        with open(output_dir / RM_INFERENCE_TOML, "wb") as f:
+            tomli_w.dump(rm_inference.model_dump(exclude_none=True, mode="json"), f)
+
 
 def check_gpus_available(gpu_ids: list[int]) -> None:
     """Raise error if there are existing processes on the specified GPUs."""
+    try:
+        import pynvml
+    except ModuleNotFoundError:
+        return  # GPU process checking not available without pynvml (e.g. AMD/ROCm)
+
     pynvml.nvmlInit()
 
     occupied = []
@@ -115,8 +146,11 @@ def rl_local(config: RLConfig):
     gpu_offset += config.deployment.num_train_gpus
     num_teacher_gpus = config.deployment.num_teacher_gpus or 0
     teacher_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_teacher_gpus)) if num_teacher_gpus > 0 else []
+    gpu_offset += num_teacher_gpus
+    num_rm_gpus = config.deployment.num_rm_gpus or 0
+    rm_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_rm_gpus)) if num_rm_gpus > 0 else []
 
-    total_requested_gpus = num_infer_gpus + config.deployment.num_train_gpus + num_teacher_gpus
+    total_requested_gpus = num_infer_gpus + config.deployment.num_train_gpus + num_teacher_gpus + num_rm_gpus
     physical_gpu_ids = get_physical_gpu_ids()
     if total_requested_gpus > len(physical_gpu_ids):
         raise ValueError(
@@ -129,6 +163,7 @@ def rl_local(config: RLConfig):
     infer_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in infer_local_gpu_ids]
     trainer_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in trainer_local_gpu_ids]
     teacher_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in teacher_local_gpu_ids]
+    rm_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in rm_local_gpu_ids]
 
     start_command = sys.argv
     logger.info("Starting RL run")
@@ -141,7 +176,7 @@ def rl_local(config: RLConfig):
         wandb_shared_env["WANDB_SHARED_RUN_ID"] = uuid.uuid4().hex
 
     # Check for existing processes on GPUs
-    all_gpu_ids = list(set(infer_gpu_ids + trainer_gpu_ids + teacher_gpu_ids))
+    all_gpu_ids = list(set(infer_gpu_ids + trainer_gpu_ids + teacher_gpu_ids + rm_gpu_ids))
     check_gpus_available(all_gpu_ids)
 
     # Validate client port matches inference server port
@@ -179,10 +214,7 @@ def rl_local(config: RLConfig):
             with open(log_dir / "inference.stdout", "w") as log_file:
                 inference_process = Popen(
                     inference_cmd,
-                    env={
-                        **os.environ,
-                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, infer_gpu_ids)),
-                    },
+                    env={**os.environ, **make_gpu_env(infer_gpu_ids)},
                     stdout=log_file,
                     stderr=log_file,
                 )
@@ -223,10 +255,7 @@ def rl_local(config: RLConfig):
             with open(log_dir / "teacher_inference.stdout", "w") as log_file:
                 teacher_inference_process = Popen(
                     teacher_inference_cmd,
-                    env={
-                        **os.environ,
-                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, teacher_gpu_ids)),
-                    },
+                    env={**os.environ, **make_gpu_env(teacher_gpu_ids)},
                     stdout=log_file,
                     stderr=log_file,
                 )
@@ -249,6 +278,37 @@ def rl_local(config: RLConfig):
                 "No teacher_inference config specified, skipping starting teacher inference server. "
                 "Is your teacher inference server running? Make sure orchestrator.teacher_model is configured."
             )
+
+        # Optionally, start reward model inference process
+        if config.rm_inference:
+            if not rm_gpu_ids:
+                raise ValueError(
+                    "rm_inference is configured but deployment.num_rm_gpus is not set. "
+                    "Either set deployment.num_rm_gpus to start an RM inference server, "
+                    "or omit rm_inference and start the server manually."
+                )
+
+            rm_inference_cmd = ["uv", "run", "inference", "@", (config_dir / RM_INFERENCE_TOML).as_posix()]
+            logger.info(f"Starting reward model inference on GPU(s) {' '.join(map(str, rm_gpu_ids))}")
+            logger.debug(f"RM inference start command: {' '.join(rm_inference_cmd)}")
+            with open(log_dir / "rm_inference.stdout", "w") as log_file:
+                rm_inference_process = Popen(
+                    rm_inference_cmd,
+                    env={**os.environ, **make_gpu_env(rm_gpu_ids)},
+                    stdout=log_file,
+                    stderr=log_file,
+                )
+            processes.append(rm_inference_process)
+
+            stop_event = Event()
+            stop_events["rm_inference"] = stop_event
+            monitor_thread = Thread(
+                target=monitor_process,
+                args=(rm_inference_process, stop_event, error_queue, "rm_inference"),
+                daemon=True,
+            )
+            monitor_thread.start()
+            monitor_threads.append(monitor_thread)
 
         # Start orchestrator process
         orchestrator_cmd = [
@@ -315,9 +375,9 @@ def rl_local(config: RLConfig):
                 trainer_cmd,
                 env={
                     **os.environ,
+                    **make_gpu_env(trainer_gpu_ids),
                     **wandb_shared_env,
                     "WANDB_SHARED_LABEL": "trainer",
-                    "CUDA_VISIBLE_DEVICES": ",".join(map(str, trainer_gpu_ids)),
                     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
                     "LOGURU_FORCE_COLORS": "1",
                     "WANDB_PROGRAM": "uv run rl",

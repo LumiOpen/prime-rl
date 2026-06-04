@@ -28,7 +28,7 @@ class PerfCounter:
         self._logger = get_logger()
 
         if torch.cuda.is_available():
-            self.gpu_peak_flops = self._get_peak_flops(torch.cuda.get_device_name(torch.device("cuda")))
+            self.gpu_peak_flops = self._get_peak_flops(self._resolve_device_name(torch.device("cuda")))
         else:
             self.gpu_peak_flops = 0
         # If not tie_word_embeddings, we exclude the embedding parameters from the total number of parameters
@@ -53,6 +53,25 @@ class PerfCounter:
         if tokens_per_second is None:
             return None
         return 100 * self.num_flop_per_token * tokens_per_second / self.gpu_peak_flops / self._world.world_size
+
+    @staticmethod
+    def _resolve_device_name(device: torch.device) -> str:
+        """Return a meaningful GPU name, falling back to amdsmi for ROCm devices."""
+        name = torch.cuda.get_device_name(device)
+        if name and "Radeon Graphics" not in name:
+            return name
+        try:
+            import amdsmi
+
+            amdsmi.amdsmi_init()
+            processors = amdsmi.amdsmi_get_processor_handles()
+            device_index = device.index if device.index is not None else 0
+            if device_index < len(processors):
+                info = amdsmi.amdsmi_get_gpu_asic_info(processors[device_index])
+                return info.get("market_name", name)
+        except Exception:
+            pass
+        return name
 
     def _get_peak_flops(self, device_name: str) -> float:
         """

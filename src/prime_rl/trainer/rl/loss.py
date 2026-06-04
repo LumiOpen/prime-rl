@@ -117,7 +117,7 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
     region being approximated by the probability difference instead of ratio.
     """
     trainer_logprobs = inputs.trainer_logprobs
-    inference_logprobs = inputs.inference_logprobs
+    inference_logprobs = inputs.inference_logprobs.clamp(min=-100.0)
     teacher_logprobs = inputs.teacher_logprobs
     advantages = inputs.advantages
     loss_mask = inputs.loss_mask
@@ -134,7 +134,7 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
     is_masked_high = ipo_invalid_mask_high
     keep_mask = loss_mask & ~is_masked
 
-    log_importance_ratio = trainer_logprobs - inference_logprobs
+    log_importance_ratio = (trainer_logprobs - inference_logprobs).clamp(min=-20.0, max=20.0)
     importance_ratio = torch.exp(log_importance_ratio)
     mismatch_kl = importance_ratio - log_importance_ratio - 1
 

@@ -551,7 +551,8 @@ async def orchestrate(config: OrchestratorConfig):
         example_ids = [r["example_id"] for r in train_rollouts]
         num_rollouts = len(train_rollouts)
         num_unique_examples = len(set(example_ids))
-        rewards = [r["reward"] for r in train_rollouts]
+        reward_weights = {env.resolved_name: env.reward_weight for env in config.env}
+        rewards = [r["reward"] * reward_weights.get(r["task"], 1.0) for r in train_rollouts]
         completion_lens = [get_completion_len(r) for r in train_rollouts]
         advantages = compute_advantages(
             rewards,

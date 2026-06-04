@@ -1,0 +1,90 @@
+# Reproduces: "Generalizing Verifiable Instruction Following" (arXiv:2507.02833)
+# Policy: OLMo-2-1124-7B-Instruct
+# Reward:
+#   if-eval-env   — IFEval + IFEvalG constraint satisfaction (ifeval category)
+#   rubric-judge-env — OLMo-2-1124-7B-RM preference score (general-quality_ref category)
+# Algorithm: GRPO via prime-rl (IPO loss, kl_tau=0 matching paper's beta=0 for base models)
+#
+# Paper hyperparameters (Appendix E):
+#   lr = 5e-7, samples_per_prompt = 16, max_tokens = 2048, temperature = 1.0
+#   RM mixing alpha = 7 (encoded in dataset category ratios, not a config knob)
+#
+# GPU layout (single node):
+#   GPU 0: vLLM inference (policy rollouts)
+#   GPU 1: trainer
+#   GPU 2: vLLM RM inference (OLMo-2-1124-7B-RM, POST /pooling via rm_server_url)
+#
+# rm_server_url is injected automatically into rubric-judge-env args by the
+# auto_setup_rm_inference validator — no manual server startup needed.
+
+max_steps = 2000
+seq_len = 2048
+output_dir = "outputs/dolci-olmo2-7b-paper"
+
+[wandb]
+project = "dolci-if-rlvr"
+name = "olmo2-7b-paper"
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 10
+
+[model]
+name = "/shared_silo/scratch/models/OLMo-2-1124-7B-Instruct"
+
+[trainer.optim]
+lr = 5e-7
+
+[trainer.loss]
+# beta = 0 for base models per paper — disable KL penalty entirely
+kl_tau = 0.1
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+
+[orchestrator.sampling]
+max_tokens = 2048
+temperature = 1.0
+
+[orchestrator.buffer]
+easy_threshold = 0.75 # 0.75
+hard_threshold = 0.25 # 0.25
+online_difficulty_filtering = true
+
+[orchestrator.val]
+interval = 50
+num_examples = 256
+
+[[orchestrator.env]]
+id = "if-eval-env"
+name = "ifeval"
+reward_weight = 1.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", min_passrate = 0.05, max_passrate = 0.95 }
+
+[[orchestrator.env]]
+id = "rubric-judge-env"
+name = "rubric_judge"
+reward_weight = 7.0
+# rm_server_url is NOT set here — it is injected automatically from [rm_inference].
+# rm_model_path must match the --served-model-name the vLLM RM server uses.
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", categories = ["general-quality_ref"], rm_model_path = "/shared_silo/scratch/models/OLMo-2-1124-7B-RM" }
+
+[trainer]
+
+[trainer.tokenizer]
+name = "/shared_silo/scratch/models/OLMo-2-1124-7B-Instruct"
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 1
+num_rm_gpus = 1
+
+[inference]
+
+[rm_inference]
+# vLLM serves OLMo-2-1124-7B-RM with --task reward (POST /pooling endpoint).
+# model.name and server.port are auto-configured from rm_model_path and port offset.
+vllm_extra = { task = "reward" }
+
