@@ -111,6 +111,6 @@ singularity exec \
     -B /opt/amdgpu/share/libdrm:/opt/amdgpu/share/libdrm:ro \
     -B /tmp:/tmp:rw \
     "$IMG" \
-    bash -c "source $ENV_SETUP && uv run --no-sync rl @ $CONFIG --output-dir $OUTPUT_DIR"
+    bash -c "source $ENV_SETUP && uv sync --frozen --no-install-project --all-extras && uv run --no-sync rl @ $CONFIG --output-dir $OUTPUT_DIR"
 
 echo "Job $SLURM_JOB_ID finished."
