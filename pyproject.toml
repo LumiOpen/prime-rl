@@ -62,7 +62,6 @@ envs = [
     "math500",
     "aime2024",
     "aime2025",
-    "if-env",
     "if-eval-env",
     "rubric-judge-env",
 ]
@@ -116,7 +115,6 @@ color-codeword = { index = "primeintellect" }
 math500 = { index = "primeintellect" }
 aime2024 = { index = "primeintellect" }
 aime2025 = { index = "primeintellect" }
-if-env = { path = "envs/if_env", editable = true }
 if-eval-env = { path = "envs/if_eval_env", editable = true }
 rubric-judge-env = { path = "envs/rubric_judge_env", editable = true }
 

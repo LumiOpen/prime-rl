@@ -69,6 +69,8 @@ reward_weight = 7.0
 args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", categories = ["general-quality_ref"], rm_model_path = "/shared_silo/scratch/models/OLMo-2-1124-7B-RM" }
 
 [trainer]
+
+[trainer.model]
 optim_cpu_offload = true
 
 [trainer.tokenizer]
