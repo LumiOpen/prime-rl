@@ -1,0 +1,35 @@
+#!/bin/bash
+# Usage: ./configs/dolci_if/run configs/dolci_if/rl_olmo2_7b_paper.toml [extra sbatch args...]
+
+set -euo pipefail
+
+CONFIG_ARG="${1:-}"
+if [ -z "$CONFIG_ARG" ]; then
+    echo "Usage: $0 path/to/config.toml [extra sbatch args...]" >&2
+    exit 1
+fi
+shift
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PRIME_RL_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Resolve config to absolute path
+if [[ "$CONFIG_ARG" = /* ]]; then
+    CONFIG="$CONFIG_ARG"
+else
+    CONFIG="$PRIME_RL_DIR/$CONFIG_ARG"
+fi
+
+if [ ! -f "$CONFIG" ]; then
+    echo "ERROR: Config not found: $CONFIG" >&2
+    exit 1
+fi
+
+# Derive job name: strip leading rl_ and prepend dolci-
+CONFIG_STEM="$(basename "$CONFIG" .toml)"
+JOB_NAME="dolci-${CONFIG_STEM#rl_}"
+
+echo "Submitting: $JOB_NAME"
+echo "Config:     $CONFIG"
+
+sbatch --job-name="$JOB_NAME" "$@" "$SCRIPT_DIR/run.sbatch" "$CONFIG"

@@ -1,29 +1,29 @@
-# Reproduces: "Generalizing Verifiable Instruction Following" (arXiv:2507.02833)
-# Policy: OLMo-2-1124-7B-Instruct
+# Policy: Qwen3.5-35B-A3B-Base (MoE: 35B total / ~3B active, 256 experts, top-8)
 # Reward:
 #   if-eval-env   — IFEval + IFEvalG constraint satisfaction (ifeval category)
 #   rubric-judge-env — OLMo-2-1124-7B-RM preference score (general-quality_ref category)
-# Algorithm: GRPO via prime-rl (IPO loss, kl_tau=0 matching paper's beta=0 for base models)
+# Algorithm: GRPO via prime-rl (IPO loss, kl_tau=0 for base model)
 #
-# Paper hyperparameters (Appendix E):
+# Hyperparameters follow Dolci paper (arXiv:2507.02833) Appendix E:
 #   lr = 5e-7, samples_per_prompt = 16, max_tokens = 2048, temperature = 1.0
-#   RM mixing alpha = 7 (encoded in dataset category ratios, not a config knob)
+#   RM mixing alpha = 7 (encoded in reward_weight ratio)
 #
-# GPU layout (single node):
-#   GPU 0: vLLM inference (policy rollouts)
-#   GPU 1: trainer
-#   GPU 2: vLLM RM inference (OLMo-2-1124-7B-RM, POST /pooling via rm_server_url)
+# GPU layout (single node, 4 GPUs):
+#   GPU 0: vLLM inference (policy rollouts) — 67GB weights, fits on 1×256GB
+#   GPU 1-2: trainer (FSDP across 2 GPUs; optim_cpu_offload moves AdamW states to RAM —
+#            without it, optimizer state alloc OOMs even with 2-GPU FSDP sharding)
+#   GPU 3: vLLM RM inference (OLMo-2-1124-7B-RM)
 #
-# rm_server_url is injected automatically into rubric-judge-env args by the
-# auto_setup_rm_inference validator — no manual server startup needed.
+# Qwen3.5-35B-A3B-Base has no chat template — use instruct tokenizer for vLLM rollouts.
+# rm_server_url is injected automatically by auto_setup_rm_inference validator.
 
 max_steps = 2000
 seq_len = 2048
-output_dir = "outputs/dolci-olmo2-7b-paper"
+output_dir = "outputs/dolci-qwen35-35b-a3b-base-olmo-rm"
 
 [wandb]
 project = "dolci-if-rlvr"
-name = "olmo2-7b-paper"
+name = "qwen35-35b-a3b-base-olmo-rm"
 
 [orchestrator.wandb.log_extras]
 samples = true
@@ -31,14 +31,13 @@ distributions = true
 interval = 10
 
 [model]
-name = "/shared_silo/scratch/models/OLMo-2-1124-7B-Instruct"
+name = "/shared_silo/scratch/models/Qwen3.5-35B-A3B-Base"
 
 [trainer.optim]
 lr = 5e-7
 
 [trainer.loss]
-# beta = 0 for base models per paper — disable KL penalty entirely
-kl_tau = 0.1
+kl_tau = 0.0
 
 [orchestrator]
 batch_size = 128
@@ -49,8 +48,8 @@ max_tokens = 2048
 temperature = 1.0
 
 [orchestrator.buffer]
-easy_threshold = 0.95 # 0.75
-hard_threshold = 0.05 # 0.25
+easy_threshold = 0.95
+hard_threshold = 0.05
 online_difficulty_filtering = true
 
 [orchestrator.val]
@@ -67,27 +66,25 @@ args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", min_p
 id = "rubric-judge-env"
 name = "rubric_judge"
 reward_weight = 7.0
-# rm_server_url is NOT set here — it is injected automatically from [rm_inference].
-# rm_model_path must match the --served-model-name the vLLM RM server uses.
 args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", categories = ["general-quality_ref"], rm_model_path = "/shared_silo/scratch/models/OLMo-2-1124-7B-RM" }
 
 [trainer]
+optim_cpu_offload = true
 
 [trainer.tokenizer]
-name = "/shared_silo/scratch/models/OLMo-2-1124-7B-Instruct"
+name = "/shared_silo/scratch/models/Qwen3.5-35B-A3B-Base"
 
 [ckpt]
 interval = 400
 
 [deployment]
-num_train_gpus = 1
+num_train_gpus = 2
 num_infer_gpus = 1
 num_rm_gpus = 1
 
 [inference]
+# Base model has no chat template — use instruct tokenizer for vLLM chat completions.
+vllm_extra = { tokenizer = "/shared_silo/scratch/models/Qwen3.5-35B-A3B" }
 
 [rm_inference]
-# vLLM serves OLMo-2-1124-7B-RM with --task reward (POST /pooling endpoint).
-# model.name and server.port are auto-configured from rm_model_path and port offset.
 vllm_extra = { task = "reward" }
-

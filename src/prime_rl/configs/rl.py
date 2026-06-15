@@ -919,16 +919,25 @@ class RLConfig(BaseConfig):
             self.rm_inference.vllm_extra = {}
         self.rm_inference.vllm_extra.setdefault("task", "reward")
 
-        # Inject rm_server_url into any env that has rm_model_path but no rm_server_url
+        # Inject rm_server_url into any env that has rm_model_path but no rm_server_url.
+        # Also handles custom_rm=True envs that use judge_model_path instead of rm_model_path.
         host = self.rm_inference.server.host or "localhost"
         port = self.rm_inference.server.port
         rm_server_url = f"http://{host}:{port}"
         for env in self.orchestrator.env:
             args = env.args or {}
-            if "rm_model_path" in args and "rm_server_url" not in args:
-                # Sync model name from env args so the server serves the right model
+            if "rm_server_url" in args:
+                continue
+            if "rm_model_path" in args:
+                # Standard RM path: sync model name so server serves the right model
                 if self.rm_inference.model.name == "Qwen/Qwen3-0.6B":  # default placeholder
                     self.rm_inference.model.name = args["rm_model_path"]
+                args["rm_server_url"] = rm_server_url
+                env.args = args
+            elif args.get("custom_rm") and "judge_model_path" in args:
+                # LLM-as-judge path: sync model name from judge_model_path
+                if self.rm_inference.model.name == "Qwen/Qwen3-0.6B":  # default placeholder
+                    self.rm_inference.model.name = args["judge_model_path"]
                 args["rm_server_url"] = rm_server_url
                 env.args = args
 

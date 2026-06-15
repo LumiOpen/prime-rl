@@ -11,7 +11,7 @@ from pathlib import Path
 import verifiers as vf
 from datasets import Dataset
 
-from .rubric import RubricJudgeRubric
+from .rubric import LLMJudgeRubric, RubricJudgeRubric
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,7 @@ def _build_example(row: dict) -> dict | None:
         "info": {
             "category": row.get("dataset_str", "general-quality"),
             "prompt_text": user_content,
+            "reference": row.get("ground_truth") or "",
         },
     }
 
@@ -84,33 +85,60 @@ def load_environment(
     dataset_seed: int = 42,
     system_prompt: str = _SYSTEM_PROMPT,
     map_kwargs: dict = {},
+    # LLM-as-judge mode — activated when custom_rm=True.
+    # The judge model is served via the same vLLM instance as the RM
+    # (rm_server_url is reused as judge_server_url automatically).
+    custom_rm: bool = False,
+    judge_model_path: str | None = None,
+    judge_prompt_template: str | None = None,
+    max_judge_tokens: int = 512,
+    judge_temperature: float = 0.0,
     **kwargs,
 ) -> vf.Environment:
     """
     Load the Dolci rubric-judge environment (RM-based reward).
 
     Args:
-        dataset_path:    Path to Dolci-Think-RL-7B directory (contains data/*.parquet).
-        categories:      Dataset categories to include. Options: "general-quality",
-                         "general-quality_ref".
-        rm_model_path:   Path/name of the reward model. Required.
-                         For local: HF path or local dir.
-                         For vLLM: must match the --served-model-name the server uses.
-        rm_device:       Device to load the model on when using local backend (default: "cuda").
-        rm_server_url:   Base URL of a running vLLM reward model server, e.g.
-                         "http://localhost:8000". When set, scoring calls POST /v1/score
-                         instead of loading the model locally. rm_device is ignored.
-        min_passrate:    Drop examples below this passrate (NaN rows always included).
-        max_passrate:    Drop examples above this passrate (NaN rows always included).
-        dataset_shuffle: Shuffle the dataset.
-        dataset_seed:    Seed for shuffling.
-        system_prompt:   System prompt prepended to every conversation.
+        dataset_path:           Path to Dolci-Think-RL-7B directory.
+        categories:             Dataset categories to include.
+        rm_model_path:          Path/name of the reward model (SequenceClassification RM).
+                                Required unless custom_rm=True.
+        rm_device:              Device for local RM backend (default: "cuda").
+        rm_server_url:          vLLM reward model server URL.  Injected automatically
+                                by auto_setup_rm_inference; also used as the judge
+                                server URL when custom_rm=True.
+        min_passrate:           Drop examples below this passrate.
+        max_passrate:           Drop examples above this passrate.
+        dataset_shuffle:        Shuffle the dataset.
+        dataset_seed:           Seed for shuffling.
+        system_prompt:          System prompt prepended to every conversation.
+        custom_rm:              When True, use an LLM-as-judge via vLLM chat completions
+                                instead of a SequenceClassification reward model.
+                                The judge is served at rm_server_url (injected automatically).
+        judge_model_path:       Path/name of the judge model as served by vLLM
+                                (must match --served-model-name).  Required when custom_rm=True.
+        judge_prompt_template:  Custom judge prompt with {question} and {answer} placeholders.
+                                Defaults to _DEFAULT_JUDGE_PROMPT.
+        max_judge_tokens:       Max tokens the judge may generate (default: 512).
+        judge_temperature:      Sampling temperature for the judge (default: 0.0 = greedy).
     """
-    if rm_model_path is None:
-        raise ValueError(
-            "rm_model_path is required for rubric-judge-env. "
-            "Add rm_model_path = '/shared_silo/scratch/models/OLMo-2-1124-7B-RM' to env args in the TOML."
-        )
+    if custom_rm:
+        if judge_model_path is None:
+            raise ValueError(
+                "judge_model_path is required when custom_rm=True. "
+                "Add judge_model_path = '/path/to/Qwen3-8B' to env args in the TOML."
+            )
+        if rm_server_url is None:
+            raise ValueError(
+                "rm_server_url must be set (or auto-injected via [rm_inference]) "
+                "when custom_rm=True."
+            )
+    else:
+        if rm_model_path is None:
+            raise ValueError(
+                "rm_model_path is required for rubric-judge-env. "
+                "Add rm_model_path = '/shared_silo/scratch/models/OLMo-2-1124-7B-RM' to env args in the TOML."
+            )
 
     invalid = set(categories) - _GENERAL_CATEGORIES
     if invalid:
@@ -149,7 +177,17 @@ def load_environment(
             ds = ds.shuffle(seed=dataset_seed)
         return ds
 
-    rubric = RubricJudgeRubric(rm_model_path=rm_model_path, rm_device=rm_device, rm_server_url=rm_server_url)
+    if custom_rm:
+        from .rubric import _DEFAULT_JUDGE_PROMPT
+        rubric = LLMJudgeRubric(
+            judge_model_path=judge_model_path,
+            judge_server_url=rm_server_url,
+            judge_prompt_template=judge_prompt_template or _DEFAULT_JUDGE_PROMPT,
+            max_judge_tokens=max_judge_tokens,
+            judge_temperature=judge_temperature,
+        )
+    else:
+        rubric = RubricJudgeRubric(rm_model_path=rm_model_path, rm_device=rm_device, rm_server_url=rm_server_url)
 
     return vf.SingleTurnEnv(
         dataset=build_dataset,
