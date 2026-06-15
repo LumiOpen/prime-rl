@@ -58,7 +58,6 @@ envs = [
     "code-env",
     "science-env",
     "logic-env",
-    "color-codeword",
     "math500",
     "aime2024",
     "aime2025",
