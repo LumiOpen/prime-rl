@@ -63,6 +63,7 @@ envs = [
     "aime2025",
     "if-eval-env",
     "rubric-judge-env",
+    "dolci-ifeval-env",
 ]
 
 [dependency-groups]
@@ -116,6 +117,7 @@ aime2024 = { index = "primeintellect" }
 aime2025 = { index = "primeintellect" }
 if-eval-env = { path = "envs/if_eval_env", editable = true }
 rubric-judge-env = { path = "envs/rubric_judge_env", editable = true }
+dolci-ifeval-env = { path = "envs/dolci_ifeval_env", editable = true }
 
 [[tool.uv.index]]
 name = "primeintellect"
