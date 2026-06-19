@@ -1,0 +1,83 @@
+# Policy: OLMo-3-7B-Instruct
+# Reward:
+#   if-eval-env       — IFEval + IFEvalG constraint satisfaction (ifeval category)
+#   rubric-judge-env  — Qwen3-8B LLM-as-judge (custom_rm=True), score 1-10 normalised to [0,1]
+# Algorithm: GRPO via prime-rl (IPO loss)
+#
+# GPU layout (single node):
+#   GPU 0: vLLM inference (policy rollouts)
+#   GPU 1: trainer
+#   GPU 2: vLLM judge inference (Qwen3-8B, POST /v1/chat/completions)
+#
+# kl_tau = 0.1: instruct model needs KL regularisation to retain SFT instruction-following.
+# OLMo-3 Instruct has its own chat template — no tokenizer override needed.
+# rm_server_url is injected automatically by auto_setup_rm_inference validator.
+
+max_steps = 2000
+seq_len = 2048
+output_dir = "outputs/dolci-olmo3-7b-instruct-qwen3-8b-judge"
+
+[wandb]
+project = "dolci-if-rlvr"
+name = "olmo3-7b-instruct-qwen3-8b-judge"
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 10
+
+[model]
+name = "/shared_silo/scratch/models/Olmo-3-7B-Instruct"
+
+[trainer.optim]
+lr = 5e-7
+
+[trainer.loss]
+kl_tau = 0.1
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+
+[orchestrator.sampling]
+max_tokens = 2048
+temperature = 1.0
+
+[orchestrator.buffer]
+easy_threshold = 0.95
+hard_threshold = 0.05
+online_difficulty_filtering = true
+
+[orchestrator.val]
+interval = 50
+num_examples = 256
+
+[[orchestrator.env]]
+id = "if-eval-env"
+name = "ifeval"
+reward_weight = 1.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", min_passrate = 0.05, max_passrate = 0.95 }
+
+[[orchestrator.env]]
+id = "rubric-judge-env"
+name = "rubric_judge"
+reward_weight = 7.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", categories = ["general-quality_ref"], custom_rm = true, judge_model_path = "/shared_silo/scratch/models/Qwen3-8B" }
+
+[trainer]
+
+[trainer.tokenizer]
+name = "/shared_silo/scratch/models/Olmo-3-7B-Instruct"
+
+[ckpt]
+interval = 400
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 1
+num_rm_gpus = 1
+
+[inference]
+
+[rm_inference]
+vllm_extra = { task = "generate" }

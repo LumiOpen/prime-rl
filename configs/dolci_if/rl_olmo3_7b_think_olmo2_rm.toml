@@ -1,0 +1,90 @@
+# Policy: OLMo-3-7B-Think (allenai/Olmo-3-7B-Think)
+# Reward:
+#   if-eval-env   — IFEval + IFEvalG constraint satisfaction (ifeval category)
+#   rubric-judge-env — OLMo-2-1124-7B-RM preference score (general-quality_ref category)
+# Algorithm: GRPO via prime-rl (IPO loss)
+#
+# GPU layout (single node):
+#   GPU 0: vLLM inference (policy rollouts)
+#   GPU 1: trainer
+#   GPU 2: vLLM RM inference (OLMo-2-1124-7B-RM, POST /pooling via rm_server_url)
+#
+# kl_tau = 0.1: instruct/think model needs KL regularisation to retain SFT behaviour.
+# Chat template is in chat_template.jinja — vLLM loads it automatically.
+# rm_server_url is injected automatically by auto_setup_rm_inference validator.
+#
+# seq_len and max_tokens are raised to 4096 to give the model room to produce
+# <think>...</think> reasoning blocks before the actual answer.
+# NOTE: _extract_text does not strip <think> blocks — OLMo-2-RM scores the full
+# completion including the reasoning trace.
+
+max_steps = 2000
+seq_len = 4096
+output_dir = "outputs/dolci-olmo3-7b-think-olmo2-rm"
+
+[wandb]
+project = "dolci-if-rlvr"
+name = "olmo3-7b-think-olmo2-rm"
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 10
+
+[model]
+name = "/shared_silo/scratch/models/Olmo-3-7B-Think"
+
+[trainer.optim]
+lr = 5e-7
+
+[trainer.loss]
+kl_tau = 0.1
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+
+[orchestrator.sampling]
+max_tokens = 4096
+temperature = 1.0
+
+[orchestrator.buffer]
+easy_threshold = 0.95
+hard_threshold = 0.05
+online_difficulty_filtering = true
+
+[orchestrator.val]
+interval = 50
+num_examples = 256
+
+[[orchestrator.env]]
+id = "if-eval-env"
+name = "ifeval"
+reward_weight = 1.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", min_passrate = 0.05, max_passrate = 0.95 }
+
+[[orchestrator.env]]
+id = "rubric-judge-env"
+name = "rubric_judge"
+reward_weight = 7.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", categories = ["general-quality_ref"], rm_model_path = "/shared_silo/scratch/models/OLMo-2-1124-7B-RM", rm_max_response_chars = 10000 }
+
+[trainer]
+
+[trainer.tokenizer]
+name = "/shared_silo/scratch/models/Olmo-3-7B-Think"
+
+[ckpt]
+interval = 400
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 1
+num_rm_gpus = 1
+
+[inference]
+
+[rm_inference]
+# OLMo-2-RM max_position_embeddings=4096 — cannot be extended.
+# Responses exceeding 4096 tokens (prompt+completion) will get 0 RM reward.
+vllm_extra = { task = "reward" }

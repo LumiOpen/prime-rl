@@ -65,13 +65,39 @@ Provide a brief reasoning, then end your response with exactly this line:
 Score: <integer from 1 to 10>"""
 
 
+def _strip_think_blocks(text: str) -> str:
+    """Remove thinking content so scorers only see the final answer.
+
+    Handles three cases:
+    1. Full <think>...</think> block in completion — remove it
+    2. Completion starts mid-think (chat template pre-fills '<think>', so the
+       response begins inside the block with no opening tag): strip up to </think>
+    3. No think tags at all (non-think model, or truncated mid-think with no </think>):
+       return text as-is for non-think models; return "" only if truncated mid-think
+    """
+    import re
+    # Case 1: full <think>...</think> blocks present — remove them
+    if "<think>" in text:
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        # Also handle unclosed opening tag (truncated mid-think)
+        text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+        return text.strip()
+    # Case 2: completion is the inside of a think block (no opening tag, has closing tag)
+    # Chat template pre-fills '<think>' so response starts mid-reasoning
+    if "</think>" in text:
+        text = text[text.index("</think>") + len("</think>"):]
+        return text.strip()
+    # Case 3: no think tags at all — regular model output, return as-is
+    return text.strip()
+
+
 def _extract_text(completion) -> str:
     if isinstance(completion, str):
-        return completion
+        return _strip_think_blocks(completion)
     if isinstance(completion, list):
         parts = [msg.get("content") or "" for msg in completion if msg.get("role") == "assistant"]
-        return "\n".join(parts)
-    return str(completion)
+        return _strip_think_blocks("\n".join(parts))
+    return _strip_think_blocks(str(completion))
 
 
 class RubricJudgeRubric(vf.Rubric):
@@ -89,11 +115,13 @@ class RubricJudgeRubric(vf.Rubric):
         rm_model_path: str,
         rm_device: str = "cuda",
         rm_server_url: str | None = None,
+        rm_max_response_chars: int | None = None,
     ):
         super().__init__()
         self._rm_model_path = rm_model_path
         self._rm_device = rm_device
         self._rm_server_url = rm_server_url.rstrip("/") if rm_server_url else None
+        self._rm_max_response_chars = rm_max_response_chars
         self._rm = None
         self._rm_tokenizer = None
         self._session = None  # aiohttp session, created lazily
@@ -141,6 +169,8 @@ class RubricJudgeRubric(vf.Rubric):
         import aiohttp
         if self._session is None:
             self._session = aiohttp.ClientSession()
+        if self._rm_max_response_chars is not None and len(response) > self._rm_max_response_chars:
+            response = response[:self._rm_max_response_chars]
         messages = [{"role": "user", "content": prompt}, {"role": "assistant", "content": response}]
         url = f"{self._rm_server_url}/pooling"
         payload = {"model": self._rm_model_path, "messages": messages}

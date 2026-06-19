@@ -79,6 +79,7 @@ def load_environment(
     rm_model_path: str | None = None,
     rm_device: str = "cuda",
     rm_server_url: str | None = None,
+    rm_max_response_chars: int | None = None,
     min_passrate: float = 0.05,
     max_passrate: float = 0.95,
     dataset_shuffle: bool = True,
@@ -187,7 +188,7 @@ def load_environment(
             judge_temperature=judge_temperature,
         )
     else:
-        rubric = RubricJudgeRubric(rm_model_path=rm_model_path, rm_device=rm_device, rm_server_url=rm_server_url)
+        rubric = RubricJudgeRubric(rm_model_path=rm_model_path, rm_device=rm_device, rm_server_url=rm_server_url, rm_max_response_chars=rm_max_response_chars)
 
     return vf.SingleTurnEnv(
         dataset=build_dataset,
