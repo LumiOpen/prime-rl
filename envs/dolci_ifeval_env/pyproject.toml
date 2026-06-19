@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dolci-ifeval-env"
+version = "0.1.0"
+description = "IFEval and Finnish IFEval environments for the verifiers framework"
+requires-python = ">=3.10"
+dependencies = [
+    "verifiers",
+    "datasets",
+    "langdetect",
+    "absl-py",
+    "immutabledict",
+    "nltk",
+]
+
+[tool.hatch.build]
+include = ["ifeval_env/", "dolci_ifeval_env/", "dolci_ifeval_env/IFEvalG_fi/", "dolci_ifeval_env_fi/", "pyproject.toml"]
