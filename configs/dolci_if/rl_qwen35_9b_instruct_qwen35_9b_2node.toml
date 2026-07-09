@@ -1,0 +1,116 @@
+# Policy: Qwen3.5-9B (instruct) — 2-node multinode setup
+# Reward:
+#   dolci-ifeval-env — IFEval constraint satisfaction, English
+#   rubric-judge-env — Qwen3.5-9B (instruct) LLM-as-judge, English
+# Algorithm: GRPO via prime-rl (IPO loss)
+#
+# GPU layout (2 nodes):
+#   Node 0: 8-GPU FSDP trainer — full node for gradient computation
+#   Node 1, GPU 0-5: vLLM inference (policy rollouts, TP=4 + DP=2 = 8 GPUs total)
+#   Node 1, GPU 6: vLLM judge inference (Qwen3.5-9B)
+#   Node 1, GPU 7: spare / RM if needed
+#
+# Benefits vs single node:
+#   - 8× more trainer GPUs → larger effective batch, better gradient estimates
+#   - batch_size 512 (vs 128) — more examples per step, lower variance gradients
+#   - TP=4 inference → higher throughput for 9B model rollouts
+#
+# Launch:
+#   cd /path/to/prime-rl
+#   uv run rl @ configs/dolci_if/rl_qwen35_9b_instruct_qwen35_9b_2node.toml --dry-run
+#   sbatch outputs/dolci-qwen35-9b-instruct-2node/rl.sbatch
+#
+# kl_tau = 0.1: instruct model needs KL regularisation.
+
+max_steps = 2000
+seq_len = 2048
+output_dir = "outputs/dolci-qwen35-9b-instruct-qwen35-9b-judge-2node"
+
+[slurm]
+job_name = "dolci-qwen35-9b-2node"
+partition = "amd-tw-verification"
+time = "48:00:00"
+project_dir = "/shared_silo/scratch/mmelnik/lib/rocm72/prime-rl"
+
+[wandb]
+project = "dolci-if-rlvr"
+name = "qwen35-9b-instruct-qwen35-9b-judge-2node"
+shared = true
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 50
+
+[model]
+name = "/shared_silo/scratch/models/Qwen3.5-9B"
+
+[trainer.optim]
+lr = 5e-7
+
+[trainer.loss]
+kl_tau = 0.1
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+
+[orchestrator.sampling]
+max_tokens = 2048
+temperature = 1.0
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[orchestrator.buffer]
+easy_threshold = 0.95
+hard_threshold = 0.05
+online_difficulty_filtering = true
+# Force equal sampling from both envs so rubric_judge isn't starved by faster dolci_ifeval
+env_ratios = [1.0, 1.0]
+
+#[[orchestrator.eval.env]]
+#id = "math500"
+#num_examples = 30
+#rollouts_per_example = 4
+
+[[orchestrator.env]]
+id = "dolci-ifeval-env"
+name = "dolci_ifeval"
+reward_weight = 1.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B" }
+
+[[orchestrator.env]]
+id = "rubric-judge-env"
+name = "rubric_judge"
+reward_weight = 2.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", categories = ["general-quality_ref", "general-quality"], custom_rm = true, judge_model_path = "/shared_silo/scratch/models/Qwen3.5-9B", max_judge_tokens = 64 }
+
+[trainer]
+
+[trainer.tokenizer]
+name = "/shared_silo/scratch/models/Qwen3.5-9B"
+
+[ckpt]
+interval = 400
+
+[deployment]
+type = "multi_node"
+num_train_nodes = 1
+num_infer_nodes = 1
+num_infer_replicas = 1
+gpus_per_node = 8
+
+[weight_broadcast]
+type = "filesystem"
+
+[inference]
+# Instruct model has its own chat template — no tokenizer override needed.
+
+[inference.parallel]
+tp = 4
+dp = 1
+
+[inference.server]
+port = 8000
+
+[rm_inference]
+vllm_extra = { task = "generate", max_model_len = 8192 }

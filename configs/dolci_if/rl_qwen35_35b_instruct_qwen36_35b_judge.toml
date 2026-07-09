@@ -1,0 +1,89 @@
+# Policy: Qwen3.5-35B-A3B (instruct, MoE: 35B total / ~3B active)
+# Reward:
+#   dolci-ifeval-env — IFEval constraint satisfaction, English (dolci_ifeval_env)
+#   rubric-judge-env — Qwen3.6-35B-A3B (instruct) LLM-as-judge, English (general-quality_ref)
+# Algorithm: GRPO via prime-rl (IPO loss)
+#
+# GPU layout (single node, 6 GPUs):
+#   GPU 0:   vLLM inference (policy rollouts, Qwen3.5-35B-A3B instruct)
+#   GPU 1-4: trainer (4-GPU FSDP, optim_cpu_offload for 35B)
+#   GPU 5:   vLLM judge inference (Qwen3.6-35B-A3B instruct)
+#
+# kl_tau = 0.1: instruct model needs KL regularisation.
+# Instruct models have their own chat templates — no tokenizer overrides needed.
+# enable_thinking=false: suppress thinking preamble in rollouts.
+# language_model_only: skip VL pipeline for qwen3_5_moe architecture in vLLM.
+
+max_steps = 4000
+seq_len = 2048
+output_dir = "outputs/dolci-qwen35-35b-instruct-qwen36-35b-judge"
+
+[wandb]
+project = "primerl"
+name = "qwen35-35b-instruct-qwen36-35b-judge"
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 50
+
+[model]
+name = "/shared_silo/scratch/models/Qwen3.5-35B-A3B"
+
+[trainer.optim]
+lr = 5e-7
+
+[trainer.loss]
+kl_tau = 0.1
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+
+[orchestrator.sampling]
+max_tokens = 2048
+temperature = 1.0
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[orchestrator.buffer]
+easy_threshold = 0.95
+hard_threshold = 0.05
+online_difficulty_filtering = true
+
+[[orchestrator.env]]
+id = "dolci-ifeval-env"
+name = "dolci_ifeval"
+reward_weight = 1.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B" }
+
+[[orchestrator.env]]
+id = "rubric-judge-env"
+name = "rubric_judge"
+reward_weight = 2.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", categories = ["general-quality_ref", "general-quality"], custom_rm = true, judge_model_path = "/shared_silo/scratch/models/Qwen3.6-35B-A3B", max_judge_tokens = 64 }
+
+[trainer]
+
+[trainer.model]
+optim_cpu_offload = true
+
+[trainer.tokenizer]
+name = "/shared_silo/scratch/models/Qwen3.5-35B-A3B"
+
+[ckpt]
+interval = 500
+
+[deployment]
+num_train_gpus = 4
+num_infer_gpus = 1
+num_rm_gpus = 1
+
+[inference]
+# Instruct model has its own chat template — no tokenizer override needed.
+# language_model_only: skip VL multimodal pipeline for qwen3_5_moe in vLLM.
+vllm_extra = { language_model_only = true }
+
+[rm_inference]
+# Qwen3.6-35B-A3B instruct has its own chat template.
+# language_model_only: skip VL pipeline for qwen3_5_moe architecture.
+vllm_extra = { task = "generate", max_model_len = 8192, language_model_only = true }

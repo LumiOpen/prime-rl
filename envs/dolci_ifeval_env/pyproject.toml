@@ -16,5 +16,9 @@ dependencies = [
     "nltk",
 ]
 
+[project.entry-points."verifiers.environments"]
+dolci-ifeval-env = "dolci_ifeval_env:load_environment"
+dolci-ifeval-env-fi = "dolci_ifeval_env:load_environment_fi"
+
 [tool.hatch.build]
 include = ["ifeval_env/", "dolci_ifeval_env/", "dolci_ifeval_env/IFEvalG_fi/", "dolci_ifeval_env_fi/", "pyproject.toml"]

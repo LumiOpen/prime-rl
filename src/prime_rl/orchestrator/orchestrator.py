@@ -821,6 +821,15 @@ async def orchestrate(config: OrchestratorConfig):
                 to_log[f"val/reward/{env}/max"] = env_by_example.reward.mean().max()
                 to_log[f"val/reward/{env}/min"] = env_by_example.reward.mean().min()
 
+        # Log per-env rewards to stdout for real-time monitoring
+        env_rewards = " | ".join(
+            f"{k.split('/')[1]}={v:.3f}"
+            for k, v in to_log.items()
+            if k.startswith("reward/") and k.endswith("/mean") and k != "reward/all/mean"
+        )
+        if env_rewards:
+            logger.info(f"Step {progress.step} rewards: {env_rewards}")
+
         # Log metrics to monitor(s)
         monitor.log(to_log, step=progress.step)
 

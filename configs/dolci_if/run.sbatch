@@ -2,11 +2,11 @@
 #SBATCH --job-name=dolci-rl
 #SBATCH --partition=amd-tw-verification
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=32
-#SBATCH --exclusive=user
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=0
-#SBATCH --time=48:00:00
+#SBATCH --exclusive
+#SBATCH --time=72:00:00
 #SBATCH --output=/shared_silo/scratch/mmelnik/lib/rocm72/prime-rl/slurm_logs/dolci_%j.out
 #SBATCH --error=/shared_silo/scratch/mmelnik/lib/rocm72/prime-rl/slurm_logs/dolci_%j.err
 
@@ -77,6 +77,7 @@ export UV_CACHE_DIR=$PRIME_RL_DIR/uv_cache
 export PATH=\$PYTHONUSERBASE/bin:\$PATH
 export HOME=/tmp/home_${SLURM_JOB_ID}
 export VLLM_CACHE_ROOT=/shared_silo/scratch/mmelnik/cache/vllm_cache
+export NLTK_DATA=/shared_silo/scratch/mmelnik/cache/nltk_data
 export PYTHONPATH=$PRIME_RL_DIR/envs/if_eval_env:$PRIME_RL_DIR/envs/rubric_judge_env:\${PYTHONPATH:-}
 mkdir -p \$HOME /shared_silo/scratch/mmelnik/cache/vllm_cache
 

@@ -1,0 +1,90 @@
+# Policy: OLMo-3-1025-7B (base)
+# Reward:
+#   if-eval-env         — IFEval constraint satisfaction, English (ifeval category)
+#   dolci-ifeval-env    — IFEval constraint satisfaction, English (dolci_ifeval_env)
+#   dolci-ifeval-env-fi — IFEval constraint satisfaction, Finnish (translated dataset)
+#   rubric-judge-env    — Qwen3.5-9B LLM-as-judge, English (general-quality_ref)
+#   rubric-judge-env-fi — Qwen3.5-9B LLM-as-judge, Finnish (translated dataset)
+# Algorithm: GRPO via prime-rl (IPO loss)
+#
+# GPU layout (single node):
+#   GPU 0: vLLM inference (policy rollouts)
+#   GPU 1: trainer
+#   GPU 2: vLLM judge inference (Qwen3.5-9B, POST /v1/chat/completions)
+#
+# kl_tau = 0.0: base model, no KL regularisation needed.
+# Base model has no chat template — use instruct tokenizer for vLLM rollouts.
+
+max_steps = 2000
+seq_len = 2048
+output_dir = "outputs/dolci-olmo3-7b-base-qwen35-9b-judge-dolci-ifeval-fi"
+
+[wandb]
+project = "dolci-if-rlvr"
+name = "olmo3-7b-base-qwen35-9b-judge-dolci-ifeval-fi"
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 10
+
+[model]
+name = "/shared_silo/scratch/models/Olmo-3-1025-7B"
+
+[trainer.optim]
+lr = 5e-7
+
+[trainer.loss]
+kl_tau = 0.0
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+
+[orchestrator.sampling]
+max_tokens = 2048
+temperature = 1.0
+
+[orchestrator.buffer]
+easy_threshold = 0.95
+hard_threshold = 0.05
+online_difficulty_filtering = true
+
+[[orchestrator.eval.env]]
+id = "math500"
+num_examples = 30
+rollouts_per_example = 4
+
+
+[[orchestrator.env]]
+id = "dolci-ifeval-env-fi"
+name = "dolci_ifeval_fi"
+reward_weight = 2.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi.jsonl" }
+
+
+[[orchestrator.env]]
+id = "rubric-judge-env"
+name = "rubric_judge_fi"
+reward_weight = 7.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi.jsonl", categories = ["general-quality_ref"], custom_rm = true, judge_model_path = "/shared_silo/scratch/models/Qwen3.5-9B", max_judge_tokens = 4096, use_finnish = true }
+
+[trainer]
+
+[trainer.tokenizer]
+name = "/shared_silo/scratch/models/Olmo-3-1025-7B"
+
+[ckpt]
+interval = 400
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 1
+num_rm_gpus = 1
+
+[inference]
+# Base model has no chat template — use instruct tokenizer for vLLM chat completions.
+vllm_extra = { tokenizer = "/shared_silo/scratch/models/Olmo-3-7B-Instruct" }
+
+[rm_inference]
+vllm_extra = { task = "generate", max_model_len = 8192 }

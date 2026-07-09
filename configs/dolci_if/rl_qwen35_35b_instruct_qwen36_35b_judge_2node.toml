@@ -1,0 +1,119 @@
+# Policy: Qwen3.5-35B-A3B (instruct, MoE) — 2-node setup
+# Reward:
+#   dolci-ifeval-env — IFEval constraint satisfaction, English
+#   rubric-judge-env — Qwen3.6-35B-A3B (instruct) LLM-as-judge, English
+# Algorithm: GRPO via prime-rl (IPO loss)
+#
+# GPU layout (2 nodes, 8 GPUs each):
+#   Node 0 (train):  8-GPU FSDP trainer, optim_cpu_offload for 35B MoE
+#   Node 1 (infer):  GPU 0-3: policy inference (DP=4, TP=1 — 4 instances × 1 GPU)
+#                    GPU 4-7: RM/judge inference (DP=4, TP=1 — 4 instances × 1 GPU)
+#
+# 35B-A3B fits on 1 GPU (70GB < 256GB VRAM), TP=1 is fine.
+# DP=4 for both policy and RM → 4× rollout throughput, 4× scoring throughput.
+# language_model_only: skip VL pipeline for qwen3_5_moe architecture in vLLM.
+#
+# Launch: sbatch run_2node.sbatch configs/dolci_if/rl_qwen35_35b_instruct_qwen36_35b_judge_2node.toml
+
+max_steps = 4000
+seq_len = 2048
+output_dir = "outputs/dolci-qwen35-35b-instruct-qwen36-35b-judge-2node"
+
+[wandb]
+project = "primerl"
+name = "qwen35-35b-instruct-qwen36-35b-judge-2node"
+shared = true
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 50
+
+[model]
+name = "/shared_silo/scratch/models/Qwen3.5-35B-A3B"
+
+[trainer.optim]
+lr = 5e-7
+
+[trainer.loss]
+kl_tau = 0.1
+
+[orchestrator]
+batch_size = 512
+rollouts_per_example = 16
+
+[orchestrator.sampling]
+max_tokens = 2048
+temperature = 1.0
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[orchestrator.buffer]
+easy_threshold = 0.95
+hard_threshold = 0.05
+online_difficulty_filtering = true
+env_ratios = [1.0, 1.0]
+
+#[[orchestrator.eval.env]]
+#id = "math500"
+#num_examples = 30
+#rollouts_per_example = 4
+
+[[orchestrator.env]]
+id = "dolci-ifeval-env"
+name = "dolci_ifeval"
+reward_weight = 1.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B" }
+
+[[orchestrator.env]]
+id = "rubric-judge-env"
+name = "rubric_judge"
+reward_weight = 2.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", categories = ["general-quality_ref", "general-quality"], custom_rm = true, judge_model_path = "/shared_silo/scratch/models/Qwen3.6-35B-A3B", max_judge_tokens = 64 }
+
+[trainer]
+
+[trainer.model]
+optim_cpu_offload = true
+
+[trainer.tokenizer]
+name = "/shared_silo/scratch/models/Qwen3.5-35B-A3B"
+
+[ckpt]
+interval = 500
+
+[deployment]
+type = "multi_node"
+num_train_nodes = 1
+num_infer_nodes = 1
+num_infer_replicas = 1
+gpus_per_node = 8
+
+[slurm]
+job_name = "dolci-qwen35-35b-2node"
+partition = "amd-tw-verification"
+time = "48:00:00"
+project_dir = "/shared_silo/scratch/mmelnik/lib/rocm72/prime-rl"
+
+[weight_broadcast]
+type = "filesystem"
+
+[inference]
+# Instruct model has its own chat template — no tokenizer override needed.
+# language_model_only: skip VL multimodal pipeline for qwen3_5_moe in vLLM.
+vllm_extra = { language_model_only = true }
+
+[inference.parallel]
+tp = 1
+dp = 4
+
+[inference.server]
+port = 8100
+
+[rm_inference]
+# Qwen3.6-35B-A3B instruct has its own chat template.
+# language_model_only: skip VL pipeline for qwen3_5_moe architecture.
+vllm_extra = { task = "generate", max_model_len = 8192, language_model_only = true }
+
+[rm_inference.parallel]
+tp = 1
+dp = 4

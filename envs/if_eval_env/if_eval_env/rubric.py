@@ -33,7 +33,18 @@ def _strip_think_blocks(text: str) -> str:
     if "</think>" in text:
         text = text[text.index("</think>") + len("</think>"):]
         return text.strip()
-    # Case 3: no think tags at all — regular model output, return as-is
+    # Case 3: plain-text thinking format without XML tags
+    thinking_markers = ["Thinking Process:\n", "Here's a thinking process", "Here is a thinking process"]
+    for marker in thinking_markers:
+        if text.startswith(marker) or f"\n{marker}" in text:
+            for answer_marker in ["\n**Final Answer", "\n**Answer", "\nFinal Answer:", "\nAnswer:", "\n---\n"]:
+                if answer_marker in text:
+                    return text[text.index(answer_marker):].strip().lstrip("-").strip()
+            after_steps = re.split(r'\n(?=\*\*(?:Final|Conclusion|Summary|Answer))', text)
+            if len(after_steps) > 1:
+                return after_steps[-1].strip()
+            return text.strip()
+    # No think tags at all — regular model output, return as-is
     return text.strip()
 
 

@@ -11,20 +11,19 @@ _LOG_SAMPLE_RATE = 0.01  # log ~1% of scored examples
 _GENERAL_CATEGORIES = {"general-quality", "general-quality_ref"}
 
 # Default judge prompt for LLMJudgeRubric.
-# Placeholders: {question}, {answer}.  Judge must emit "Score: N" (1-10).
-# Reward is normalized to [0, 1] by dividing by 10.
-# Mirrors open-instruct's general_quality_template (judge_utils.py).
+# Placeholders: {question}, {answer}.  Judge must emit "Score: N" (1-100).
+# Reward is normalized to [0, 1] by dividing by 100.
 # Used for "general-quality" examples (no reference answer).
 _DEFAULT_JUDGE_PROMPT = """\
 ### Task Description
 Please act as an impartial judge and evaluate the quality of the response provided by an
 AI assistant to the user query displayed below.
 
-Notes:
-- Your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
-- Begin your evaluation by providing a short explanation.
-- Be as objective as possible. After providing your short explanation, please output a score on a scale of 1 to 10.
-- Please adhere to the following format.
+Your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
+
+You MUST respond in exactly this format:
+Score: <integer from 1 to 100>
+<your brief reasoning here>
 
 [Query]
 {question}
@@ -32,11 +31,8 @@ Notes:
 [AI Answer]
 {answer}
 
-[Your judgement]
-Provide a brief reasoning, then end your response with exactly this line:
-Score: <integer from 1 to 10>"""
+[Your judgement]"""
 
-# Mirrors open-instruct's general_quality_ref_template (judge_utils.py).
 # Used for "general-quality_ref" examples (reference answer available).
 _JUDGE_PROMPT_WITH_REF = """\
 ### Task Description
@@ -44,12 +40,12 @@ Please act as an impartial judge and evaluate the quality of the answer provided
 AI assistant to the conversation history leading up to the answer displayed below.
 Judge whether the provided answer is good by comparing it to the reference answer.
 
-Notes:
-- Besides comparing to the reference answer, your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
-- Note that sometimes the reference answer is not the only answer. So any valid variation of the reference answer is also acceptable and can get a full score.
-- Begin your evaluation by providing a short explanation.
-- Be as objective as possible. After providing your short explanation, please output a score on a scale of 1 to 10.
-- Please adhere to the following format.
+Besides comparing to the reference answer, your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
+Note that sometimes the reference answer is not the only answer. So any valid variation of the reference answer is also acceptable and can get a full score.
+
+You MUST respond in exactly this format:
+Score: <integer from 1 to 100>
+<your brief reasoning here>
 
 [Query]
 {question}
@@ -60,9 +56,7 @@ Notes:
 [Reference Gold Answer]
 {reference}
 
-[Your judgement]
-Provide a brief reasoning, then end your response with exactly this line:
-Score: <integer from 1 to 10>"""
+[Your judgement]"""
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -87,7 +81,47 @@ def _strip_think_blocks(text: str) -> str:
     if "</think>" in text:
         text = text[text.index("</think>") + len("</think>"):]
         return text.strip()
-    # Case 3: no think tags at all — regular model output, return as-is
+    # Case 3: plain-text thinking format (e.g. Qwen3.5-9B base outputs
+    # "Thinking Process:\n\n1. Analyze..." without XML tags).
+    # Extract only the final answer so the judge evaluates content quality.
+    thinking_markers = [
+        "Thinking Process:\n",
+        "Here's a thinking process",
+        "Here is a thinking process",
+    ]
+    for marker in thinking_markers:
+        if text.startswith(marker) or f"\n{marker}" in text:
+            # 1. Look for an explicit final answer header
+            for answer_marker in [
+                "\n**Final Answer",
+                "\n**Answer",
+                "\nFinal Answer:",
+                "\nAnswer:",
+                "\n---\n",
+            ]:
+                if answer_marker in text:
+                    return text[text.index(answer_marker):].strip().lstrip("-").strip()
+            # 2. Find the "drafting" section — where the model writes the actual response
+            for draft_marker in [
+                "\n**Drafting",
+                "\n**Writing",
+                "\n**Composing",
+                "\n**Response",
+                "\nDrafting",
+            ]:
+                if draft_marker in text:
+                    return text[text.index(draft_marker):].strip()
+            # 3. Find the last top-level numbered step content — the model's actual output
+            # is typically in the last step after all analysis steps
+            last_step = re.search(r'\n\d+\.\s+\*\*[^*]+\*\*[^#]*$', text, re.DOTALL)
+            if last_step:
+                candidate = text[last_step.start():].strip()
+                # Only use if it looks like actual content (>50 chars), not a step header
+                if len(candidate) > 50:
+                    return candidate
+            # 4. Nothing found — pass full text so judge can still evaluate
+            return text.strip()
+    # No think tags at all — regular model output, return as-is
     return text.strip()
 
 
@@ -263,24 +297,25 @@ class LLMJudgeRubric(vf.Rubric):
 
     @staticmethod
     def _parse_score(text: str) -> float:
-        # 1. open-instruct format: {"SCORE": "7"} or {"SCORE": 7}
-        match = re.search(r'"SCORE"\s*:\s*"?(\d+)"?', text)
-        # 2. legacy "Score: N" or "score: N"
+        # 1. Score-first format: "Score: N" on the first line (primary)
+        first_line = text.strip().split("\n")[0]
+        match = re.match(r"[Ss]core\s*:\s*(\d+)", first_line)
+        # 2. "Score: N" anywhere in text
         if not match:
             match = re.search(r"[Ss]core\s*:\s*(\d+)", text)
-        # 3. Qwen3.5 free-form endings: "...N/10" or "...N out of 10" or "rating: N"
+        # 3. open-instruct format: {"SCORE": "7"} or {"SCORE": 7}
         if not match:
-            match = re.search(r'\b([1-9]|10)\s*/\s*10\b', text)
-        if not match:
-            match = re.search(r'\b([1-9]|10)\s+out\s+of\s+10\b', text, re.IGNORECASE)
+            match = re.search(r'"SCORE"\s*:\s*"?(\d+)"?', text)
+        # 4. "rating: N"
         if not match:
             match = re.search(r'[Rr]ating\s*:\s*(\d+)', text)
-        # 4. Last resort: final standalone digit 1-10 at end of reasoning block
+        # 5. Last resort: leading number on first line
         if not match:
-            match = re.search(r'(?<!\d)([1-9]|10)(?!\d)\s*[.\n]*$', text.strip())
+            match = re.match(r'(\d{1,3})\b', first_line)
         if match:
             raw = int(match.group(1))
-            return max(1, min(10, raw)) / 10.0
+            # Always 1-100 scale as per the prompt
+            return max(1, min(100, raw)) / 100.0
         logger.warning("LLM judge: could not parse score from output: %r", text[:200])
         return 0.0
 

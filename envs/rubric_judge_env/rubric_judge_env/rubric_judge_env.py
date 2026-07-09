@@ -1,10 +1,16 @@
 """
 Prime-RL environment for Dolci IF-RLVR (reward-model judge).
 
-Dataset: Dolci-Think-RL-7B (parquet shards), categories "general-quality" and/or "general-quality_ref".
+Supports two dataset formats:
+  1. Dolci-Think-RL-7B — directory with data/*.parquet shards
+  2. Dolci-Think-RL-7B-prompt-ground-truth-translated-fi — jsonl file
+     Pass use_finnish=True to use translated_prompt + translated_ground_truth.
+
+Dataset categories: "general-quality" and/or "general-quality_ref".
 Reward:  OLMo-2-1124-7B-RM sigmoid score ∈ [0, 1].
 """
 
+import json
 import logging
 from pathlib import Path
 
@@ -23,13 +29,49 @@ _SYSTEM_PROMPT = (
     "Follow ALL formatting and content constraints stated in the user's request exactly."
 )
 
+_SYSTEM_PROMPT_FI = (
+    "Olet avulias assistentti. Noudata kaikkia käyttäjän pyyntöön sisältyviä ohjeita huolellisesti."
+)
 
-def _load_raw(dataset_path: str, categories: list[str]) -> Dataset:
+
+def _load_raw(dataset_path: str, categories: list[str], use_finnish: bool = False) -> Dataset:
+    path = Path(dataset_path)
+
+    # jsonl file (translated dataset) — read line-by-line to handle inconsistent schema
+    if path.is_file() or str(dataset_path).endswith(".jsonl"):
+        prompt_col = "translated_prompt" if use_finnish else "prompt"
+        gt_col = "translated_ground_truth" if use_finnish else "ground_truth"
+        rows = []
+        with open(dataset_path) as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ds_val = row.get("dataset", "")
+                if isinstance(ds_val, list):
+                    ds_val = ds_val[0] if ds_val else ""
+                if ds_val not in categories:
+                    continue
+                passrate = row.get("passrate")
+                prompt = row.get(prompt_col, "") or row.get("prompt", "")
+                gt = row.get(gt_col, "") or row.get("ground_truth", "")
+                if isinstance(gt, list):
+                    gt = gt[0] if gt else ""
+                rows.append({
+                    "prompt": prompt,
+                    "ground_truth": gt,
+                    "dataset_str": ds_val,
+                    "passrate": float(passrate) if passrate is not None else None,
+                })
+        return Dataset.from_list(rows)
+
+    # parquet directory (original Dolci format)
     import glob
     import os
     import pandas as pd
 
-    root = Path(dataset_path)
+    root = path
     files = sorted(glob.glob(str(root / "data" / "*.parquet")))
     if not files:
         files = sorted(glob.glob(str(root / "*.parquet")))
@@ -38,7 +80,7 @@ def _load_raw(dataset_path: str, categories: list[str]) -> Dataset:
         data_exists = (root / "data").exists()
         ls_root = os.listdir(root) if root_exists else []
         raise FileNotFoundError(
-            f"No parquet files found in {dataset_path}/data/ or {dataset_path}/. "
+            f"No parquet files or jsonl found at {dataset_path}. "
             f"root_exists={root_exists}, data_exists={data_exists}, "
             f"cwd={os.getcwd()}, ls_root={ls_root}"
         )
@@ -46,7 +88,6 @@ def _load_raw(dataset_path: str, categories: list[str]) -> Dataset:
     cols = ["prompt", "ground_truth", "dataset", "passrate"]
     dfs = [pd.read_parquet(f, columns=cols) for f in files]
     df = pd.concat(dfs, ignore_index=True)
-
     df["dataset_str"] = df["dataset"].apply(
         lambda x: list(x)[0] if hasattr(x, "__iter__") and not isinstance(x, str) else str(x)
     )
@@ -57,10 +98,17 @@ def _load_raw(dataset_path: str, categories: list[str]) -> Dataset:
 def _build_example(row: dict) -> dict | None:
     prompt_text: str = row["prompt"]
 
-    if isinstance(prompt_text, str) and prompt_text.startswith("user: "):
-        user_content = prompt_text[len("user: "):]
+    prefix = "user: " if not row.get("_fi") else "käyttäjä: "
+    if isinstance(prompt_text, str) and (
+        prompt_text.startswith("user: ") or prompt_text.lower().startswith("käyttäjä: ")
+    ):
+        user_content = prompt_text.split(": ", 1)[1]
     else:
         user_content = str(prompt_text)
+
+    gt = row.get("ground_truth") or ""
+    if isinstance(gt, list):
+        gt = gt[0] if gt else ""
 
     return {
         "question": user_content,
@@ -68,7 +116,7 @@ def _build_example(row: dict) -> dict | None:
         "info": {
             "category": row.get("dataset_str", "general-quality"),
             "prompt_text": user_content,
-            "reference": row.get("ground_truth") or "",
+            "reference": gt,
         },
     }
 
@@ -84,7 +132,8 @@ def load_environment(
     max_passrate: float = 0.95,
     dataset_shuffle: bool = True,
     dataset_seed: int = 42,
-    system_prompt: str = _SYSTEM_PROMPT,
+    use_finnish: bool = False,
+    system_prompt: str | None = None,
     map_kwargs: dict = {},
     # LLM-as-judge mode — activated when custom_rm=True.
     # The judge model is served via the same vLLM instance as the RM
@@ -123,6 +172,9 @@ def load_environment(
         max_judge_tokens:       Max tokens the judge may generate (default: 512).
         judge_temperature:      Sampling temperature for the judge (default: 0.0 = greedy).
     """
+    if system_prompt is None:
+        system_prompt = _SYSTEM_PROMPT
+
     if custom_rm:
         if judge_model_path is None:
             raise ValueError(
@@ -151,7 +203,7 @@ def load_environment(
     categories = list(categories)
 
     def build_dataset():
-        raw = _load_raw(dataset_path, categories)
+        raw = _load_raw(dataset_path, categories, use_finnish=use_finnish)
 
         if "passrate" in raw.column_names:
             import math

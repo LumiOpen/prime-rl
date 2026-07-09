@@ -45,26 +45,26 @@ wheels = [
 
 [[package]]
 name = "aime2024"
-version = "0.1.20"
+version = "0.1.18"
 source = { registry = "https://hub.primeintellect.ai/primeintellect/simple/" }
 dependencies = [
     { name = "math-verify", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "verifiers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://hub.primeintellect.ai/primeintellect/aime2024/@7c81d224/aime2024-0.1.20-py3-none-any.whl", hash = "sha256:0a035b602de7af9fa410a07a0e26c0361d090089af9c9a0386bc527ed6a8a3bb" },
+    { url = "https://hub.primeintellect.ai/primeintellect/aime2024/@e6768e58/aime2024-0.1.18-py3-none-any.whl", hash = "sha256:75b4cfdb46108e5b2483c809a82bfa57802c2e476ea800708900f7512e8405f6" },
 ]
 
 [[package]]
 name = "aime2025"
-version = "0.1.20"
+version = "0.1.18"
 source = { registry = "https://hub.primeintellect.ai/primeintellect/simple/" }
 dependencies = [
     { name = "math-verify", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "verifiers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://hub.primeintellect.ai/primeintellect/aime2025/@61cdf1e5/aime2025-0.1.20-py3-none-any.whl", hash = "sha256:e509a63f0f816b0ffbe5ec20989fa4269a43e63a6a3951c5b98940e905b0545d" },
+    { url = "https://hub.primeintellect.ai/primeintellect/aime2025/@ec6af76f/aime2025-0.1.18-py3-none-any.whl", hash = "sha256:cda06c86accc3bcd5881b7888951e9d7d6573df122814257f7eefa9e6dc3ec16" },
 ]
 
 [[package]]
@@ -463,18 +463,6 @@ wheels = [
 ]
 
 [[package]]
-name = "color-codeword"
-version = "0.1.0"
-source = { registry = "https://hub.primeintellect.ai/primeintellect/simple/" }
-dependencies = [
-    { name = "pillow", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "verifiers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-]
-wheels = [
-    { url = "https://hub.primeintellect.ai/primeintellect/color-codeword/@828f24c5/color_codeword-0.1.0-py3-none-any.whl", hash = "sha256:5bf72f74d6ee001b6be96768dd269e8762617dd3644238bda7623f58a6bc069a" },
-]
-
-[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -690,6 +678,29 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e0/4d/f332313098c1de1b2d2ff91cf2674415cc7cddab2ca1b01ae29774bd5fdf/docstring_parser-0.18.0.tar.gz", hash = "sha256:292510982205c12b1248696f44959db3cdd1740237a968ea1e2e7a900eeb2015", size = 29341, upload-time = "2026-04-14T04:09:19.867Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a7/5f/ed01f9a3cdffbd5a008556fc7b2a08ddb1cc6ace7effa7340604b1d16699/docstring_parser-0.18.0-py3-none-any.whl", hash = "sha256:b3fcbed555c47d8479be0796ef7e19c2670d428d72e96da63f3a40122860374b", size = 22484, upload-time = "2026-04-14T04:09:18.638Z" },
+]
+
+[[package]]
+name = "dolci-ifeval-env"
+version = "0.1.0"
+source = { editable = "envs/dolci_ifeval_env" }
+dependencies = [
+    { name = "absl-py", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "datasets", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "immutabledict", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "langdetect", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "nltk", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "verifiers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "absl-py" },
+    { name = "datasets" },
+    { name = "immutabledict" },
+    { name = "langdetect" },
+    { name = "nltk" },
+    { name = "verifiers" },
 ]
 
 [[package]]
@@ -1207,29 +1218,6 @@ wheels = [
 ]
 
 [[package]]
-name = "if-env"
-version = "0.1.0"
-source = { editable = "envs/if_env" }
-dependencies = [
-    { name = "datasets", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "langdetect", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nltk", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "pandas", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "pyarrow", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "verifiers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "datasets" },
-    { name = "langdetect" },
-    { name = "nltk" },
-    { name = "pandas" },
-    { name = "pyarrow" },
-    { name = "verifiers" },
-]
-
-[[package]]
 name = "if-eval-env"
 version = "0.1.0"
 source = { editable = "envs/if_eval_env" }
@@ -1260,6 +1248,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/f4/57/60d1a6a512f2f0508
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6d/81/2fee58f9024a3449aee83edfa7167fb5ccd7e1af2557300e28531bb68e16/ijson-3.5.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7389a56b8562a19948bdf1d7bae3a2edc8c7f86fb59834dcb1c4c722818e645a", size = 149729, upload-time = "2026-02-24T03:57:14.191Z" },
     { url = "https://files.pythonhosted.org/packages/d2/bf/f9d4399d0e6e3fd615035290a71e97c843f17f329b43638c0a01cf112d73/ijson-3.5.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:dc1b3836b174b6db2fa8319f1926fb5445abd195dc963368092103f8579cb8ed", size = 151583, upload-time = "2026-02-24T03:57:17.757Z" },
+]
+
+[[package]]
+name = "immutabledict"
+version = "4.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1d/e6/718471048fea0366c3e3d1df3acfd914ca66d571cdffcf6d37bbcd725708/immutabledict-4.3.1.tar.gz", hash = "sha256:f844a669106cfdc73f47b1a9da003782fb17dc955a54c80972e0d93d1c63c514", size = 7806, upload-time = "2026-02-15T10:32:34.668Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a3/ce/f9018bf69ae91b273b6391a095e7c93fa5e1617f25b6ba81ad4b20c9df10/immutabledict-4.3.1-py3-none-any.whl", hash = "sha256:c9facdc0ff30fdb8e35bd16532026cac472a549e182c94fa201b51b25e4bf7bf", size = 5000, upload-time = "2026-02-15T10:32:33.672Z" },
 ]
 
 [[package]]
@@ -1744,14 +1741,14 @@ wheels = [
 
 [[package]]
 name = "math500"
-version = "0.1.17"
+version = "0.1.16"
 source = { registry = "https://hub.primeintellect.ai/primeintellect/simple/" }
 dependencies = [
     { name = "math-verify", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "verifiers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://hub.primeintellect.ai/primeintellect/math500/@8b618af8/math500-0.1.17-py3-none-any.whl", hash = "sha256:84beb8cacb788aa721e386c5acf028a24c2447d5f440f347eb3becb08128445b" },
+    { url = "https://hub.primeintellect.ai/primeintellect/math500/@4951d227/math500-0.1.16-py3-none-any.whl", hash = "sha256:08c6b96755dd64d90efa5bc4e488e8232abddacedbc238267ecb09632ed3f5cb" },
 ]
 
 [[package]]
@@ -2529,8 +2526,7 @@ envs = [
     { name = "aime2025", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "alphabet-sort", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "code-env", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "color-codeword", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "if-env", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "dolci-ifeval-env", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "if-eval-env", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "logic-env", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "math-env", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -2563,12 +2559,11 @@ requires-dist = [
     { name = "amdsmi", directory = "/shared_silo/scratch/mmelnik/lib/rocm72/prime-rl/amd_smi" },
     { name = "beartype", specifier = ">=0.21.0" },
     { name = "code-env", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
-    { name = "color-codeword", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "dion", git = "https://github.com/samsja/dion.git?rev=d891eeb" },
+    { name = "dolci-ifeval-env", marker = "extra == 'envs'", editable = "envs/dolci_ifeval_env" },
     { name = "flash-attn" },
     { name = "flash-attn", specifier = ">=2.8.3" },
-    { name = "if-env", marker = "extra == 'envs'", editable = "envs/if_env" },
     { name = "if-eval-env", marker = "extra == 'envs'", editable = "envs/if_eval_env" },
     { name = "jaxtyping", specifier = ">=0.3.2" },
     { name = "liger-kernel", specifier = ">=0.5.10" },

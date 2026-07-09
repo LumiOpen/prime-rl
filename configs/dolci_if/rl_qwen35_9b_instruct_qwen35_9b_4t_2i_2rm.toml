@@ -1,0 +1,93 @@
+# Policy: Qwen3.5-9B (instruct) — single node, 8 GPUs
+# Reward:
+#   dolci-ifeval-env — IFEval constraint satisfaction, English
+#   rubric-judge-env — Qwen3.5-9B (instruct) LLM-as-judge, English
+# Algorithm: GRPO via prime-rl (IPO loss)
+#
+# GPU layout (single node, 8 GPUs total):
+#   GPU 0-1: vLLM inference (policy rollouts, DP=2 — 2 independent instances)
+#   GPU 2-5: trainer (4-GPU FSDP)
+#   GPU 6-7: vLLM judge/RM inference (DP=2 — 2 independent instances)
+#
+# kl_tau = 0.1: instruct model needs KL regularisation.
+# Launch: sbatch --gpus-per-node=8 configs/dolci_if/run.sbatch <this_config>
+
+max_steps = 4000
+seq_len = 2048
+output_dir = "outputs/dolci-qwen35-9b-instruct-4t-2i-2rm"
+
+[wandb]
+project = "dolci-if-rlvr"
+name = "qwen35-9b-instruct-4t-2i-2rm"
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 50
+
+[model]
+name = "/shared_silo/scratch/models/Qwen3.5-9B"
+
+[trainer.optim]
+lr = 5e-7
+
+[trainer.loss]
+kl_tau = 0.1
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+
+[orchestrator.sampling]
+max_tokens = 2048
+temperature = 1.0
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[orchestrator.buffer]
+easy_threshold = 0.95
+hard_threshold = 0.05
+online_difficulty_filtering = true
+
+#[[orchestrator.eval.env]]
+#id = "math500"
+#num_examples = 30
+#rollouts_per_example = 4
+
+[[orchestrator.env]]
+id = "dolci-ifeval-env"
+name = "dolci_ifeval"
+reward_weight = 1.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B" }
+
+[[orchestrator.env]]
+id = "rubric-judge-env"
+name = "rubric_judge"
+reward_weight = 2.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", categories = ["general-quality_ref", "general-quality"], custom_rm = true, judge_model_path = "/shared_silo/scratch/models/Qwen3.5-9B", max_judge_tokens = 64 }
+
+[trainer]
+
+[trainer.tokenizer]
+name = "/shared_silo/scratch/models/Qwen3.5-9B"
+
+[ckpt]
+interval = 500
+
+[deployment]
+num_train_gpus = 4
+num_infer_gpus = 2
+num_rm_gpus = 2
+
+[inference]
+# Instruct model has its own chat template — no tokenizer override needed.
+
+[inference.parallel]
+tp = 1
+dp = 2
+
+[rm_inference]
+vllm_extra = { task = "generate", max_model_len = 8192 }
+
+[rm_inference.parallel]
+tp = 1
+dp = 2

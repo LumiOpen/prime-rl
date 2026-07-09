@@ -1,0 +1,95 @@
+# Policy: Qwen3.5-9B (instruct) + LoRA adapter
+# Reward:
+#   dolci-ifeval-env — IFEval constraint satisfaction, English (dolci_ifeval_env)
+#   rubric-judge-env — Qwen3.5-9B (instruct) LLM-as-judge, English (general-quality_ref)
+# Algorithm: GRPO via prime-rl (IPO loss)
+#
+# GPU layout (single node):
+#   GPU 0: vLLM inference (policy rollouts, Qwen3.5-9B instruct + LoRA)
+#   GPU 1: trainer
+#   GPU 2: vLLM judge inference (Qwen3.5-9B instruct, POST /v1/chat/completions)
+#
+# kl_tau = 0.1: instruct model needs KL regularisation.
+# LoRA rank=64: only adapter weights trained (~0.5% of params), base frozen.
+# enable_thinking=false: suppress thinking preamble in rollouts.
+
+max_steps = 2000
+seq_len = 2048
+output_dir = "outputs/dolci-qwen35-9b-instruct-qwen35-9b-judge-lora"
+
+[wandb]
+project = "dolci-if-rlvr"
+name = "qwen35-9b-instruct-qwen35-9b-judge-lora"
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 10
+
+[model]
+name = "/shared_silo/scratch/models/Qwen3.5-9B"
+
+[trainer.optim]
+lr = 1e-4
+
+[trainer.loss]
+kl_tau = 0.1
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+
+[orchestrator.sampling]
+max_tokens = 2048
+temperature = 1.0
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[orchestrator.buffer]
+easy_threshold = 0.95
+hard_threshold = 0.05
+online_difficulty_filtering = true
+
+[[orchestrator.eval.env]]
+id = "math500"
+num_examples = 30
+rollouts_per_example = 4
+
+[[orchestrator.env]]
+id = "dolci-ifeval-env"
+name = "dolci_ifeval"
+reward_weight = 1.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B" }
+
+[[orchestrator.env]]
+id = "rubric-judge-env"
+name = "rubric_judge"
+reward_weight = 2.0
+args = { dataset_path = "/shared_silo/scratch/datasets/Dolci-Think-RL-7B", categories = ["general-quality_ref"], custom_rm = true, judge_model_path = "/shared_silo/scratch/models/Qwen3.5-9B", max_judge_tokens = 4096 }
+
+[trainer]
+
+[trainer.model.lora]
+rank = 64
+alpha = 128.0
+dropout = 0.0
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "experts"]
+
+[trainer.tokenizer]
+name = "/shared_silo/scratch/models/Qwen3.5-9B"
+
+[ckpt]
+interval = 400
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 1
+num_rm_gpus = 1
+
+[inference]
+# Instruct model has its own chat template — no tokenizer override needed.
+
+[rm_inference]
+vllm_extra = { task = "generate", max_model_len = 8192 }
