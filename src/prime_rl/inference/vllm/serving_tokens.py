@@ -37,12 +37,12 @@ from vllm.entrypoints.openai.engine.protocol import (
     RequestResponseMetadata,
     UsageInfo,
 )
-from vllm.entrypoints.serve.disagg.protocol import (
+from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
     GenerateRequest,
     GenerateResponse,
     GenerateResponseChoice,
 )
-from vllm.entrypoints.serve.disagg.serving import ServingTokens
+from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -200,7 +200,7 @@ class PrimeRlServingTokens(ServingTokens):
         # Build the engine input — features-aware (MM) or text-only fallback.
         # Identical to upstream so we keep tracking it.
         if features := request.features:
-            from vllm.entrypoints.serve.disagg.mm_serde import decode_mm_kwargs_item
+            from vllm.entrypoints.scale_out.token_in_token_out.mm_serde import decode_mm_kwargs_item
             from vllm.inputs import mm_input
             from vllm.multimodal.inputs import (
                 MultiModalKwargsItem,
@@ -226,7 +226,7 @@ class PrimeRlServingTokens(ServingTokens):
                 cache_salt=request.cache_salt,
             )
         else:
-            (engine_input,) = await self.openai_serving_render.preprocess_completion(
+            (engine_input,) = await self.online_renderer.preprocess_completion(
                 request,
                 prompt_input=request.token_ids,
                 prompt_embeds=None,

@@ -9,8 +9,8 @@ from transformers.integrations import use_kernel_forward_from_hub
 
 @lru_cache(maxsize=1)
 def _get_quack_rmsnorm():
-    """Lazy-load quack rmsnorm. Returns None if unavailable or GPU is pre-Hopper."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+    """Lazy-load quack rmsnorm. Returns None if unavailable, GPU is pre-Hopper, or running on ROCm."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9 or torch.version.hip is not None:
         return None
     try:
         from quack import rmsnorm

@@ -14,7 +14,13 @@ def disable_nccl_p2p_if_unavailable() -> None:
 
     Uses pynvml to check physical GPU topology, which works regardless of
     CUDA_VISIBLE_DEVICES restrictions on the current process.
+    On ROCm, RCCL manages its own topology (xGMI/Infinity Fabric) — skip entirely.
     """
+    import torch
+
+    if torch.version.hip is not None:
+        return
+
     pynvml.nvmlInit()
     try:
         n = pynvml.nvmlDeviceGetCount()

@@ -44,6 +44,11 @@ dependencies = [
     "pandas>=2.0",
     "msgspec>=0.18",
     "torchao>=0.17.0",
+    "reverse-text-v1",
+    "amdsmi",
+    "math-env",
+    "rubric-judge-env",
+    "dolci-ifeval-env",
 ]
 
 [project.scripts]
@@ -59,12 +64,7 @@ prime_rl = "prime_rl.inference.patches:apply_shared_vllm_patches"
 
 [project.optional-dependencies]
 flash-attn = [
-    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu128torch2.11-cp312-cp312-linux_x86_64.whl ; platform_machine == 'x86_64'",
-]
-flash-attn-3 = ["flash_attn_3"]
-
-flash-attn-cute = [
-    "flash-attn-4",
+    "flash-attn>=2.8.3",
 ]
 disagg = [
     "deep-ep ; platform_machine == 'x86_64' or platform_machine == 'aarch64'",
@@ -86,8 +86,6 @@ all = [
     "prime-rl[flash-attn]",
     "prime-rl[disagg]",
     "prime-rl[quack]",
-    "prime-rl[flash-attn-3]",
-    "prime-rl[flash-attn-cute]",
 ]
 
 [dependency-groups]
@@ -113,15 +111,12 @@ exclude-newer = "7 days"
 no-build-isolation-package = ["flash-attn"]
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
-# Override torch's pinned cuDNN to fix Conv3d performance regression (torch 2.9 + cuDNN 9.8-9.14)
-# See: https://github.com/pytorch/pytorch/issues/166122
 override-dependencies = [
-    "nvidia-cudnn-cu12>=9.15",
-    "nvidia-cutlass-dsl>=4.4.1",
+    "torch==2.11.0+rocm7.2",
+    "torchvision==0.26.0+rocm7.2",
+    "triton-rocm==3.6.0",
     "transformers==5.6.2",
-    "torch>=2.9.0",
     "openenv-core",
 ]
 
@@ -161,7 +156,6 @@ requires-dist = [
 vllm = false
 tokenspeed-mla = false
 fastokens = false
-flash_attn_3 = false
 # PrimeIntellect-published packages in this project's dependency closure —
 # fast-track so first-party releases can land same-day. Only packages that
 # appear in `uv tree` need to be listed; the resolver ignores entries for
@@ -172,6 +166,7 @@ prime-tunnel = false
 prime-evals = false
 verifiers = false
 renderers = false
+math-env = false
 prime-pydantic-config = false
 # Trusted git/URL sources pinned by rev or wheel URL (defensive: belt-and-suspenders)
 vllm-router = false
@@ -183,6 +178,11 @@ torchao = false
 
 [tool.uv.sources]
 prime-rl-configs = { path = "packages/prime-rl-configs", editable = true }
+reverse-text-v1 = { workspace = true }
+amdsmi = { path = "/shared_silo/scratch/kahakala/lib/prime-rl-upstream/amd_smi" }
+math-env = { index = "primeintellect" }
+rubric-judge-env = { path = "envs/rubric_judge_env", editable = true }
+dolci-ifeval-env = { path = "envs/dolci_ifeval_env", editable = true }
 # prime-rl depends on the one `verifiers` package (v0 + v1 + the legacy bridge + the built-in v1
 # harnesses/tasksets, now bundled in verifiers.v1). v0 envs resolve from
 # deps/{verifiers,research-environments}/environments; v1 tasksets (`-v1`) and the `compact`
@@ -190,21 +190,18 @@ prime-rl-configs = { path = "packages/prime-rl-configs", editable = true }
 verifiers = { path = "deps/verifiers", editable = true }
 renderers = { path = "deps/renderers", editable = true }
 prime-pydantic-config = { path = "deps/pydantic-config", editable = true }
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-torchaudio = { index = "pytorch-cu128" }
+torch = { index = "pytorch-rocm" }
+torchvision = { index = "pytorch-rocm" }
+torchaudio = { index = "pytorch-rocm" }
+triton-rocm = { index = "pytorch-rocm" }
 torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "23e4dfc" }
 torchao = { url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.6.0/torchao-0.17.0+git02105d46c-cp312-cp312-linux_x86_64.whl", marker = "platform_machine == 'x86_64'" }
 dion = { git = "https://github.com/samsja/dion.git", rev = "d891eeb" }
-flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention.git", subdirectory = "flash_attn/cute", rev = "96bd151" }
 vllm-router = [
     { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.26/vllm_router-0.1.26-cp38-abi3-manylinux_2_28_x86_64.whl", marker = "platform_machine == 'x86_64'" },
     { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.26/vllm_router-0.1.26-cp38-abi3-manylinux_2_28_aarch64.whl", marker = "platform_machine == 'aarch64'" },
 ]
-vllm = [
-    { url = "https://github.com/vllm-project/vllm/releases/download/v0.24.0/vllm-0.24.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl", marker = "platform_machine == 'x86_64'" },
-    { url = "https://github.com/vllm-project/vllm/releases/download/v0.24.0/vllm-0.24.0+cu129-cp38-abi3-manylinux_2_28_aarch64.whl", marker = "platform_machine == 'aarch64'" },
-]
+vllm = { path = "/shared_silo/scratch/kahakala/lib/wheels/vllm-0.25.1+rocm722-cp312-cp312-linux_x86_64.whl" }
 deep-ep = [
     { url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_x86_64.whl", marker = "platform_machine == 'x86_64'" },
     { url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/deep_ep-1.1.0+1fd57b0-cp312-cp312-linux_aarch64.whl", marker = "platform_machine == 'aarch64'" },
@@ -215,24 +212,20 @@ deep-gemm = [
 ]
 nixl-cu12 = { url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }
 flash-linear-attention = { git = "https://github.com/fla-org/flash-linear-attention" }
-flash_attn_3 = { index = "pytorch-cu128-test" }
 
 [tool.uv.extra-build-dependencies]
 flash-attn = [{ requirement = "torch", match-runtime = true }]
 flash-attn-3 = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 
-[tool.uv.extra-build-variables]
-flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
-
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu128-test"
-url = "https://download.pytorch.org/whl/test/cu128"
+name = "primeintellect"
+url = "https://hub.primeintellect.ai/primeintellect/simple/"
 explicit = true
 
 [tool.ruff.lint]

@@ -46,8 +46,15 @@ INFERENCE_TOML = "inference.toml"
 
 def get_physical_gpu_ids() -> list[int]:
     """Return physical GPU IDs visible to the launcher."""
-    raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("HIP_VISIBLE_DEVICES")
     if raw_visible is None:
+        import torch
+        if torch.version.hip is not None:
+            import amdsmi
+            amdsmi.amdsmi_init()
+            count = len(amdsmi.amdsmi_get_processor_handles())
+            amdsmi.amdsmi_shut_down()
+            return list(range(count))
         pynvml.nvmlInit()
         return list(range(pynvml.nvmlDeviceGetCount()))
     return [int(token.strip()) for token in raw_visible.split(",") if token.strip()]

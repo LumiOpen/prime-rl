@@ -77,6 +77,7 @@ def setup_env_server_logging(log_level: str, json_logging: bool = False) -> None
     their per-rollout logs."""
     setup_logger(log_level, json_logging=json_logging)
     intercept_vf_logging(logger="verifiers.v1", level=log_level)
+    intercept_vf_logging(logger="verifiers.renderer_client", level=log_level)
 
 
 def set_default_executor(max_workers: int = 64) -> None:

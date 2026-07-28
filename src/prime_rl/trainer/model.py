@@ -1237,8 +1237,14 @@ def resolve_auto_attn(config: ModelConfig) -> None:
     FA4 on datacenter Blackwell (SM100), FA3 on Hopper (SM90), FA2 otherwise.
     Workstation Blackwell GPUs (e.g. RTX PRO 6000, SM120) lack FA4 kernels and
     can't run the Hopper-only FA3 kernels, so they fall back to FA2.
+    On ROCm, always resolves to FA2 (FA3/FA4 are NVIDIA-only).
     """
     if config.attn != "auto":
+        return
+    logger = get_logger()
+    if torch.version.hip is not None:
+        logger.info("Auto-resolved attn='auto' to 'flash_attention_2' (ROCm)")
+        config.attn = "flash_attention_2"
         return
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) == (10, 0):
@@ -1247,7 +1253,6 @@ def resolve_auto_attn(config: ModelConfig) -> None:
         resolved = "flash_attention_3"
     else:
         resolved = "flash_attention_2"
-    logger = get_logger()
     logger.info(f"Auto-resolved attn='auto' to '{resolved}' (SM{major}{minor})")
     config.attn = resolved
 
