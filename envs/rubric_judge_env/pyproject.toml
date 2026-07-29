@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rubric-judge-env"
+version = "0.1.0"
+description = "Prime-RL environment for Dolci IF-RLVR (reward-model judge)"
+requires-python = ">=3.11"
+dependencies = [
+    "verifiers",
+    "datasets",
+    "pandas",
+    "pyarrow",
+    "torch",
+    "transformers",
+    "aiohttp",
+]
+
+[project.entry-points."verifiers.environments"]
+rubric-judge-env = "rubric_judge_env:load_environment"
