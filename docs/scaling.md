@@ -41,7 +41,7 @@ uv run rl @ rl.toml \
   --inference.vllm.data-parallel-size 6
 ```
 
-The launcher allocates GPUs in order from `CUDA_VISIBLE_DEVICES` (or all visible GPUs): inference first, trainer next. To target a specific physical subset, pin `CUDA_VISIBLE_DEVICES` before launching.
+The launcher allocates GPUs in order from the first configured visibility variable: `CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, then `HIP_VISIBLE_DEVICES`. If none is set, it falls back to all GPUs reported by NVML. Inference receives the first GPUs and the trainer receives the remainder. `CUDA_VISIBLE_DEVICES` remains the portable default; on Linux/ROCm, `ROCR_VISIBLE_DEVICES` is also supported.
 
 For quick A/B ablations on the same node, run two RL instances side-by-side in separate tmux sessions, each pinned to half the GPUs and a separate inference port:
 

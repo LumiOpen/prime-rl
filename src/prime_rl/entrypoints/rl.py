@@ -17,6 +17,7 @@ from prime_rl.configs.algorithm import FrozenModelConfig
 from prime_rl.configs.inference import VllmRouterConfig
 from prime_rl.configs.orchestrator import EnvConfig
 from prime_rl.configs.rl import RLConfig
+from prime_rl.configs.shared import GPU_VISIBILITY_ENV_VARS
 from prime_rl.entrypoints.inference import vllm_overrides_fragment
 from prime_rl.utils.config import cli, to_toml_dict
 from prime_rl.utils.logger import get_logger, setup_logger
@@ -67,13 +68,23 @@ def env_server_names(config: RLConfig, split: str) -> list[str]:
     return [source.resolved_name for source_split, source, _ in env_servers(config) if source_split == split]
 
 
-def get_physical_gpu_ids() -> list[int]:
-    """Return physical GPU IDs visible to the launcher."""
-    raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if raw_visible is None:
-        pynvml.nvmlInit()
-        return list(range(pynvml.nvmlDeviceGetCount()))
-    return [int(token.strip()) for token in raw_visible.split(",") if token.strip()]
+def get_gpu_visibility() -> tuple[str, list[str]]:
+    """Return the active GPU visibility variable and its device identifiers."""
+    for variable in GPU_VISIBILITY_ENV_VARS:
+        if variable in os.environ:
+            return variable, [
+                identifier.strip() for identifier in os.environ[variable].split(",") if identifier.strip()
+            ]
+
+    pynvml.nvmlInit()
+    return "CUDA_VISIBLE_DEVICES", [str(index) for index in range(pynvml.nvmlDeviceGetCount())]
+
+
+def with_gpu_visibility(env: dict[str, str], variable: str, gpu_ids: list[str]) -> dict[str, str]:
+    """Return an environment containing exactly one GPU visibility variable."""
+    child_env = {key: value for key, value in env.items() if key not in GPU_VISIBILITY_ENV_VARS}
+    child_env[variable] = ",".join(gpu_ids)
+    return child_env
 
 
 def write_config(config: RLConfig, output_dir: Path, exclude: set[str] | None = None) -> None:
@@ -144,7 +155,7 @@ def rl_local(config: RLConfig):
     trainer_local_gpu_ids = list(range(gpu_offset, gpu_offset + config.deployment.num_train_gpus))
 
     total_requested_gpus = num_infer_gpus + config.deployment.num_train_gpus
-    physical_gpu_ids = get_physical_gpu_ids()
+    gpu_visibility_variable, physical_gpu_ids = get_gpu_visibility()
     if total_requested_gpus > len(physical_gpu_ids):
         raise ValueError(
             f"Requested {total_requested_gpus} GPUs via deployment settings, but only "
@@ -208,14 +219,17 @@ def rl_local(config: RLConfig):
             with open(log_dir / "inference.log", "w") as log_file:
                 inference_process = Popen(
                     inference_cmd,
-                    env={
-                        **os.environ,
-                        **DEFAULT_COMMON_ENV_VARS,
-                        **DEFAULT_INFERENCE_ENV_VARS,
-                        **config.env_vars,
-                        **config.inference.env_vars,
-                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, infer_gpu_ids)),
-                    },
+                    env=with_gpu_visibility(
+                        {
+                            **os.environ,
+                            **DEFAULT_COMMON_ENV_VARS,
+                            **DEFAULT_INFERENCE_ENV_VARS,
+                            **config.env_vars,
+                            **config.inference.env_vars,
+                        },
+                        gpu_visibility_variable,
+                        infer_gpu_ids,
+                    ),
                     stdout=log_file,
                     stderr=log_file,
                 )
@@ -347,19 +361,22 @@ def rl_local(config: RLConfig):
         with open(log_dir / "trainer.log", "w") as log_file:
             trainer_process = Popen(
                 trainer_cmd,
-                env={
-                    **os.environ,
-                    **DEFAULT_COMMON_ENV_VARS,
-                    **DEFAULT_TRAINER_ENV_VARS,
-                    "LOGURU_FORCE_COLORS": "1",
-                    "WANDB_PROGRAM": "uv run rl",
-                    "WANDB_ARGS": json.dumps(start_command),
-                    **config.env_vars,
-                    **config.trainer.env_vars,
-                    **wandb_shared_env,
-                    "WANDB_SHARED_LABEL": "trainer",
-                    "CUDA_VISIBLE_DEVICES": ",".join(map(str, trainer_gpu_ids)),
-                },
+                env=with_gpu_visibility(
+                    {
+                        **os.environ,
+                        **DEFAULT_COMMON_ENV_VARS,
+                        **DEFAULT_TRAINER_ENV_VARS,
+                        "LOGURU_FORCE_COLORS": "1",
+                        "WANDB_PROGRAM": "uv run rl",
+                        "WANDB_ARGS": json.dumps(start_command),
+                        **config.env_vars,
+                        **config.trainer.env_vars,
+                        **wandb_shared_env,
+                        "WANDB_SHARED_LABEL": "trainer",
+                    },
+                    gpu_visibility_variable,
+                    trainer_gpu_ids,
+                ),
                 stdout=log_file,
                 stderr=log_file,
             )
