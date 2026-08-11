@@ -1,4 +1,5 @@
 import inspect
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -6,6 +7,7 @@ import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as HFQwen3_5ForCausalLM
 
+from prime_rl.trainer.model import _is_qwen3_5_config, _qwen3_5_layer_type
 from prime_rl.trainer.models.layers.attn import FlashAttention, substitute_ring_attn
 from prime_rl.trainer.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5Model
 from prime_rl.trainer.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedFlashAttention
@@ -79,6 +81,29 @@ def _tiny_moe_config(attn_impl: str = "flash_attention_2") -> Qwen3_5MoeConfig:
     )
     config._attn_implementation = attn_impl
     return config
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (SimpleNamespace(model_type="qwen3_5"), True),
+        (SimpleNamespace(model_type="qwen3_5_moe"), True),
+        (SimpleNamespace(model_type="wrapper", text_config=SimpleNamespace(model_type="qwen3_5_text")), True),
+        (SimpleNamespace(model_type="qwen3"), False),
+        (SimpleNamespace(model_type=None), False),
+    ],
+)
+def test_qwen3_5_detection_uses_model_metadata(config, expected):
+    assert _is_qwen3_5_config(config) is expected
+
+
+def test_qwen3_5_layer_type_supports_transformers_api_names():
+    assert _qwen3_5_layer_type(SimpleNamespace(layer_type="linear_attention")) == "linear_attention"
+    assert _qwen3_5_layer_type(SimpleNamespace(block_type="linear_attention")) == "linear_attention"
+    assert _qwen3_5_layer_type(SimpleNamespace(layer_type="full_attention", block_type="linear_attention")) == (
+        "full_attention"
+    )
+    assert _qwen3_5_layer_type(SimpleNamespace()) is None
 
 
 @pytest.mark.gpu
