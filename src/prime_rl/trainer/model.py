@@ -105,6 +105,19 @@ def _patch_qwen3_5_moe_conversion_mapping():
     register_checkpoint_conversion_mapping("qwen3_5_moe", [], overwrite=True)
 
 
+def _is_qwen3_5_config(config: PretrainedConfig) -> bool:
+    model_types = (
+        getattr(config, "model_type", ""),
+        getattr(getattr(config, "text_config", None), "model_type", ""),
+    )
+    return any(isinstance(model_type, str) and model_type.startswith("qwen3_5") for model_type in model_types)
+
+
+def _qwen3_5_layer_type(layer: nn.Module) -> str | None:
+    layer_type = getattr(layer, "layer_type", None)
+    return layer_type if layer_type is not None else getattr(layer, "block_type", None)
+
+
 def _patch_qwen3_5_text_position_ids():
     """Fix Qwen3.5 passing 3D MRoPE position_ids to decoder layers instead of 2D text_position_ids.
 
@@ -291,7 +304,7 @@ def _patch_qwen3_5_linear_attn_varlen():
     ):
         if position_ids is not None and position_ids.ndim == 3:
             position_ids = position_ids[0]
-        if self.layer_type != "linear_attention":
+        if _qwen3_5_layer_type(self) != "linear_attention":
             return _dec_orig(
                 self,
                 hidden_states,
@@ -538,17 +551,16 @@ def get_model(
 
     is_vlm_training = config.vlm is not None
 
-    if "Qwen3.5" in config.name or "qwen3_5" in config.name.lower():
-        _patch_qwen3_5_text_position_ids()
-        _patch_qwen3_5_moe_conversion_mapping()
-        _patch_qwen3_5_linear_attn_varlen()
-
     model_config = cast(
         PretrainedConfig,
         AutoConfig.from_pretrained(
             config.name, attn_implementation=config.attn, trust_remote_code=config.trust_remote_code
         ),
     )
+    if _is_qwen3_5_config(model_config):
+        _patch_qwen3_5_text_position_ids()
+        _patch_qwen3_5_moe_conversion_mapping()
+        _patch_qwen3_5_linear_attn_varlen()
     model_config.use_cache = False
     is_vlm_arch = is_vlm_architecture(model_config)
 
