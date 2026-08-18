@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=sft-isolation
+#SBATCH --job-name=gradnorm-probe
 #SBATCH --partition=amd-tw-verification
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-node=1
 #SBATCH --mem=0
-#SBATCH --time=02:00:00
-#SBATCH --output=./opd_val/logs/sftiso_%j.out
-#SBATCH --error=./opd_val/logs/sftiso_%j.err
+#SBATCH --time=01:00:00
+#SBATCH --output=./opd_val/logs/probe_%j.out
+#SBATCH --error=./opd_val/logs/probe_%j.err
 
 # TRAINER ISOLATION TEST.
 #
@@ -83,19 +83,37 @@ echo "Run dir: $RUN_DIR"
 # Two arms so a flat curve can't be blamed on the learning rate:
 #   default lr 2e-5 (the repo's own vetted value for this config)
 #   plus torch.compile disabled, as required on ROCm
-for LR in $LRS; do
+# Single GPU on purpose: with world_size 1 there is no sharding, so if the
+# manual norm and torchtitan's reported norm disagree here, the distributed
+# reduction is exonerated and the bug is in the norm computation itself.
+# max_norm 1.0 is the DEFAULT that breaks training — we want the probe to see
+# exactly the regime that fails.
+# Which of these three is responsible for the 1.4e7x gradient inflation?
+#
+#   TRITON: FLASH_ATTENTION_TRITON_AMD_ENABLE picks flash-attn's Triton AMD
+#           backend over composable-kernel. Inherited from
+#           rl_train_singlenode_mixed.sbatch:308 and copied into every opd_val
+#           script, so EVERY experiment so far used it. Top suspect.
+#   AC:     every damaged tensor sat inside a _checkpoint_wrapped_module, and
+#           activation checkpointing recomputes the forward during backward.
+#   kernel: flash-attn itself, independent of the above.
+#
+# Each line is "PROBE_SDPA TRITON AC". Reference points: flash+TRUE+on = 3.4e8
+# (the regime all prior results ran in), MATH SDPA = 24.4.
+for CFG in "0 TRUE on" "0 FALSE on" "0 TRUE off" "1 TRUE on"; do
+    set -- $CFG; SDPA=$1; TRITON=$2; AC=$3
+    if [ "$SDPA" = "1" ]; then ARM="MATH SDPA        "; else ARM="flash-attn varlen"; fi
+    if [ "$AC" = "off" ]; then ACFLAG="--model.ac None"; else ACFLAG=""; fi
     echo ""
-    echo "############ lr=$LR ############"
+    echo "############ $ARM | TRITON_AMD=$TRITON | act.ckpt=$AC ############"
+    # The export must come AFTER sourcing env_setup, which sets it to TRUE.
     singularity exec $CF $BM "$IMG" \
-        bash -c "source $ENV_SETUP && \
-            uv run sft @ examples/basic/reverse-text/sft.toml \
-                --no-wandb \
-                --optim.lr $LR \
-                --model.compile None \
-                $EXTRA_ARGS \
-                --output-dir $RUN_DIR/lr_$LR" \
-        2>&1 | tee "$RUN_DIR/sft_lr_$LR.log" | grep -E "Step |Loss|Error|Traceback|SUCCESS" | tail -40
-    echo "(full log: $RUN_DIR/sft_lr_$LR.log)"
+        bash -c "source $ENV_SETUP && export FLASH_ATTENTION_TRITON_AMD_ENABLE=$TRITON && PROBE_SDPA=$SDPA \
+            uv run torchrun --standalone --nproc-per-node 1 --local-ranks-filter 0 \
+                $OUT/gradnorm_probe.py @ examples/basic/reverse-text/sft.toml \
+                --no-wandb --model.compile None --optim.max-norm 1e12 $ACFLAG \
+                --max-steps 3 --output-dir $RUN_DIR/s${SDPA}_t${TRITON}_ac${AC}" \
+        2>&1 | grep -E "\[probe\] step|\[probe\] attention|Step [0-9]+ \||Error|Traceback|RuntimeError" | head -12
 done
 
 rm -rf "$SCRATCH"

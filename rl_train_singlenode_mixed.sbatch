@@ -305,7 +305,12 @@ export HOME=/tmp/home_\$(hostname)_\${SLURM_JOB_ID}
 mkdir -p \$TRITON_CACHE_DIR \$TORCHINDUCTOR_CACHE_DIR \$XDG_CACHE_HOME \$HOME
 
 export UV_PYTHON=$PRIME_RL_DIR/.venv/bin/python3
-export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+# DO NOT set FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE. It selects flash-attn's
+# Triton AMD backend, whose BACKWARD is broken here: gradients come out ~1.4e7x
+# too large (forward is exact), which silently corrupts layer 0 and the
+# embeddings and makes the default max_norm=1.0 clip away all learning.
+# Verified job 43543. The default composable-kernel backend is correct AND 3x
+# faster (17.6k vs 5.9k tok/s). See opd_val/FINDINGS.md 2.1.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.5
 export RCCL_NET_GDR_LEVEL=2
 export NCCL_SOCKET_IFNAME=eno0

@@ -1129,3 +1129,151 @@ both still hung. Before recording a run's numbers as final, check all four of th
   non-terminal state (`RUNNING` or `PENDING`). **No jobs were submitted, cancelled, or otherwise
   touched by this agent during this update — in particular, none of the 8 running/pending jobs
   42611-42618 were touched.**
+
+---
+
+## 2026-08-18 — Gradient-norm probe: the ROCm flash-attn backward is broken (jobs 43536–43540)
+
+**Question.** Is the trainer's reported `Grad. Norm` of ~1e8 wrong (a `clip_grad_norm_` bug,
+clipping restorable), or are the gradients genuinely that large (a loss-scaling problem)?
+The whole investigation had been running with `max_norm = 1e12` on the first assumption.
+
+**Method.** `opd_val/gradnorm_probe.py` wraps the standalone `sft` entrypoint and
+monkeypatches `torchtitan.distributed.utils.clip_grad_norm_` to compute the global L2 norm
+independently before clipping, with a per-parameter breakdown. Run on **one GPU** so there is
+no sharding: a manual sum over `.to_local()` grads is then exact, and a disagreement would
+exonerate the FSDP/DTensor reduction. Config `examples/basic/reverse-text/sft.toml`,
+Qwen3-0.6B, lr 2e-5, `compile = "None"`.
+
+**Job history.** 43536 failed (`RANK expected, but not set` — `uv run sft` launches torchrun
+internally; invoking the module with plain `python` skips it). 43537 fixed that with
+`torchrun --standalone --nproc-per-node 1`. 43539 added full parameter names, shapes and
+per-element RMS. 43540 added the SDPA arm.
+
+### Result 1 — the norm is correct (43537)
+
+`ratio = reported/manual = 1.0000` at **every** step, at both `max_norm = 1.0` and `1e12`,
+matching to 7 significant figures. `all_finite = True`, `n_params = 310`.
+**`clip_grad_norm_` was never at fault.** The gradients really are ~1e8–3.6e8.
+
+### Result 2 — the damage is localised to layer 0 and the Q/K path (43539)
+
+One parameter carries 42–60% of the squared norm, consistently:
+
+```
+model.embed_tokens.weight              (151936,1024)  norm 2.38e8  rms 1.9e4
+model.layers.0...self_attn.q_proj      (2048,1024)    norm 1.88e8  rms 1.3e5
+model.layers.0...self_attn.k_proj      (1024,1024)    norm 1.21e8  rms 1.2e5
+model.layers.0...self_attn.o_proj      (1024,2048)    norm 4.38e7  rms 3.0e4
+model.layers.0...self_attn.q_norm      (128,)         norm 3.68e7  rms 3.3e6
+```
+
+All layer 0 + embeddings, ordered q_proj > k_proj > v_proj > o_proj. `q_norm` has 128
+elements carrying a per-element gradient RMS of 3.3 million.
+
+### Result 3 — swapping the attention kernel fixes it (43540)
+
+Same data, same seed, only `FlashAttention._compute_attention` replaced by a per-sequence
+`F.scaled_dot_product_attention` under `SDPBackend.MATH`:
+
+| backend | step-1 loss | grad norm 1–3 | embed grad RMS | top-1 share | tok/s |
+|---|---|---|---|---|---|
+| `flash_attn_varlen_func` | 4.6125 | 3.40e8 / 1.46e8 / 1.37e8 | 1.9e4 | ~50% | 5940 |
+| MATH SDPA | 4.6122 | 24.4 / 12.0 / 6.7 | 2.1e-4 | ~24% | 11196 |
+
+**The loss agrees to four significant figures — the forward is exact — while the gradients
+differ by ~1.4e7.** A backward-only kernel bug. Under SDPA the per-parameter distribution is
+diffuse, `q_norm` leaves the top five, and the SDPA arm's loss also falls faster over three
+steps (4.6122 → 4.2364 vs 4.6125 → 4.4489), consistent with correct gradients.
+
+Environment: `flash-attn 2.8.3.post1`, `torch 2.11.0+rocm7.2`, `triton 3.6.0`; only FA2
+installed. MATH SDPA was 2× faster at equal peak memory, but is O(L²) memory and will not
+scale.
+
+### Why `max_norm = 1.0` looked like it "prevented all learning"
+
+At a true norm of 6–24, `max_norm = 1.0` is a sensible clip; prime-rl's default was never
+wrong. The failure is a second-order effect of the first bug: the inflated layer-0 gradients
+carry ~50% of the norm, so the *global* rescale by 1/3.4e8 crushes the ~305 healthy
+parameters to ~1e-8, where AdamW's `eps = 1e-8` floor swamps them and their updates go to
+zero. Unclipped, AdamW's per-parameter normalisation rescues the healthy majority while
+layer 0 keeps training on garbage. **`max_norm = 1e12` worked by accident.**
+
+### Result 4 — it is ONE ENVIRONMENT VARIABLE (43543)
+
+Prompted by the user noting that colleagues run prime-rl + flash-attn here without trouble.
+`FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` selects flash-attn's Triton AMD backend over
+composable-kernel. It originates at `rl_train_singlenode_mixed.sbatch:308` and I copied it
+into all twelve `opd_val` scripts, so **every experiment in this investigation used it**.
+
+| backend | TRITON_AMD | act.ckpt | step-1 loss | grad norm 1-3 | tok/s |
+|---|---|---|---|---|---|
+| flash-attn varlen | TRUE | on | 4.6125 | 3.40e8 / 1.46e8 / 1.37e8 | 5869 |
+| flash-attn varlen | **FALSE** | on | 4.6127 | **24.39 / 11.98 / 6.66** | **17550** |
+| flash-attn varlen | TRUE | off | 4.6125 | 3.40e8 / 1.46e8 / 1.37e8 | 15284 |
+| MATH SDPA | - | on | 4.6122 | 24.36 / 11.98 / 6.65 | 11069 |
+
+Unset, flash-attn matches the independent SDPA reference to 3 s.f. on the norm and 4 s.f. on
+the loss, at 3x the Triton throughput. The distinct throughput (17550 vs 11069 vs 5869)
+confirms a real third kernel ran rather than a silent fallback. **Activation checkpointing is
+exonerated** - that cell is bit-identical to the control.
+
+Fix applied: all 13 scripts (12 in `opd_val/` plus `rl_train_singlenode_mixed.sbatch`) now
+carry a comment in place of the export explaining why not to set it.
+
+### Result 5 — confirmation at the DEFAULT max_norm (43544)
+
+Plain `uv run sft` on `examples/basic/reverse-text/sft.toml`, lr 2e-5, 100 steps, **no
+`max-norm` override** — the exact configuration that produced a flat 4.6125 -> 4.8955 in
+jobs 42356/42359, now with the variable removed:
+
+| step | 1 | 5 | 10 | 25 | 50 | 75 | 100 |
+|---|---|---|---|---|---|---|---|
+| loss | 4.6127 | 4.0529 | 3.4887 | 2.7808 | 1.6166 | 1.1225 | **0.9469** |
+| grad norm | 24.39 | 5.23 | 2.46 | 3.53 | 5.32 | 6.62 | 4.16 |
+
+The norm sits in 2-25 for the whole run, so `max_norm = 1.0` is clipping mildly and sanely,
+exactly as designed.
+
+**The old "working" workaround was also badly degraded.** Job 42364 (`max_norm = 1e12`, same
+config, same 100 steps) reached only **3.7183**. With the variable removed and clipping left
+at its default, the same run reaches **0.9469** — a ~4x better final loss. So the Triton
+backward was not merely breaking clipped runs; it was crippling the unclipped ones too. Every
+prior result is degraded, not just uncertain.
+
+### Consequences
+- **Every experiment in this log trained layer 0 and the embeddings on corrupted gradients**,
+  including GRPO 0.7256 vs `opd` 0.6715 ± 0.0019. Both arms shared the defect so the ranking
+  is not automatically void, but none of it should be read as a claim about the *algorithms*
+  until reproduced on a correct backward.
+- Fix paths, neither attempted: (a) a flash-attn build with a correct ROCm backward;
+  (b) add `sdpa` to prime-rl as a correctness fallback.
+
+### Also closed out — clipping does not rescue top-k (43534/43535, offline scores 43541)
+
+`teacher_top_k = 20` with `max_norm` 5e7 / 1e7, 300 steps, GSM8K band. Both ran clean
+(rc=0, 2h15). Offline scores (43541):
+
+| arm | step_50 | 100 | 150 | 200 | 250 | 300 |
+|---|---|---|---|---|---|---|
+| k=20, `max_norm` 5e7 | 0.5894 | 0.0237 | 0.0115 | 0.0084 | 0.0115 | 0.0107 |
+| k=20, `max_norm` 1e7 | 0.5872 | 0.0183 | 0.0084 | 0.0084 | 0.0115 | 0.0107 |
+
+Both are at the base student's 0.588 at step 50 (2.4–2.7% truncation) and collapse to ~0.01
+at 100% truncation by step 150 — same window and same endpoint as the unclipped arms.
+Constraining the update norm does not rescue top-k. That closes the sweep at **seven
+variants, all collapsing**: residual/renormalize/none × reverse/mixed/forward, plus these two
+clipped arms.
+
+Note this negative result is *entangled* with the flash-attn finding above: with the backward
+broken, a top-k objective that puts exact gradient on the Q/K path is being fed corrupted
+gradients precisely where the damage is worst. Top-k should be re-tested on a correct
+backward before the collapse is attributed to the objective.
+
+**A misread worth recording:** I flagged these arms' *in-run* step-1 eval (reward 0.02 at
+95% truncation, against a 0.588 student) as evidence the top-k path breaks generation
+immediately. It is not — that is the known-broken in-run eval, which reads ~0.05 for **every**
+arm including the GRPO runs that offline-score 0.726, because it uses
+`openai_chat_completions` rather than the renderer so `enable_thinking=false` never applies.
+The offline eval is clean and shows the top-k collapse is real (e.g. `M-k20-none-forward`:
+step_50 0.5719 at 2.6% truncation → step_300 0.0099 at 100%).

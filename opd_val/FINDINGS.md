@@ -7,6 +7,8 @@
 
 ## 1. Bottom line up front
 
+> **CORRECTION (2026-08-18).** The "broken gradient-norm computation" described below was misdiagnosed, twice. The norm is computed correctly, and flash-attn is fine. The real cause is a **single environment variable**: `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` selects flash-attn's Triton AMD backend, whose *backward* returns gradients ~1.4e7× too large while its forward is exact. It was inherited from `rl_train_singlenode_mixed.sbatch:308` and copied into all twelve `opd_val` scripts, so **every experiment in this investigation ran with it**. Unset, the default composable-kernel backward is correct *and* 3× faster. `max_norm = 1e12` was never a fix — it worked by accident, and `max_norm = 1.0` is the correct default. See §2.1. **Every result in this document was measured on a corrupted backward pass** and needs reproducing before being read as a claim about distillation.
+
 Two infrastructure bugs — a broken gradient-norm computation that made the default `max_norm = 1.0` prevent learning entirely, and a ROCm `torch.compile` crash — blocked *all* training on this cluster and had to be found before any question about distillation could even be asked. Every result recorded before 2026-08-12 evening is an artifact of the first bug and is worthless. With `max_norm = 1e12` the trainer learns normally, and the comparison is then clean and negative: from a base-model student, **`sft` improves reward 0.043 → 0.150 while `opd` collapses 0.046 → 0.002 with 100% truncation**, and `grpo` also improves. A substantial secondary effort — implementing top-k teacher distributions to fix a real coverage defect in the sampled-token KL estimator — demonstrably fixed that defect and **did not change the outcome**: `opd` fails at every k in {8, 20, 50, 100} and at both learning rates tried. The leading hypothesis (untested) is that `opd` needs a student already competent at the task; a ladder of partially-SFT'd students to test that is running now (job 42459).
 
 ---
@@ -15,7 +17,7 @@ Two infrastructure bugs — a broken gradient-norm computation that made the def
 
 These affect everyone running prime-rl on this cluster, not just distillation.
 
-### 2.1 `max_norm = 1.0` + a bogus gradient norm ⇒ the trainer does not learn *(the big one)*
+### 2.1 The ROCm flash-attention backward is broken ⇒ the trainer does not learn at default `max_norm` *(the big one)*
 
 The trainer reports `Grad. Norm` values of ~1e8–1e10 for a 0.6B model where O(1–10) is correct. Default clipping at `max_norm = 1.0` therefore scales every update by a factor that swings ~100× step to step, which destroys AdamW's `m`/`v` EMAs and turns training into a random walk.
 
@@ -28,11 +30,36 @@ Isolated in the **standalone `sft` entrypoint** on the repo's own vetted config 
 | 42362 | 1.0, offload off | 2e-5 / 1e-4 | bit-identical to above | `optim_cpu_offload` ruled out |
 | **42364** | **1e12 (off)** | 2e-5 | **4.6125 → 3.7183** | **descends** |
 
-Critically, 42364 still logs `Grad. Norm` of 3.4e8–4.2e10 *with clipping disabled* while the loss descends normally. So the gradients are fine; **the reported scalar norm is the bug.**
+**ROOT-CAUSED 2026-08-18 (jobs 43539/43540/43543) — and the diagnosis above was wrong.** The reported norm is *correct*; the gradients really are that large, because of one environment variable.
 
-- **Root cause: UNIDENTIFIED.** `clip_grad_norm_` comes from `torchtitan.distributed.utils` and is called at `src/prime_rl/trainer/sft/train.py:471` and `src/prime_rl/trainer/rl/train.py:558`. Prime suspect is the FSDP/DTensor norm reduction on ROCm; this has not been instrumented.
-- **`max_norm = 1e12` is a workaround, not a fix.** Any run on this cluster that leaves clipping at its default silently reintroduces the failure.
-- **Next diagnostic:** a per-parameter gradient-norm dump. If one parameter or one DTensor shard is anomalous while the rest are sane, that pinpoints the reduction path.
+**The cause: `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`.** It selects flash-attn's Triton AMD backend instead of composable-kernel. Job 43543, four cells, everything else identical:
+
+| attention backend | `FLASH_ATTENTION_TRITON_AMD_ENABLE` | act. ckpt | step-1 loss | grad norm 1–3 | tok/s |
+|---|---|---|---|---|---|
+| flash-attn varlen | **TRUE** | on | 4.6125 | 3.40e8 / 1.46e8 / 1.37e8 | 5869 |
+| flash-attn varlen | **FALSE** | on | 4.6127 | **24.39 / 11.98 / 6.66** | **17550** |
+| flash-attn varlen | **TRUE** | off | 4.6125 | 3.40e8 / 1.46e8 / 1.37e8 | 15284 |
+| MATH SDPA (reference) | — | on | 4.6122 | 24.36 / 11.98 / 6.65 | 11069 |
+
+Unset, flash-attn agrees with an independent MATH-SDPA reference to three significant figures on the gradient norm and four on the loss, and runs **3× faster** than the Triton path. Activation checkpointing is exonerated — that cell is bit-identical to the control. The variable came from `rl_train_singlenode_mixed.sbatch:308` and was copied into all twelve `opd_val` scripts; all thirteen have been patched to a comment explaining why not to set it.
+
+The rest of this section records the earlier, more general finding that led here — that the *backward* was corrupt while the forward was exact.
+
+`opd_val/gradnorm_probe.py` wraps the standalone `sft` entrypoint on a single GPU (no sharding, so a manual sum over `.to_local()` grads is exact) and monkeypatches `torchtitan.distributed.utils.clip_grad_norm_` to compute the norm independently before clipping:
+
+| backend | step-1 loss | grad norm, steps 1–3 | reported/manual | `embed_tokens` grad RMS | top-1 share |
+|---|---|---|---|---|---|
+| `flash_attn_varlen_func` (default) | 4.6125 | 3.40e8 / 1.46e8 / 1.37e8 | **1.0000** | 1.9e4 | ~50% |
+| `F.scaled_dot_product_attention`, MATH backend | 4.6122 | 24.4 / 12.0 / 6.7 | **1.0000** | 2.1e-4 | ~24% |
+
+Same data, same seed, only the attention kernel swapped. **The loss agrees to four significant figures — the forward is correct — while the gradients differ by ~1.4e7.** The reported/manual ratio is 1.0000 in both arms, so `clip_grad_norm_` was never at fault.
+
+The damage is localised and structured: the five largest per-parameter norms are all layer 0 plus the embedding, ordered q_proj > k_proj > v_proj > o_proj — the Q/K path — and `q_norm` (128 elements) reaches a per-element gradient RMS of **3.3e6**. Under SDPA `q_norm` leaves the top five entirely.
+
+- **`max_norm = 1.0` is the correct default.** At a true norm of 6–24 it is an entirely sensible clip. It appeared to "prevent all learning" only because the *global* rescale by 1/3.4e8 crushes the ~305 healthy parameters to ~1e-8, where AdamW's `eps = 1e-8` floor swamps them and their updates go to zero. Unclipped, AdamW's per-parameter normalisation rescues the healthy majority while layer 0 keeps training on garbage. **`max_norm = 1e12` worked by accident and fixed nothing.**
+- **Environment:** `flash-attn 2.8.3.post1`, `torch 2.11.0+rocm7.2`, `triton 3.6.0`. Only FA2 is installed. Colleagues on this cluster run the same versions without trouble — consistent with the variable, not the package, being at fault.
+- **Every result in this document and in `EXPERIMENT_LOG.md` was measured with layer 0 and the embeddings training on corrupted gradients**, including GRPO 0.7256 vs `opd` 0.6715. Both arms shared the defect, so the ranking is not automatically void, but no conclusion here should be treated as a statement about the *algorithms* until it is reproduced. The seven-variant top-k collapse is the most suspect of all: top-k puts exact gradient on the Q/K path, which is where the corruption was worst.
+- **The fix is free.** Removing the variable is strictly better on every axis measured: correct gradients, 3× throughput, and the repo's default `max_norm` becomes usable again. No code change, no dependency pin, no `sdpa` fallback needed.
 
 ### 2.2 ROCm: `torch.compile` must be off
 
@@ -206,7 +233,7 @@ The untested middle regime is a student **competent at the task but meaningfully
 ## 7. Recommendations, in order
 
 1. **Report the `max_norm` / gradient-norm bug upstream and to whoever owns the ROCm port — highest priority, and not a distillation issue.** It blocks *all* prime-rl training on this cluster with default settings, silently, with no error. Anyone who runs prime-rl here today and leaves `[trainer.optim] max_norm` alone gets a flat loss curve and no indication why. Include the 42364 vs 42359 A/B (identical config, one flag, 4.6125→3.7183 vs 4.6125→4.8955) — it is a two-line reproduction. *Confidence: very high, isolated on the standalone entrypoint with a bit-identical determinism check.*
-2. **Root-cause the norm itself with a per-parameter gradient-norm dump.** Until then every run here needs `max_norm` set to a no-op, which is a foot-gun waiting to be forgotten. *Prime suspect FSDP/DTensor reduction on ROCm; confidence in the suspect: low, it has not been instrumented.*
+2. ~~**Root-cause the norm itself with a per-parameter gradient-norm dump.**~~ **DONE (2026-08-18, jobs 43539/43540) — see §2.1.** The norm was correct; the ROCm flash-attn *backward* is broken (gradients 1.4e7× too large, forward exact to 4 s.f.). The report in item 1 should be redirected: it is not a `clip_grad_norm_` bug, and `max_norm = 1.0` is the right default. Two fix paths, neither yet attempted: (a) an environment fix — a flash-attn build whose ROCm backward is correct; (b) a prime-rl change — add `sdpa` to `AttnImplementation` and `ATTN_IMPL2CLASS` as a correctness fallback, since today the config offers no working backend on this hardware. *Confidence: very high — single GPU, no sharding, identical loss with only the kernel swapped.*
 3. **Run the intermediate-checkpoint experiment (42459's ladder) — this is the real test of `opd` viability.** Everything else about `opd` is now known to work mechanically; the only open question is whether it works from a competent-but-inferior student. If `opd` also fails from a 0.3–0.6-reward student, the conclusion is that `opd` as implemented does not work here, and further estimator tuning is not worth doing. *Confidence in the hypothesis: moderate — it is consistent with all the evidence and with the standard SFT-then-RL recipe, but it is a hypothesis.*
 4. **Fix or report the `/tmp/vf-scripts` path** (`deps/verifiers/.../base.py:173`) — a one-line `TMPDIR` fix upstream removes a class of node-dependent flakiness that already cost one 98-minute wasted job. *Confidence: high, root cause is certain.*
 5. **Report the shutdown deadlock.** Nine occurrences, ~a third of all runs, each holding a full node until walltime or an operator intervenes. The `zero_advantage` hypothesis does not survive the wider census (five of the nine are `opd`, which ships no advantages), so this needs fresh investigation of the orchestrator's batch-dispatch path. *Confidence in the symptom: certain. In any mechanism: none.*
