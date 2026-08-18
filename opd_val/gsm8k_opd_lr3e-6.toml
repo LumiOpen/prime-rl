@@ -97,12 +97,11 @@ judge = "None"
 [trainer.optim]
 lr = 3e-6
 
-# CRITICAL ROCm workaround: with the default max_norm = 1.0 the trainer does not
-# learn at all — the reported gradient norm is ~1e8-1e10 and fluctuates ~100x
-# per step, which breaks AdamW's m/v EMAs. Verified in isolation on the
-# standalone sft entrypoint: max_norm 1.0 -> loss flat 4.61->4.90; 1e12 ->
-# 4.61->3.72. Root cause unidentified; this is a workaround.
-max_norm = 1e12
+# max_norm left at the prime-rl default (1.0). The old `max_norm = 1e12`
+# workaround compensated for FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE selecting
+# flash-attn's broken Triton AMD backward (gradients 1.4e7x too large). With
+# that variable removed the true norm is 2-25 and the default clips sanely.
+# Verified jobs 43543/43544. See FINDINGS.md 2.1.
 
 [trainer.model]
 # Inductor's meta kernel for flash_attn._flash_attn_varlen_forward reports a

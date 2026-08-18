@@ -27,7 +27,7 @@ name = "Qwen/Qwen3-1.7B"
 
 [orchestrator]
 batch_size = 128
-group_size = 4
+group_size = 16
 
 [orchestrator.model.client]
 base_url = ["http://127.0.0.1:8000/v1"]
@@ -95,7 +95,7 @@ answer_key = "answer"
 judge = "None"
 
 [trainer.optim]
-lr = 2e-5
+lr = 1e-5
 
 # max_norm left at the prime-rl default (1.0). The old `max_norm = 1e12`
 # workaround compensated for FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE selecting
@@ -109,6 +109,7 @@ lr = 2e-5
 compile = "None"
 
 [inference]
+seed = 0
 gpu_memory_utilization = 0.8
 
 [inference.server]
@@ -133,10 +134,7 @@ num_infer_gpus = 2
 num_train_gpus = 2
 
 [orchestrator.algo]
-type = "sft"
+type = "grpo"
 
-# sft's teacher IS the model it samples from — the empirical ceiling for how
-# much of the teacher's advantage is transferable at this budget.
-[orchestrator.algo.sampling.source]
-name = "Qwen/Qwen3-8B"
-base_url = ["http://127.0.0.1:8001/v1"]
+[ckpt]
+interval = 50

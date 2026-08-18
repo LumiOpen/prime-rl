@@ -56,13 +56,11 @@ harness = { id = "null", runtime = { type = "subprocess" } }
 [trainer.optim]
 lr = 2e-5
 
-# CRITICAL ROCm workaround: with the default max_norm = 1.0 the trainer does not
-# learn at all. The reported gradient norm is ~1e8-1e10 (a correct CE norm for a
-# 0.6B model is O(1-10)) and fluctuates ~100x per step, so clipping to it makes
-# the effective step size swing wildly and breaks AdamW's m/v EMAs. Verified in
-# isolation with the standalone sft entrypoint: max_norm 1.0 -> loss flat
-# 4.61->4.90; max_norm 1e12 -> loss descends 4.61->3.76.
-max_norm = 1e12
+# max_norm left at the prime-rl default (1.0). The old `max_norm = 1e12`
+# workaround compensated for FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE selecting
+# flash-attn's broken Triton AMD backward (gradients 1.4e7x too large). With
+# that variable removed the true norm is 2-25 and the default clips sanely.
+# Verified jobs 43543/43544. See FINDINGS.md 2.1.
 
 [trainer.model]
 # The fused lm head never materializes logits, so the policy's own logprobs on

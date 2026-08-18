@@ -70,7 +70,13 @@ echo "=== checkpoint eval on the 327-problem band | job $SLURM_JOB_ID ==="
 echo "reference: student 0.588 (step 0) -> teacher 0.893"
 
 for RUN in ${RUNS:-opd-lr1e-6_42563 grpo-lr1e-6_42564 opd-lr3e-6_42565 grpo-lr3e-6_42566}; do
+  # STEPS filters which checkpoints to score (default: all). Scoring every
+  # checkpoint costs a vLLM spin-up each, so restrict it when only the
+  # trajectory endpoints matter.
   for CKPT in $(ls -d "$OUT/runs/$RUN/run/weights/step_"* 2>/dev/null | sort -t_ -k2 -n); do
+    if [ -n "${STEPS:-}" ]; then
+      case " $STEPS " in *" $(basename "$CKPT" | sed 's/step_//') "*) ;; *) continue ;; esac
+    fi
     STEP=$(basename "$CKPT")
     echo ""
     echo "########## $RUN / $STEP ##########"
