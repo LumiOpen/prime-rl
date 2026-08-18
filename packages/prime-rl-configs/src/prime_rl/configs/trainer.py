@@ -503,13 +503,18 @@ class RefKLConfig(BaseConfig):
     mixed_kl_weight: float = Field(0.5, ge=0.0, le=1.0)
     """Weight on the forward term when ``kl_type = "mixed"``."""
 
-    topk_normalization: Literal["residual", "renormalize"] = "residual"
+    topk_normalization: Literal["residual", "renormalize", "none"] = "residual"
     """How the top-k support is turned into a distribution. ``residual`` keeps the
     policy's absolute probabilities and lumps all off-support mass into one extra
     atom, so the objective also penalizes mass the reference does not cover.
     ``renormalize`` softmaxes both sides *within* the support, so the objective
     matches only the shape inside it and is indifferent to how much total mass
-    lives there (the partition function cancels)."""
+    lives there (the partition function cancels). ``none`` is the plain partial
+    sum over absolute probabilities (NeMo-RL's ``DistillationLossFn`` with
+    ``zero_outside_topk = false``): alone with ``kl_type = "reverse"`` this is
+    degenerate — the policy can satisfy it by evacuating the support — but with a
+    forward component the teacher's weights are constants, so that term reduces
+    to soft-label cross-entropy on the support and anchors the objective."""
 
     temperature: float = Field(1.0, gt=0.0)
     """Softmax temperature applied symmetrically to both sides of the top-k KL."""

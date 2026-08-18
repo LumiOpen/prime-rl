@@ -147,7 +147,50 @@ none is configurable in prime-rl today (`ref_kl_loss_fn` takes no config at all)
   fan-out, consistent with distillation not needing group-relative credit
   (matches prime-rl's note that `group_size` only fans out sampling for `opd`).
 
-## What I'd suggest, in order
+## RESULTS (added 2026-08-18, after running the suggestions below)
+
+All three suggestions were run. **Two of the three made things worse than
+prime-rl's existing defaults, and the third did not rescue top-k.**
+
+| arm | final reward | vs k=0 baseline 0.680 |
+|---|---|---|
+| k=20 residual + reverse (our original bug) | 0.024 | much worse |
+| k=20 **renormalize** + reverse (NeMo-RL's normalization) | 0.0015 | **worse still** |
+| k=20 **renormalize + mixed** (NeMo-RL's default) | 0.0000 | worst |
+| k=0 + MOPD loss settings (no ratio, two-sided gate) | 0.615 | worse |
+| **k=0, prime-rl defaults** | **0.680** | — |
+
+Three things I got wrong in the suggestions below, worth recording:
+
+1. **Renormalization was not the fix.** The unit test was right that my residual
+   atom imposes a 20x penalty for off-support mass, and swapping it does change
+   the failure mode — but the arm still collapses, into *repetition* rather than
+   diffusion ("number number number number...", mean 5057 chars). Entropy fell
+   to 0.07, which I initially read as healthy; it was the policy locking onto a
+   degenerate mode. Reverse KL is mode-seeking and, given an exact gradient, it
+   finds one.
+2. **Mixed KL is actively harmful here**, not safer: entropy 11.03 of a possible
+   ~11.9, i.e. near-uniform. Forward KL is mode-covering and unboundedly
+   penalizes `p -> 0` where the teacher has mass, which inflates a
+   near-deterministic policy. NeMo-RL's `kl_type: mixed` default belongs to
+   `distillation.py`, an SFT-style trainer (lr 2e-5, `num_generations_per_prompt: 1`),
+   not an on-policy RL loop.
+3. **MOPD's loss settings hurt.** Dropping the unbounded importance ratio is not
+   free variance reduction — the ratio corrects real off-policy staleness in our
+   async setup, and MOPD only gets away without it because it pairs the
+   REINFORCE form with ICE-POP gating that prime-rl does not implement. (The
+   two changes are being ablated separately; the combined effect is -0.065.)
+
+The general lesson: their defaults are tuned for a different regime, and porting
+individual knobs across that gap does not transfer. Running them as separate
+arms rather than adopting the config wholesale is what made this legible.
+
+The one thing that unambiguously *was* worth taking from NeMo-RL is the bug
+report itself: reading `_direct_topk_kl` is what exposed that my residual atom
+was a 20x off-support penalty, which three rounds of my own unit tests had
+missed because they only checked properties I had thought to check.
+
+## What I suggested, in order (superseded by the results above)
 
 1. **Rerun top-k with their formulation** — renormalize within K, and use
    `kl_type = mixed` at 0.5. Two small edits to `ref_kl_loss_fn`. This directly

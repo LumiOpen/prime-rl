@@ -263,6 +263,16 @@ def _topk_divergence(
         reverse = (p * (log_p - log_q)).sum(-1)
         forward = (q * (log_q - log_p)).sum(-1)
         residual = torch.zeros_like(reverse)
+    elif config.topk_normalization == "none":
+        # Plain partial sum over absolute probabilities. The forward term is
+        # sum_v q(v)(log q(v) - log p(v)) with q constant, i.e. soft-label cross
+        # entropy on the support — it cannot be gamed by moving mass off the
+        # support, which is what makes this safe despite not being a true KL.
+        log_p, log_q = trainer_topk / T, ref_topk / T
+        p_, q_ = torch.exp(log_p) * valid, torch.exp(log_q) * valid
+        reverse = (p_ * (log_p - log_q)).sum(-1)
+        forward = (q_ * (log_q - log_p)).sum(-1)
+        residual = torch.zeros_like(reverse)
     else:
         log_p, log_q = trainer_topk / T, ref_topk / T
         p, q = torch.exp(log_p) * valid, torch.exp(log_q) * valid

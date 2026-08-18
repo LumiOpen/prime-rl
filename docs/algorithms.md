@@ -372,6 +372,29 @@ Two requirements when `teacher_top_k >= 1`:
 
 Cost is linear in `k` — roughly 1 MB of wire traffic per 1k tokens per 10 units of `k` — and the trainer logs `TopK Mass`, the share of the policy's probability the support actually covers. A small mass means the KL is carried mostly by the coarse off-support term and `k` is too narrow to resolve much.
 
+> [!WARNING]
+> `teacher_top_k = 0` (the sampled-token estimator) is the default for a reason.
+> On a GSM8K student/teacher pair (`Qwen3-1.7B` ← `Qwen3-8B`, a 30-point gap on
+> the training distribution), every distributional variant tried **degraded the
+> policy to near-zero reward** while `k = 0` improved it from 0.59 to 0.68:
+>
+> | `teacher_top_k` | `topk_normalization` | `kl_type` | final reward |
+> |---|---|---|---|
+> | 0 | — | — | **0.68** |
+> | 20 | `residual` | `reverse` | 0.02 |
+> | 20 | `renormalize` | `reverse` | 0.002 (repetition collapse) |
+> | 20 | `renormalize` | `mixed` | 0.000 (near-uniform) |
+>
+> The failures are not tuning artifacts: they persist across a 10x learning-rate
+> sweep, and the *more completely* the KL was minimized the worse the model got
+> (a run that cut the KL by 95% scored 0.02). Minimizing a per-token
+> distributional KL against a teacher, evaluated on the student's *own*
+> trajectories, is not the same objective as becoming a better model — and the
+> sampled-token estimator's high variance appears to protect against
+> over-optimizing that gap. Treat `teacher_top_k >= 1` as experimental, and
+> watch reward rather than `Ref KL`, which falls monotonically in every failing
+> run.
+
 ## Filters
 
 Filters drop rollouts between scoring and training. Built-ins (composable):
