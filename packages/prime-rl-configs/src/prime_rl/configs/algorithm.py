@@ -250,6 +250,24 @@ class OPDAlgoConfig(BaseAlgoConfig):
     ``"policy"`` is not even representable here (use ``opsd`` for
     demo-conditioned self-teaching)."""
 
+    teacher_top_k: int = Field(0, ge=0)
+    """Size of the teacher's per-token support shipped to the trainer.
+
+    ``0`` (the default) ships one teacher logprob per token — the logprob of the
+    token the policy actually sampled — and the trainer uses the score-function
+    estimator ``(log pi - log pi_ref) * grad log pi``. That estimator is
+    unbiased for the per-token reverse KL but only ever touches tokens the
+    policy emitted: it can push probability *down*, never *up* onto a token the
+    teacher prefers but the policy never samples.
+
+    ``k >= 1`` additionally ships the teacher's top-k support (ids + logprobs)
+    per token, and the trainer evaluates the reverse KL directly over that
+    support, ``sum_v pi(v) (log pi(v) - log pi_ref(v))``, which puts gradient on
+    every token in the support. Larger ``k`` approximates the exact
+    vocabulary-wide KL more closely at a linear wire cost (~1 MB per 1k tokens
+    per k=10). Requires ``trainer.model.fused_lm_head_token_chunk_size =
+    "disabled"``, since the fused head never materializes logits."""
+
 
 class OPSDAlgoConfig(BaseAlgoConfig):
     type: Literal["opsd"] = "opsd"

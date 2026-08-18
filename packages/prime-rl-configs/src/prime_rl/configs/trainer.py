@@ -487,6 +487,52 @@ class CustomLossConfig(BaseConfig):
 LossConfig: TypeAlias = Annotated[DefaultLossConfig | IPOLossConfig | CustomLossConfig, Field(discriminator="type")]
 
 
+class RefKLConfig(BaseConfig):
+    """Knobs for the ``ref_kl`` loss component (``opd`` / ``opsd``).
+
+    Every default reproduces the previous hard-coded behaviour exactly, so an
+    unconfigured run is unchanged."""
+
+    kl_type: Literal["reverse", "forward", "mixed"] = "reverse"
+    """Divergence direction, used only when the algorithm ships a teacher support
+    (``teacher_top_k >= 1``) — the sampled-token estimator has a single support
+    point and no direction to choose. ``reverse`` is KL(policy || reference),
+    mode-seeking; ``forward`` is KL(reference || policy), mode-covering and more
+    stable; ``mixed`` blends them by ``mixed_kl_weight``."""
+
+    mixed_kl_weight: float = Field(0.5, ge=0.0, le=1.0)
+    """Weight on the forward term when ``kl_type = "mixed"``."""
+
+    topk_normalization: Literal["residual", "renormalize"] = "residual"
+    """How the top-k support is turned into a distribution. ``residual`` keeps the
+    policy's absolute probabilities and lumps all off-support mass into one extra
+    atom, so the objective also penalizes mass the reference does not cover.
+    ``renormalize`` softmaxes both sides *within* the support, so the objective
+    matches only the shape inside it and is indifferent to how much total mass
+    lives there (the partition function cancels)."""
+
+    temperature: float = Field(1.0, gt=0.0)
+    """Softmax temperature applied symmetrically to both sides of the top-k KL."""
+
+    importance_ratio: bool = True
+    """Multiply the per-token signal by the trainer/inference importance ratio.
+    ``false`` gives the plain REINFORCE form, leaving off-policy correction
+    entirely to the trust region — the ratio is unbounded above, so it is a
+    variance source on an already high-variance estimator."""
+
+    trust_region: Literal["one_sided", "two_sided", "none"] = "one_sided"
+    """Which tokens are dropped from the policy-gradient term. ``one_sided`` drops
+    tokens whose trainer probability fell more than ``trust_region_threshold``
+    below the inference probability; ``two_sided`` also drops those that rose by
+    more than it (a hard gate on drift in either direction)."""
+
+    trust_region_threshold: float = Field(0.2, gt=0.0)
+    """Probability-difference bound for the trust region."""
+
+    mismatch_kl_coef: float = Field(1e-3, ge=0.0)
+    """Coefficient on the squared-log-ratio drift regularizer."""
+
+
 class FakeDataLoaderConfig(BaseConfig):
     batch_size: int = Field(2, ge=1)
     """Batch size of the fake data loader."""
@@ -547,7 +593,10 @@ class TrainerConfig(BaseConfig):
     data: DataLoaderConfig = DataLoaderConfig()
 
     loss: LossConfig = DefaultLossConfig()
-    """Loss config for the rl loss component (see ``setup_rl_loss_fn``). The ce / ref_kl components are fixed and do not read this."""
+    """Loss config for the rl loss component (see ``setup_rl_loss_fn``). The ce component is fixed; the ref_kl component reads ``ref_kl`` below."""
+
+    ref_kl: RefKLConfig = RefKLConfig()
+    """Config for the ref_kl loss component (``opd`` / ``opsd``). Defaults reproduce the previous hard-coded behaviour."""
 
     optim: OptimizerConfig = AdamWConfig()
 

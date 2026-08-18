@@ -18,6 +18,16 @@ class RoutedExperts(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tru
     dtype: str
 
 
+# The teacher's top-k support per token (opd with `teacher_top_k >= 1`), for
+# evaluating the reverse KL over a support instead of the single sampled token.
+# Same raw-bytes treatment as RoutedExperts: at k=100 over 1k tokens this is
+# ~800 KB per sample, so tolist() is far too expensive.
+class TeacherTopK(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
+    ids: bytes  # int32,   [seq_len, width]
+    logprobs: bytes  # float32, [seq_len, width]
+    shape: list[int]  # [seq_len, width], width = teacher_top_k + 1
+
+
 # Orchestrator -> Packer
 class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A single training example — one branch of a rollout as a flat token sequence.
@@ -68,6 +78,11 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # samples without live rl member tokens (the trainer raises otherwise).
     advantages: list[float] | None = None
 
+    # NOTE: append new fields at the END. These structs are `array_like=True`,
+    # so the wire format is a positional array and field order IS the schema —
+    # inserting a field anywhere else silently mis-decodes every field after it.
+    teacher_topk: TeacherTopK | None = None
+
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A batch of training examples with metadata for transport."""
@@ -109,3 +124,6 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # Packer-derived metadata used for run-local token exports.
     run_id: str | None = None
     run_step: int | None = None
+
+    # NOTE: append new fields at the END — see the note on TrainingSample.
+    teacher_topk: TeacherTopK | None = None

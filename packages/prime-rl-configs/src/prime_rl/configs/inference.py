@@ -48,6 +48,9 @@ class ModelConfig(BaseModelConfig):
     max_model_len: int | None = None
     """Maximum model context length. If None, uses the model config's value. Forwarded as ``--max-model-len``."""
 
+    max_logprobs: int = 20
+    """Largest ``logprobs`` / ``prompt_logprobs`` a request may ask for; the server rejects anything above it with a 400. vLLM's own default (20) is fine for sampling, but a frozen teacher serving ``opd`` with ``teacher_top_k`` above 20 needs this raised to at least that ``k``. Forwarded as ``--max-logprobs``."""
+
     enforce_eager: bool = False
     """Enforce eager mode. When False, PyTorch eager and cuda graphs run hybrid for maximum performance. Forwarded as ``--enforce-eager``."""
 
@@ -580,6 +583,7 @@ class InferenceConfig(BaseConfig):
             "model.name": "model",
             "model.dtype": "dtype",
             "model.max_model_len": "max_model_len",
+            "model.max_logprobs": "max_logprobs",
             "model.enforce_eager": "enforce_eager",
             "model.trust_remote_code": "trust_remote_code",
             "model.chat_template": "chat_template",

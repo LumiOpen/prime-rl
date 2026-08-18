@@ -1,0 +1,88 @@
+# Shared base for the 512-token reverse-text comparison (opd / grpo / sft).
+# Not runnable on its own — opd_512.toml, grpo_512.toml and sft_512.toml are
+# generated from this by make_512_configs.py, which appends the algo block.
+#
+# Changes vs the first round:
+#   max_completion_tokens 128 -> 512   the 128 cap truncated ~78% of student
+#                                      rollouts, which scored exactly 0.0 and
+#                                      left both algorithms with almost no signal
+#   lr stays 3e-6                      1e-5 destabilised both opd and grpo
+#                                      (entropy 0.65 -> 0.95+, grpo reward collapse)
+#   max_steps 60                       enough budget to see movement
+#
+# GPU layout (opd_val/rl_opd.sbatch): policy server GPU 0, trainer GPU 1,
+# frozen teacher GPU 2 (:8001).
+
+max_steps = 100
+seq_len = 2048
+
+[model]
+name = "PrimeIntellect/Qwen3-0.6B"
+
+[orchestrator]
+batch_size = 128
+group_size = 16
+
+[orchestrator.model.client]
+base_url = ["http://127.0.0.1:8000/v1"]
+
+[orchestrator.renderer]
+name = "prime-qwen3"
+
+[orchestrator.train.sampling]
+max_completion_tokens = 1024
+# Keep at 1.0: vLLM returns raw (untempered) prompt_logprobs for the teacher
+# while the trainer temperature-scales the student's, so T != 1 mismatches the
+# two sides of the ref_kl.
+temperature = 1.0
+
+[[orchestrator.train.env]]
+name = "reverse-text"
+taskset = { id = "reverse-text-v1" }
+harness = { id = "null", runtime = { type = "subprocess" } }
+
+[orchestrator.eval]
+interval = 5
+num_examples = 128
+
+[orchestrator.eval.sampling]
+max_completion_tokens = 1024
+
+[[orchestrator.eval.env]]
+name = "reverse-text"
+taskset = { id = "reverse-text-v1" }
+harness = { id = "null", runtime = { type = "subprocess" } }
+
+[trainer.optim]
+lr = 5e-6
+
+# CRITICAL ROCm workaround: with the default max_norm = 1.0 the trainer does not
+# learn at all. The reported gradient norm is ~1e8-1e10 (a correct CE norm for a
+# 0.6B model is O(1-10)) and fluctuates ~100x per step, so clipping to it makes
+# the effective step size swing wildly and breaks AdamW's m/v EMAs. Verified in
+# isolation with the standalone sft entrypoint: max_norm 1.0 -> loss flat
+# 4.61->4.90; max_norm 1e12 -> loss descends 4.61->3.76.
+max_norm = 1e12
+
+[trainer.model]
+# torch.compile is off on ROCm: inductor's meta kernel for
+# flash_attn._flash_attn_varlen_forward reports a transposed shape and the
+# trainer dies on `assert_size_stride(buf, (16, 2047), (2047, 1))`.
+compile = "None"
+
+[inference]
+gpu_memory_utilization = 0.5
+
+[inference.server]
+port = 8000
+
+[deployment]
+num_infer_gpus = 1
+num_train_gpus = 1
+
+[orchestrator.algo]
+type = "opd"
+
+[orchestrator.algo.teacher]
+name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL"
+base_url = ["http://127.0.0.1:8001/v1"]

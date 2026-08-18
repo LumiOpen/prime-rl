@@ -177,6 +177,11 @@ class MultiPacker(BasePacker):
                 False,
                 f"Run wrote a sample with ref logprobs length != sample length ({len(sample.ref_logprobs)} != {sample_length})",
             )
+        if sample.teacher_topk is not None and sample.teacher_topk.shape[0] != sample_length:
+            return (
+                False,
+                f"Run wrote a sample with teacher top-k rows != sample length ({sample.teacher_topk.shape[0]} != {sample_length})",
+            )
         return True, None
 
     def _get_batch(self) -> None:

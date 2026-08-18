@@ -5,7 +5,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from prime_rl.trainer.utils import balanced_partition
-from prime_rl.transport.types import EncodedTensor, MicroBatch, RoutedExperts, TrainingSample
+from prime_rl.transport.types import EncodedTensor, MicroBatch, RoutedExperts, TeacherTopK, TrainingSample
+from prime_rl.utils.client import MISSING_LOGPROB
 
 # Backfill value per component weight stream when a packed sample doesn't
 # carry it: absent rl means weight 1.0 on the loss mask, absent ce/ref_kl
@@ -40,6 +41,50 @@ def _pad_routed_experts(micro_batch: MicroBatch, padding_size: int) -> None:
     row_size = _routed_experts_row_size(routed_experts)
     routed_experts.data += b"\0" * (padding_size * row_size)
     routed_experts.shape[0] += padding_size
+
+
+# The teacher top-k support (opd, teacher_top_k >= 1) is a per-token 2-D payload
+# carried as raw bytes, so it needs the same copy/slice/pad treatment as
+# routed_experts rather than the list slicing the scalar streams get.
+def _copy_teacher_topk(teacher_topk: TeacherTopK) -> TeacherTopK:
+    return TeacherTopK(
+        ids=teacher_topk.ids,
+        logprobs=teacher_topk.logprobs,
+        shape=list(teacher_topk.shape),
+    )
+
+
+def _teacher_topk_row_sizes(teacher_topk: TeacherTopK) -> tuple[int, int]:
+    """Bytes per token for the id and logprob buffers (int32 / float32)."""
+    width = teacher_topk.shape[1]
+    return width * np.dtype(np.int32).itemsize, width * np.dtype(np.float32).itemsize
+
+
+def _slice_teacher_topk(teacher_topk: TeacherTopK, seq_len: int) -> TeacherTopK:
+    id_row, lp_row = _teacher_topk_row_sizes(teacher_topk)
+    return TeacherTopK(
+        ids=teacher_topk.ids[: seq_len * id_row],
+        logprobs=teacher_topk.logprobs[: seq_len * lp_row],
+        shape=[seq_len, teacher_topk.shape[1]],
+    )
+
+
+def _empty_teacher_topk_rows(width: int, num_rows: int) -> tuple[bytes, bytes]:
+    """Filler rows for tokens with no teacher support — a sample that isn't opd
+    sharing a bin, or trailing pad. Ids are 0 and logprobs are MISSING_LOGPROB,
+    which the loss masks out, so these never contribute to the KL."""
+    ids = np.zeros((num_rows, width), dtype=np.int32)
+    logprobs = np.full((num_rows, width), MISSING_LOGPROB, dtype=np.float32)
+    return ids.tobytes(), logprobs.tobytes()
+
+
+def _pad_teacher_topk(micro_batch: MicroBatch, padding_size: int) -> None:
+    teacher_topk = micro_batch.teacher_topk
+    assert teacher_topk is not None
+    ids, logprobs = _empty_teacher_topk_rows(teacher_topk.shape[1], padding_size)
+    teacher_topk.ids += ids
+    teacher_topk.logprobs += logprobs
+    teacher_topk.shape[0] += padding_size
 
 
 def _slice_encoded(tensor: EncodedTensor, n_rows: int) -> EncodedTensor:
@@ -133,6 +178,9 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     routed_experts = (
         _copy_routed_experts(training_example.routed_experts) if training_example.routed_experts is not None else None
     )
+    teacher_topk = (
+        _copy_teacher_topk(training_example.teacher_topk) if training_example.teacher_topk is not None else None
+    )
 
     if len(input_ids) > seq_len:
         # Multimodal: never split an image's placeholder block — cut to a whole-image boundary
@@ -156,6 +204,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             ref_kl_weights = ref_kl_weights[:cut]
         if routed_experts is not None:
             routed_experts = _slice_routed_experts(routed_experts, cut)
+        if teacher_topk is not None:
+            teacher_topk = _slice_teacher_topk(teacher_topk, cut)
         if mm_token_type_ids is not None:
             mm_token_type_ids = mm_token_type_ids[:cut]
         env_names = env_names[:cut]
@@ -186,6 +236,14 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         )
         assert len(routed_experts.data) == len(input_ids) * _routed_experts_row_size(routed_experts)
 
+    if teacher_topk is not None:
+        assert teacher_topk.shape[0] == len(input_ids), (
+            f"teacher_topk: {teacher_topk.shape}, input_ids: {len(input_ids)}"
+        )
+        id_row, lp_row = _teacher_topk_row_sizes(teacher_topk)
+        assert len(teacher_topk.ids) == len(input_ids) * id_row
+        assert len(teacher_topk.logprobs) == len(input_ids) * lp_row
+
     if mm_token_type_ids is not None:
         assert len(mm_token_type_ids) == len(input_ids), (
             f"mm_token_type_ids: {len(mm_token_type_ids)}, input_ids: {len(input_ids)}"
@@ -209,6 +267,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         ce_weights=ce_weights,
         ref_kl_weights=ref_kl_weights,
         seq_lens=[len(input_ids)],
+        teacher_topk=teacher_topk,
     )
 
 
@@ -272,6 +331,12 @@ class _MicroBatchBin:
 def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     has_ref_logprobs = any(sample.ref_logprobs is not None for _, sample in bin_content.samples)
     has_mm_token_type_ids = any(sample.mm_token_type_ids is not None for _, sample in bin_content.samples)
+    # Width of the teacher support, taken from whichever samples carry one. All
+    # opd samples in a run share it (it's teacher_top_k + 1); samples without a
+    # support get masked-out filler rows of the same width.
+    topk_widths = {s.teacher_topk.shape[1] for _, s in bin_content.samples if s.teacher_topk is not None}
+    assert len(topk_widths) <= 1, f"mixed teacher top-k widths in one bin: {sorted(topk_widths)}"
+    topk_width = topk_widths.pop() if topk_widths else None
     # A weight stream materializes as soon as one packed sample carries it; the
     # samples that lack it get the stream's identity fill (STREAM_FILL).
     has_stream = {name: any(getattr(s, name) is not None for _, s in bin_content.samples) for name in STREAM_FILL}
@@ -288,6 +353,8 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     streams: dict[str, list[float] | None] = {name: ([] if has_stream[name] else None) for name in STREAM_FILL}
     seq_lens: list[int] = []
     routed_experts: RoutedExperts | None = None
+    topk_ids: list[bytes] = []
+    topk_logprobs: list[bytes] = []
     lora_num_tokens = [0] * num_loras
 
     for lora_idx, sample in bin_content.samples:
@@ -318,6 +385,17 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
                 assert routed_experts.shape[1:] == sample.routed_experts.shape[1:]
                 routed_experts.data += sample.routed_experts.data
                 routed_experts.shape[0] += sample.routed_experts.shape[0]
+        if topk_width is not None:
+            # Backfill non-opd samples with masked-out rows so the payload stays
+            # token-aligned. Safe to read as filler: the ref_kl component is
+            # gated on ref_kl_weights, which is all-zero for those samples.
+            if sample.teacher_topk is not None:
+                topk_ids.append(sample.teacher_topk.ids)
+                topk_logprobs.append(sample.teacher_topk.logprobs)
+            else:
+                filler_ids, filler_logprobs = _empty_teacher_topk_rows(topk_width, sample_len)
+                topk_ids.append(filler_ids)
+                topk_logprobs.append(filler_logprobs)
         seq_lens.extend(sample.seq_lens)
         lora_num_tokens[lora_idx] += sample_len
 
@@ -325,6 +403,15 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     assert sum(sequence_lengths) == len(input_ids), (sequence_lengths, len(input_ids))
     assert sum(seq_lens) == len(input_ids), (seq_lens, len(input_ids))
     first_sample = bin_content.first_sample
+    teacher_topk = (
+        TeacherTopK(
+            ids=b"".join(topk_ids),
+            logprobs=b"".join(topk_logprobs),
+            shape=[len(input_ids), topk_width],
+        )
+        if topk_width is not None
+        else None
+    )
 
     return MicroBatch(
         input_ids=input_ids,
@@ -344,6 +431,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
         ce_weights=streams["ce_weights"],
         ref_kl_weights=streams["ref_kl_weights"],
         seq_lens=seq_lens,
+        teacher_topk=teacher_topk,
     )
 
 
@@ -466,6 +554,8 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
         micro_batch.mm_token_type_ids.extend([0] * padding_size)
     if micro_batch.routed_experts is not None:
         _pad_routed_experts(micro_batch, padding_size)
+    if micro_batch.teacher_topk is not None:
+        _pad_teacher_topk(micro_batch, padding_size)
     micro_batch.env_names.extend([""] * padding_size)
 
     return micro_batch
@@ -502,6 +592,14 @@ def _assert_token_arrays_aligned(micro_batch: MicroBatch) -> None:
         assert micro_batch.routed_experts.shape[0] == num_tokens, (
             f"routed_experts misaligned after packing: {micro_batch.routed_experts.shape[0]} != {num_tokens} tokens"
         )
+    if micro_batch.teacher_topk is not None:
+        teacher_topk = micro_batch.teacher_topk
+        assert teacher_topk.shape[0] == num_tokens, (
+            f"teacher_topk misaligned after packing: {teacher_topk.shape[0]} != {num_tokens} tokens"
+        )
+        id_row, lp_row = _teacher_topk_row_sizes(teacher_topk)
+        assert len(teacher_topk.ids) == num_tokens * id_row, "teacher_topk id buffer size != shape"
+        assert len(teacher_topk.logprobs) == num_tokens * lp_row, "teacher_topk logprob buffer size != shape"
 
 
 def _make_dummy_batch(source: MicroBatch) -> MicroBatch:

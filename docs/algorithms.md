@@ -19,6 +19,7 @@ This page covers the math and the configurable algorithmic components: the algor
   - [Default Advantage](#default-advantage)
   - [Authoring an Algorithm](#authoring-an-algorithm)
   - [Reference Scoring](#reference-scoring)
+  - [Estimating the Reverse KL](#estimating-the-reverse-kl)
 - [Filters](#filters)
 - [Multi-Turn Trajectories](#multi-turn-trajectories)
   - [Extension Property](#extension-property)
@@ -67,7 +68,7 @@ type = "grpo"  # the default
 |---|---|---|---|
 | `grpo` | policy | `rl` on actions | Standard group-relative RL. |
 | `max_rl` | policy | `rl` on actions | MaxRL ([arXiv:2602.02710](https://arxiv.org/abs/2602.02710)): GRPO's centered reward normalized by the group **mean** instead of the standard deviation — the gradient is unbiased for the order-`group_size` truncation of the maximum-likelihood objective, upweighting hard examples like `1/p`. |
-| `opd` | policy | `ref_kl` on actions | On-policy distillation ([Thinking Machines](https://thinkingmachines.ai/blog/on-policy-distillation/)): the policy samples, per-token reverse KL against a reference model as the gradient signal. Needs a `teacher`. |
+| `opd` | policy | `ref_kl` on actions | On-policy distillation ([Thinking Machines](https://thinkingmachines.ai/blog/on-policy-distillation/)): the policy samples, per-token reverse KL against a reference model as the gradient signal. Needs a `teacher`; `teacher_top_k` selects the KL estimator. |
 | `sft` | *(the teacher)* | `ce` on actions | Hard distillation: a frozen model generates rollouts, the policy trains with CE on its tokens. Needs a frozen `sampling.source` (the teacher it samples from). |
 | `opsd` | policy | `ref_kl` on actions | SDFT ([arXiv:2601.19897](https://arxiv.org/abs/2601.19897)): the model is its own reference, conditioned on an expert demonstration. The teacher *is* the live policy (the paper's setting, no extra deployment) — no model to configure. |
 | `echo` | policy | `rl` on actions + weighted `ce` on observations | ECHO: standard GRPO plus a cross-entropy loss on env-provided tokens already present in the rollout, selected by message role (needs the renderer's role attribution). Defaults to tool-response bodies at `alpha = 0.1` (ECHO's λ); set `roles` to train other roles, each at its own weight. |
@@ -325,7 +326,7 @@ Each per-token list must match the rollout's completion-token count exactly — 
 
 `OPDAlgorithm` / `OPSDAlgorithm` do their model I/O in `score_rollout`: as each rollout arrives they query a reference (the sample's own context for `opd`, the demo-conditioned context for `opsd`) and attach per-token reference logprobs to each sample. Rollouts are consumed serially by the orchestrator's main loop and each carries only a handful of samples, so the in-flight request count is naturally bounded — no explicit concurrency cap:
 
-- `opd` — score each sample's own context under the `teacher` (a frozen [model reference](#model-references)) via prefill; fills `ref_logprobs` for the `ref_kl` loss component (on-policy distillation). The `teacher` is typed `FrozenModelConfig`, so `"policy"` isn't representable (the KL would be identically zero).
+- `opd` — score each sample's own context under the `teacher` (a frozen [model reference](#model-references)) via prefill; fills `ref_logprobs` for the `ref_kl` loss component (on-policy distillation). The `teacher` is typed `FrozenModelConfig`, so `"policy"` isn't representable (the KL would be identically zero). `teacher_top_k` widens what the teacher ships — see [Estimating the reverse KL](#estimating-the-reverse-kl).
 - `opsd` — SDFT: prepend an expert demonstration as a leading system message (`template`, with a `{demonstration}` placeholder) and score the sample under that demo-conditioned context. The sample is scored verbatim (`hint_block + token_ids`, slicing the hint's logprobs back off), so the join is BPE-clean and it's robust to tool/multimodal prompts and any number of turns. The scoring reference *is* the live policy — self-distillation names no teacher. opsd builds its own renderer to tokenize the hint block: the tokenizer is always the live policy's (not configurable — there is no separate model), and only the `renderer` family is settable (defaults to `"auto"`, resolved from the policy tokenizer; set it to match a non-auto policy renderer). The demonstration is read from the example's `info[demo_key]`, falling back to a top-level rollout field of the same name (e.g. `answer`).
 
 ```toml
@@ -335,6 +336,41 @@ demo_key = "demonstration"
 ```
 
 Scoring runs at arrival, *before* the pre-batch filters, so a rollout that is later filtered still cost its reference compute — accepted for the simpler one-rollout-at-a-time shape (advantage-based filters never fire for opd/opsd anyway, since neither assigns an advantage).
+
+### Estimating the reverse KL
+
+`opd`'s `teacher_top_k` chooses how the per-token reverse KL is estimated. The default, `0`, ships one teacher logprob per token — the logprob of the token the policy actually sampled — and the trainer uses the score-function estimator:
+
+$$
+\nabla_\theta D \;\approx\; \bigl(\log \pi_\theta(y_t) - \log \pi_{\text{ref}}(y_t)\bigr)\, \nabla_\theta \log \pi_\theta(y_t)
+$$
+
+This is unbiased for the per-token reverse KL, but it only ever touches tokens the policy emitted: it can move probability *off* a bad token, never *onto* a token the reference prefers that the policy never samples.
+
+Setting `teacher_top_k = k` additionally ships the teacher's top-`k` support (ids + logprobs) per token, and the trainer evaluates the KL over that support directly, differentiating through every entry rather than relying on the sampled token alone:
+
+$$
+D_t = \sum_{v \in S} \pi_\theta(v)\bigl(\log \pi_\theta(v) - \log \pi_{\text{ref}}(v)\bigr) \;+\; \pi_\theta(\bar S)\bigl(\log \pi_\theta(\bar S) - \log \pi_{\text{ref}}(\bar S)\bigr)
+$$
+
+The second term lumps all off-support mass into a single atom, which makes $D_t$ a genuine KL between two $(k{+}1)$-category distributions — non-negative, and a lower bound on the true vocabulary-wide KL by the data-processing inequality. Without it the partial sum has a degenerate minimum: the policy can drive every in-support probability to zero and satisfy the objective by moving its mass onto the untracked rest of the vocabulary.
+
+```toml
+[orchestrator.algo]
+type = "opd"
+teacher_top_k = 20
+
+[orchestrator.algo.teacher]
+name = "Qwen/Qwen3-8B"
+base_url = ["http://localhost:8001/v1"]
+```
+
+Two requirements when `teacher_top_k >= 1`:
+
+- **`[trainer.model] fused_lm_head_token_chunk_size = "disabled"`.** The fused head computes logprobs via a chunked online logsumexp and never materializes logits, so the policy's probabilities on the teacher's support cannot be gathered. The trainer raises a config error naming this flag rather than failing obscurely.
+- **The teacher's `model.max_logprobs` must be at least `k`** (vLLM's default is 20); above that the server rejects the scoring request with a 400.
+
+Cost is linear in `k` — roughly 1 MB of wire traffic per 1k tokens per 10 units of `k` — and the trainer logs `TopK Mass`, the share of the policy's probability the support actually covers. A small mass means the KL is carried mostly by the coarse off-support term and `k` is too narrow to resolve much.
 
 ## Filters
 

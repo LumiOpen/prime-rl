@@ -5,7 +5,7 @@ import os
 from collections.abc import Mapping
 from itertools import cycle
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 import httpx
 import verifiers.v1 as vf
@@ -77,6 +77,10 @@ class InferencePool(Protocol):
         """Prefill-score ``token_ids`` under the pool's model — one logprob per token."""
         ...
 
+    async def score_topk(self, token_ids: list[int], top_k: int) -> TopKScores:
+        """Prefill-score ``token_ids`` keeping the model's top-k support per token."""
+        ...
+
     async def stop(self) -> None:
         """Stop the inference pool."""
         ...
@@ -93,7 +97,7 @@ class PrefillScorer:
         self._clients: dict = {}  # client_identity -> AsyncOpenAI, one per endpoint
         self._rr = 0
 
-    async def score(self, configs: list[vf.ClientConfig], model: str, token_ids: list[int]) -> list[float]:
+    def _next_client(self, configs: list[vf.ClientConfig]) -> AsyncOpenAI:
         if not configs:
             raise RuntimeError("no inference endpoints available to prefill-score")
         cfg = configs[self._rr % len(configs)]
@@ -109,7 +113,15 @@ class PrefillScorer:
                 api_key=os.environ.get(cfg.api_key_var) or "EMPTY",
                 default_headers=cfg.headers or None,
             )
-        return await prefill_logprobs(openai, model, token_ids)
+        return openai
+
+    async def score(self, configs: list[vf.ClientConfig], model: str, token_ids: list[int]) -> list[float]:
+        return await prefill_logprobs(self._next_client(configs), model, token_ids)
+
+    async def score_topk(
+        self, configs: list[vf.ClientConfig], model: str, token_ids: list[int], top_k: int
+    ) -> TopKScores:
+        return await prefill_logprobs_topk(self._next_client(configs), model, token_ids, top_k)
 
     async def aclose(self) -> None:
         await asyncio.gather(*(c.close() for c in self._clients.values()))
@@ -179,6 +191,11 @@ class StaticInferencePool:
         """Prefill-score ``token_ids`` under this pool's model (one logprob per
         token, 0.0 for the leading token). Delegates to the shared scorer."""
         return await self._scorer.score(self.train_clients, self.model_name, token_ids)
+
+    async def score_topk(self, token_ids: list[int], top_k: int) -> TopKScores:
+        """Prefill-score ``token_ids`` keeping this pool's model's top-k support
+        per token. Delegates to the shared scorer."""
+        return await self._scorer.score_topk(self.train_clients, self.model_name, token_ids, top_k)
 
     async def stop(self) -> None:
         await self._scorer.aclose()
@@ -566,6 +583,83 @@ async def init_nccl_broadcast(
             for client_num, admin_client in enumerate(admin_clients)
         ]
     )
+
+
+MISSING_LOGPROB = -1e30
+"""Padding for an absent entry in a top-k support row. Masked out in the loss
+(``> -1e29``), so a short or empty row contributes nothing to the KL."""
+
+
+class TopKScores(NamedTuple):
+    """Prefill scores keeping the model's top-k support per token.
+
+    ``sampled`` is one logprob per token (identical to what :func:`prefill_logprobs`
+    returns). ``ids`` / ``logprobs`` are the per-token support, both
+    ``[len(token_ids), width]`` with ``width = top_k + 1`` — the union of the
+    prompt token and the model's top-k, since vLLM emits the prompt token first
+    and only dedupes it when it is itself in the top-k. Rows shorter than
+    ``width`` (and the leading token, which has no preceding context) are padded
+    with id 0 and :data:`MISSING_LOGPROB`."""
+
+    sampled: list[float]
+    ids: list[list[int]]
+    logprobs: list[list[float]]
+
+
+async def prefill_logprobs_topk(
+    openai: AsyncOpenAI, model: str, token_ids: list[int], top_k: int
+) -> TopKScores:
+    """Prefill-score ``token_ids`` under ``model``, keeping the whole top-k support
+    per position rather than just the prompt token's logprob.
+
+    Same endpoint as :func:`prefill_logprobs`, but requests ``prompt_logprobs:
+    top_k`` and keeps every entry of each position's dict instead of only the
+    first. Used by ``opd`` with ``teacher_top_k >= 1`` so the trainer can
+    evaluate the reverse KL over the support instead of the single sampled
+    token."""
+    from vllm.entrypoints.scale_out.token_in_token_out.protocol import GenerateResponse
+
+    base = str(openai.base_url).rstrip("/").removesuffix("/v1")
+    http_response = await openai.post(
+        f"{base}/inference/v1/generate",
+        cast_to=httpx.Response,
+        body={
+            "model": model,
+            "token_ids": token_ids,
+            "sampling_params": {"max_tokens": 1, "temperature": 1.0, "top_p": 1.0, "prompt_logprobs": top_k},
+        },
+    )
+    response = GenerateResponse.model_validate_json(http_response.content)
+
+    width = top_k + 1
+    sampled: list[float] = []
+    ids: list[list[int]] = []
+    logprobs: list[list[float]] = []
+    for entry in response.prompt_logprobs or []:
+        if not entry:
+            # Leading token: no preceding context, so no distribution at all.
+            sampled.append(0.0)
+            ids.append([0] * width)
+            logprobs.append([MISSING_LOGPROB] * width)
+            continue
+        # Insertion order puts the prompt token first (vLLM concatenates the
+        # target id ahead of the topk indices), so `sampled` stays identical to
+        # what `prefill_logprobs` would have returned.
+        row_ids: list[int] = []
+        row_lps: list[float] = []
+        for token_id, logprob in entry.items():
+            lp = logprob.logprob if hasattr(logprob, "logprob") else logprob.get("logprob")
+            row_ids.append(int(token_id))
+            row_lps.append(float(lp) if lp is not None else MISSING_LOGPROB)
+        sampled.append(row_lps[0])
+        # Dedupe (target in top-k) makes rows shorter than width; an over-long
+        # row would silently truncate the support, so clamp explicitly.
+        row_ids, row_lps = row_ids[:width], row_lps[:width]
+        pad = width - len(row_ids)
+        ids.append(row_ids + [0] * pad)
+        logprobs.append(row_lps + [MISSING_LOGPROB] * pad)
+
+    return TopKScores(sampled=sampled, ids=ids, logprobs=logprobs)
 
 
 async def prefill_logprobs(openai: AsyncOpenAI, model: str, token_ids: list[int]) -> list[float]:

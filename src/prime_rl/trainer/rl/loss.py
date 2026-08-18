@@ -6,7 +6,7 @@ from beartype import beartype as typechecker
 from jaxtyping import Bool, Float, Int, jaxtyped
 from torch import Tensor
 
-from prime_rl.configs.trainer import CustomLossConfig, DefaultLossConfig, IPOLossConfig, LossConfig
+from prime_rl.configs.trainer import CustomLossConfig, DefaultLossConfig, IPOLossConfig, LossConfig, RefKLConfig
 from prime_rl.utils.utils import import_object
 
 
@@ -26,6 +26,10 @@ class LossInputs:
     advantages: Float[Tensor, " seq"]
     loss_mask: Bool[Tensor, " seq"]
     loss_weights: Float[Tensor, " seq"] | None = field(default=None)
+    # The reference model's top-k support and the policy's own logprobs at the
+    # same ids (opd with ``teacher_top_k >= 1``). Both present or both absent.
+    ref_topk_logprobs: Float[Tensor, "seq k"] | None = field(default=None)
+    trainer_topk_logprobs: Float[Tensor, "seq k"] | None = field(default=None)
 
 
 @dataclass
@@ -56,6 +60,20 @@ def selective_log_softmax(
 
 @jaxtyped(typechecker=typechecker)
 @torch.compile(dynamic=True)
+def gather_log_softmax(
+    logits: Float[Tensor, "batch seq vocab"], index: Int[Tensor, "batch seq k"]
+) -> Float[Tensor, "batch seq k"]:
+    """Log-probabilities at ``k`` arbitrary vocab indices per position.
+
+    The rank-3-index sibling of :func:`selective_log_softmax` — used to evaluate
+    the policy's own distribution on a teacher's top-k support so the reverse KL
+    can be summed over that support instead of the single sampled token."""
+    logprobs = logits.log_softmax(dim=-1)
+    return torch.gather(logprobs, dim=-1, index=index)
+
+
+@jaxtyped(typechecker=typechecker)
+@torch.compile(dynamic=True)
 def compute_entropy(shifted_logits: Float[Tensor, "batch seq vocab"]) -> Float[Tensor, "batch seq"]:
     with torch.no_grad():
         pd = torch.nn.functional.softmax(shifted_logits, dim=-1)
@@ -73,12 +91,16 @@ def shift_tensor_left(t: Float[Tensor, "batch seq"]) -> Float[Tensor, "batch seq
     return torch.cat([t[:, 1:], torch.full((t.shape[0], 1), 0, device=t.device, dtype=t.dtype)], dim=1)
 
 
-def shift_tensor_right(t: Float[Tensor, "batch seq"], pad_value: float | None = None) -> Float[Tensor, "batch seq"]:
+def shift_tensor_right(t: Tensor, pad_value: float | None = None) -> Tensor:
     """Shifts the tensor one token to the right, prepending a padding value.
 
     Used to realign logprobs/entropy after computing with shifted labels.
     After shift: result[i] = t[i-1], result[0] = pad_value.
     This converts from "predict next token" convention to "probability of current token" convention.
+
+    Accepts ``[batch, seq]`` and also ``[batch, seq, k]`` (a per-token top-k
+    support), which must be shifted identically to stay aligned with the scalar
+    logprobs.
 
     Args:
         t: Tensor to shift right
@@ -88,7 +110,13 @@ def shift_tensor_right(t: Float[Tensor, "batch seq"], pad_value: float | None = 
     """
     if pad_value is None:
         pad_value = 0.0
-    return torch.cat([torch.full((t.shape[0], 1), pad_value, device=t.device, dtype=t.dtype), t[:, :-1]], dim=1)
+    pad_shape = (t.shape[0], 1, *t.shape[2:])
+    return torch.cat([torch.full(pad_shape, pad_value, device=t.device, dtype=t.dtype), t[:, :-1]], dim=1)
+
+
+_MISSING_LOGPROB_THRESHOLD = -1e29
+"""Entries of a teacher top-k support below this are padding, not real logprobs
+(see ``prime_rl.utils.client.MISSING_LOGPROB``)."""
 
 
 def _safe_mean(values: Tensor, mask: Tensor) -> Tensor:
@@ -196,15 +224,90 @@ def ipo_loss_fn(inputs: LossInputs, loss_config: IPOLossConfig) -> LossOutputs:
     return LossOutputs(loss=loss, metrics=metrics)
 
 
-def ref_kl_loss_fn(inputs: LossInputs) -> LossOutputs:
+def _topk_divergence(
+    trainer_topk: Tensor, ref_topk: Tensor, config: RefKLConfig
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Per-token divergence over the reference's top-k support.
+
+    Returns ``(per_token_kl, policy_mass, residual)``. ``policy_mass`` is the
+    share of the policy's probability the support covers — the diagnostic for
+    whether k is wide enough to say anything.
+
+    Two ways to turn the support into a distribution, per ``topk_normalization``:
+
+    - ``residual`` keeps absolute probabilities and adds one atom for everything
+      off-support, so the objective also penalizes mass the reference does not
+      cover. This makes it a genuine KL over k+1 categories, but it actively
+      pulls the policy's mass *onto* the support, which is a much stronger demand
+      than matching the shape inside it.
+    - ``renormalize`` softmaxes both sides within the support (NeMo-RL's
+      ``_direct_topk_kl``). The full-vocab partition function cancels, so this
+      matches only the in-support shape and is indifferent to the total mass
+      there.
+    """
+    valid = ref_topk > _MISSING_LOGPROB_THRESHOLD
+    ref_topk = torch.where(valid, ref_topk, torch.full_like(ref_topk, -1e4))
+    T = config.temperature
+
+    policy_mass = (torch.exp(trainer_topk) * valid).sum(-1)
+
+    if config.topk_normalization == "renormalize":
+        # Softmax within the support. Masked-out columns go to -inf so they take
+        # zero probability under both distributions.
+        neg_inf = torch.finfo(trainer_topk.dtype).min
+        s = torch.where(valid, trainer_topk / T, torch.full_like(trainer_topk, neg_inf))
+        t = torch.where(valid, ref_topk / T, torch.full_like(ref_topk, neg_inf))
+        log_p = torch.log_softmax(s, dim=-1)
+        log_q = torch.log_softmax(t, dim=-1)
+        p, q = torch.exp(log_p) * valid, torch.exp(log_q) * valid
+        reverse = (p * (log_p - log_q)).sum(-1)
+        forward = (q * (log_q - log_p)).sum(-1)
+        residual = torch.zeros_like(reverse)
+    else:
+        log_p, log_q = trainer_topk / T, ref_topk / T
+        p, q = torch.exp(log_p) * valid, torch.exp(log_q) * valid
+        eps = 1e-6
+        p_out = (1.0 - p.sum(-1)).clamp_min(eps)
+        q_out = (1.0 - q.sum(-1)).clamp_min(eps)
+        residual = p_out * (torch.log(p_out) - torch.log(q_out))
+        reverse = (p * (log_p - log_q)).sum(-1) + residual
+        forward = (q * (log_q - log_p)).sum(-1) + q_out * (torch.log(q_out) - torch.log(p_out))
+
+    if config.kl_type == "reverse":
+        per_token_kl = reverse
+    elif config.kl_type == "forward":
+        per_token_kl = forward
+    else:
+        w = config.mixed_kl_weight
+        per_token_kl = w * forward + (1.0 - w) * reverse
+    return per_token_kl, policy_mass, residual
+
+
+def ref_kl_loss_fn(inputs: LossInputs, config: RefKLConfig | None = None) -> LossOutputs:
     """
     Ref-KL loss type (on-policy distillation): the reverse KL to the reference
-    model is the per-token policy-gradient signal, with the importance ratio
-    correcting trainer/inference mismatch and staleness. A one-sided trust
-    region drops tokens whose trainer probability fell more than 0.2 below the
-    inference probability; a squared-log-ratio term regularizes drift. Scalar
-    advantages are not read — ref_kl algorithms ship none.
+    model is the per-token training signal, with the importance ratio correcting
+    trainer/inference mismatch and staleness. A one-sided trust region drops
+    tokens whose trainer probability fell more than 0.2 below the inference
+    probability; a squared-log-ratio term regularizes drift. Scalar advantages
+    are not read — ref_kl algorithms ship none.
+
+    Two estimators of the per-token reverse KL, selected by whether the
+    algorithm shipped a support (``teacher_top_k``):
+
+    - **sampled token** (the default). ``(log pi - log pi_ref) * grad log pi`` —
+      the score-function estimator, using only the reference's logprob for the
+      token the policy actually sampled. Unbiased, but it can only move
+      probability *off* tokens the policy emitted: a token the reference prefers
+      but the policy never samples gets no gradient at all.
+    - **top-k support**. ``sum_v pi(v) (log pi(v) - log pi_ref(v))`` over the
+      reference's top-k, differentiated directly (no score-function term). Every
+      token in the support gets gradient, including ones the policy would not
+      have sampled, so probability can move *onto* what the reference prefers.
+      The importance ratio is detached here — it corrects for the states being
+      drawn from a stale policy, not for the KL itself.
     """
+    config = config or RefKLConfig()
     trainer_logprobs = inputs.trainer_logprobs
     inference_logprobs = inputs.inference_logprobs
     ref_logprobs = inputs.ref_logprobs
@@ -218,27 +321,45 @@ def ref_kl_loss_fn(inputs: LossInputs) -> LossOutputs:
     )
 
     probs_diff = torch.exp(trainer_logprobs) - torch.exp(inference_logprobs)
-    is_masked = probs_diff < -0.2
+    thresh = config.trust_region_threshold
+    if config.trust_region == "none":
+        is_masked = torch.zeros_like(loss_mask)
+    elif config.trust_region == "two_sided":
+        is_masked = probs_diff.abs() > thresh
+    else:
+        is_masked = probs_diff < -thresh
     drop_mask = loss_mask & is_masked
     keep_mask = loss_mask & ~is_masked
 
+    ratio = importance_ratio.detach() if config.importance_ratio else torch.ones_like(importance_ratio)
+
     ref_kl = ref_logprobs - trainer_logprobs
 
-    pg_loss = keep_mask * ref_kl.detach() * importance_ratio
-    kl_loss = loss_mask * log_importance_ratio**2
-    per_token_loss = -pg_loss + 1e-3 * kl_loss
-    if inputs.loss_weights is not None:
-        per_token_loss = per_token_loss * inputs.loss_weights
-    loss = per_token_loss.sum()
-
-    # Namespaced: the rl loss fn emits same-named trust-region metrics with a
-    # different definition, and mixed batches run both fns in one step.
     metrics = {
         "ref_kl/masked_mismatch_kl": _safe_mean(mismatch_kl, drop_mask),
         "ref_kl/unmasked_mismatch_kl": _safe_mean(mismatch_kl, keep_mask),
         "ref_kl/is_masked": _safe_mean(is_masked, loss_mask),
         "ref_kl": _safe_mean(ref_kl, loss_mask),
     }
+
+    ref_topk = inputs.ref_topk_logprobs
+    trainer_topk = inputs.trainer_topk_logprobs
+    kl_loss = loss_mask * log_importance_ratio**2
+    if ref_topk is not None and trainer_topk is not None:
+        per_token_kl, policy_mass, residual = _topk_divergence(trainer_topk, ref_topk, config)
+        # Sign is opposite the sampled-token branch: per_token_kl is the
+        # divergence itself (>= 0, minimized), not a reward to ascend.
+        per_token_loss = keep_mask * ratio * per_token_kl + config.mismatch_kl_coef * kl_loss
+        metrics["ref_kl/topk_mass"] = _safe_mean(policy_mass, loss_mask)
+        metrics["ref_kl/topk_kl"] = _safe_mean(per_token_kl, loss_mask)
+        metrics["ref_kl/topk_residual"] = _safe_mean(residual, loss_mask)
+    else:
+        pg_loss = keep_mask * ref_kl.detach() * ratio
+        per_token_loss = -pg_loss + config.mismatch_kl_coef * kl_loss
+
+    if inputs.loss_weights is not None:
+        per_token_loss = per_token_loss * inputs.loss_weights
+    loss = per_token_loss.sum()
 
     return LossOutputs(loss=loss, metrics=metrics)
 
@@ -282,6 +403,16 @@ def setup_rl_loss_fn(loss_config: LossConfig) -> LossFn:
     return rl_fn
 
 
+def setup_ref_kl_loss_fn(config: RefKLConfig) -> LossFn:
+    """Bind ``trainer.ref_kl`` into the ref_kl component's loss fn, mirroring
+    ``setup_rl_loss_fn`` for the rl component."""
+
+    def ref_kl_fn(inputs: LossInputs) -> LossOutputs:
+        return ref_kl_loss_fn(inputs, config)
+
+    return ref_kl_fn
+
+
 def compute_loss(
     trainer_logprobs: list[Float[Tensor, " seq_i"]],
     inference_logprobs: list[Float[Tensor, " seq_i"]],
@@ -295,6 +426,9 @@ def compute_loss(
     rl_scale: int,
     ce_scale: int,
     ref_kl_scale: int,
+    ref_topk_logprobs: list[Float[Tensor, "seq_i k"]] | None = None,
+    trainer_topk_logprobs: list[Float[Tensor, "seq_i k"]] | None = None,
+    ref_kl_fn: LossFn | None = None,
 ) -> tuple[Float[Tensor, ""], dict[str, Any]]:
     """
     Compute loss for packed sequences (batch size = 1, multiple sequences packed along sequence dimension).
@@ -331,6 +465,7 @@ def compute_loss(
         Tuple of (scaled_loss, aggregated_metrics)
     """
     all_metrics: dict[str, list[Tensor]] = {}
+    ref_kl_fn = ref_kl_fn or ref_kl_loss_fn
 
     n = len(trainer_logprobs)
     if ref_logprobs is None:
@@ -341,6 +476,10 @@ def compute_loss(
         ce_weights = [None] * n
     if ref_kl_weights is None:
         ref_kl_weights = [None] * n
+    if ref_topk_logprobs is None:
+        ref_topk_logprobs = [None] * n
+    if trainer_topk_logprobs is None:
+        trainer_topk_logprobs = [None] * n
 
     def run_loss_fn(loss_fn: LossFn, inputs: LossInputs) -> Tensor:
         result = loss_fn(inputs)
@@ -355,7 +494,7 @@ def compute_loss(
     rl_loss = trainer_logprobs[0].sum() * 0.0
     ce_loss = 0.0
     ref_kl_loss = 0.0
-    for t_logp, i_logp, ref_logp, adv, mask, rl_w, ce_w, ref_kl_w in zip(
+    for t_logp, i_logp, ref_logp, adv, mask, rl_w, ce_w, ref_kl_w, ref_topk, t_topk in zip(
         trainer_logprobs,
         inference_logprobs,
         ref_logprobs,
@@ -364,6 +503,8 @@ def compute_loss(
         rl_weights,
         ce_weights,
         ref_kl_weights,
+        ref_topk_logprobs,
+        trainer_topk_logprobs,
     ):
 
         def make_inputs(component_mask: Bool[Tensor, " seq"], weights: Float[Tensor, " seq"] | None) -> LossInputs:
@@ -374,6 +515,8 @@ def compute_loss(
                 advantages=adv,
                 loss_mask=component_mask,
                 loss_weights=weights,
+                ref_topk_logprobs=ref_topk,
+                trainer_topk_logprobs=t_topk,
             )
 
         if rl_w is None:
@@ -389,7 +532,7 @@ def compute_loss(
         if ref_kl_w is not None:
             ref_kl_mask = ref_kl_w != 0
             if bool(ref_kl_mask.any()):
-                ref_kl_loss = ref_kl_loss + run_loss_fn(ref_kl_loss_fn, make_inputs(ref_kl_mask, ref_kl_w))
+                ref_kl_loss = ref_kl_loss + run_loss_fn(ref_kl_fn, make_inputs(ref_kl_mask, ref_kl_w))
 
     scaled_loss = rl_loss / rl_scale + ce_loss / ce_scale + ref_kl_loss / ref_kl_scale
 

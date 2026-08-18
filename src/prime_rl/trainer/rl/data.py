@@ -27,6 +27,11 @@ class TensorMicroBatch(TypedDict):
     advantages: Float[Tensor, "batch seq"]
     inference_logprobs: Float[Tensor, "batch seq"]
     ref_logprobs: Float[Tensor, "batch seq"] | None
+    # Teacher top-k support (opd with teacher_top_k >= 1). Ids index the vocab;
+    # the trainer gathers its own logprobs at them to evaluate the KL over the
+    # support. Padded entries carry MISSING_LOGPROB and are masked in the loss.
+    teacher_topk_ids: Int[Tensor, "batch seq k"] | None
+    teacher_topk_logprobs: Float[Tensor, "batch seq k"] | None
     loss_mask: Bool[Tensor, "batch seq"]
     temperatures: Float[Tensor, "batch seq"]  # Per-token temperatures
     env_names: list[str]
@@ -125,6 +130,8 @@ class FakeDataLoader:
             "advantages": advantages.unsqueeze(0),
             "inference_logprobs": inference_logprobs.unsqueeze(0),
             "ref_logprobs": None,
+            "teacher_topk_ids": None,
+            "teacher_topk_logprobs": None,
             "temperatures": torch.ones(input_ids.shape[0]).unsqueeze(0),
             "env_names": ["fake"] * input_ids.shape[0],
             "sequence_lengths": sequence_lengths,
@@ -158,6 +165,8 @@ class FakeDataLoader:
             "advantages": torch.randn(self.seq_len, generator=generator).unsqueeze(0),
             "inference_logprobs": torch.randn(self.seq_len, generator=generator).unsqueeze(0),
             "ref_logprobs": None,
+            "teacher_topk_ids": None,
+            "teacher_topk_logprobs": None,
             "temperatures": torch.ones(self.seq_len).unsqueeze(0),
             "env_names": ["fake"] * self.seq_len,
             "sequence_lengths": [self.seq_len],
@@ -246,6 +255,20 @@ class DataLoader:
                 .to(torch.int32)
                 .unsqueeze(0)
             )
+        teacher_topk_ids, teacher_topk_logprobs = None, None
+        packed_teacher_topk = micro_batch.teacher_topk
+        if packed_teacher_topk is not None:
+            # frombuffer needs a writable buffer; the msgpack payload is bytes.
+            teacher_topk_ids = (
+                torch.frombuffer(bytearray(packed_teacher_topk.ids), dtype=torch.int32)
+                .reshape(packed_teacher_topk.shape)
+                .unsqueeze(0)
+            )
+            teacher_topk_logprobs = (
+                torch.frombuffer(bytearray(packed_teacher_topk.logprobs), dtype=torch.float32)
+                .reshape(packed_teacher_topk.shape)
+                .unsqueeze(0)
+            )
         return TensorMicroBatch(
             input_ids=torch.tensor(micro_batch.input_ids, dtype=torch.long).unsqueeze(0),
             position_ids=torch.tensor(micro_batch.position_ids, dtype=torch.long).unsqueeze(0),
@@ -254,6 +277,8 @@ class DataLoader:
             ref_logprobs=torch.tensor(micro_batch.ref_logprobs, dtype=torch.float).unsqueeze(0)
             if micro_batch.ref_logprobs is not None
             else None,
+            teacher_topk_ids=teacher_topk_ids,
+            teacher_topk_logprobs=teacher_topk_logprobs,
             loss_mask=torch.tensor(micro_batch.loss_mask, dtype=torch.bool).unsqueeze(0),
             temperatures=torch.tensor(micro_batch.temperatures, dtype=torch.float).unsqueeze(0),
             env_names=micro_batch.env_names,

@@ -1,0 +1,86 @@
+# OPD validation on reverse-text (AMD / ROCm, single node).
+#
+# Student : PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT  (the policy, trained)
+# Teacher : PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL   (frozen, better at the task)
+#
+# Mirrors configs/debug/algo/opd.toml and the CI config
+# (configs/ci/integration/reverse-text-rl-opd/start.toml), which asserts final
+# eval reward > 0.5.
+#
+# GPU layout (opd_val/rl_opd.sbatch): the rl entrypoint places the policy server
+# on GPU 0 and the trainer on GPU 1 via CUDA_VISIBLE_DEVICES; the frozen teacher
+# is launched separately on GPU 2. HIP_VISIBLE_DEVICES is deliberately NOT set
+# for the rl entrypoint — on ROCm it takes precedence over CUDA_VISIBLE_DEVICES,
+# which would collapse the server and trainer onto the same device.
+
+max_steps = 60
+seq_len = 2048
+
+[model]
+name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
+
+[orchestrator]
+batch_size = 128
+group_size = 16
+
+[orchestrator.model.client]
+base_url = ["http://127.0.0.1:8000/v1"]
+
+[orchestrator.algo]
+type = "opd"
+
+# The frozen teacher. Must be a prime-rl `uv run inference` vLLM server: OPD
+# prefill-scores through /inference/v1/generate + prompt_logprobs, which a plain
+# OpenAI-compatible endpoint does not expose.
+[orchestrator.algo.teacher]
+name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL"
+base_url = ["http://127.0.0.1:8001/v1"]
+
+[orchestrator.renderer]
+name = "prime-qwen3"
+
+[orchestrator.train.sampling]
+max_completion_tokens = 128
+# Keep at 1.0: vLLM returns raw (untempered) prompt_logprobs for the teacher
+# while the trainer temperature-scales the student's, so T != 1 silently
+# mismatches the two sides of the KL.
+temperature = 1.0
+
+[[orchestrator.train.env]]
+name = "reverse-text"
+taskset = { id = "reverse-text-v1" }
+harness = { id = "null", runtime = { type = "subprocess" } }
+
+[orchestrator.eval]
+interval = 1
+num_examples = 128
+
+[orchestrator.eval.sampling]
+max_completion_tokens = 128
+
+[[orchestrator.eval.env]]
+name = "reverse-text"
+taskset = { id = "reverse-text-v1" }
+harness = { id = "null", runtime = { type = "subprocess" } }
+
+[trainer.optim]
+lr = 1e-5
+
+[trainer.model]
+# torch.compile is off on ROCm: inductor's meta kernel for
+# flash_attn._flash_attn_varlen_forward reports a transposed shape and the
+# trainer dies on `assert_size_stride(buf, (16, 2047), (2047, 1))`. Not
+# OPD-specific — the same workaround is in rl_train_singlenode_mixed.sbatch.
+compile = "None"
+
+# Policy inference server, launched by the rl entrypoint on GPU 0. The teacher
+# is NOT started here — prime-rl never launches frozen models.
+[inference]
+gpu_memory_utilization = 0.5
+
+[inference.server]
+port = 8000
+
+[deployment]
+num_infer_gpus = 1
+num_train_gpus = 1

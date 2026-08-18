@@ -30,7 +30,9 @@ from prime_rl.trainer.rl.loss import (
     compute_entropy,
     compute_loss,
     compute_importance_ratio_and_mismatch_kl,
+    gather_log_softmax,
     selective_log_softmax,
+    setup_ref_kl_loss_fn,
     setup_rl_loss_fn,
     shift_tensor_left,
     shift_tensor_right,
@@ -155,6 +157,7 @@ def train(config: TrainerConfig):
     # Set up the loss function for the RL loss type (ce / ref_kl are fixed)
     logger.info(f"Setting up loss function ({config.loss})")
     rl_loss_fn = setup_rl_loss_fn(config.loss)
+    ref_kl_fn = setup_ref_kl_loss_fn(config.ref_kl)
 
     # Set up the optimizer
     logger.info(f"Initializing optimizer ({config.optim})")
@@ -337,6 +340,14 @@ def train(config: TrainerConfig):
             loss_mask = micro_batch["loss_mask"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             ref_logprobs = micro_batch["ref_logprobs"].to("cuda") if micro_batch["ref_logprobs"] is not None else None
+            teacher_topk_ids = (
+                micro_batch["teacher_topk_ids"].to("cuda") if micro_batch["teacher_topk_ids"] is not None else None
+            )
+            ref_topk_logprobs = (
+                micro_batch["teacher_topk_logprobs"].to("cuda")
+                if micro_batch["teacher_topk_logprobs"] is not None
+                else None
+            )
             rl_weights = micro_batch["rl_weights"].to("cuda") if micro_batch["rl_weights"] is not None else None
             ce_weights = micro_batch["ce_weights"].to("cuda") if micro_batch["ce_weights"] is not None else None
             ref_kl_weights = (
@@ -408,6 +419,11 @@ def train(config: TrainerConfig):
             # Shard temperatures for context parallelism if enabled
             if cp_enabled:
                 temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
+                # The teacher's support is per token, so it shards with the
+                # hidden states like temperatures; the gathered logprobs are
+                # brought back to full length below.
+                if teacher_topk_ids is not None:
+                    teacher_topk_ids = shard_for_cp(teacher_topk_ids, cp_rank=cp_rank, cp_world_size=cp_size)
 
             # Forward pass with per-token temperatures
             with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
@@ -424,6 +440,7 @@ def train(config: TrainerConfig):
                     routed_experts=routed_experts,
                 )
 
+            trainer_topk_logprobs = None
             if out.get("logprobs") is None:
                 # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
                 assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
@@ -432,20 +449,37 @@ def train(config: TrainerConfig):
                 scaled_logits = logits / temperatures.unsqueeze(-1)
                 out["logprobs"] = selective_log_softmax(scaled_logits, labels)
                 out["entropy"] = compute_entropy(scaled_logits)
-            # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures
+                if teacher_topk_ids is not None:
+                    # The policy's own distribution on the teacher's support, so
+                    # the ref_kl component can sum the KL over it.
+                    trainer_topk_logprobs = gather_log_softmax(scaled_logits, teacher_topk_ids)
+            elif teacher_topk_ids is not None:
+                # FusedOutputLinear never materializes logits (chunked online
+                # logsumexp, recomputed in backward), so there is nothing to
+                # gather the support from.
+                raise ValueError(
+                    "opd with teacher_top_k >= 1 needs the policy's logits to evaluate the KL over the "
+                    "teacher's support, but the fused lm head does not materialize them. Set "
+                    '`[trainer.model] fused_lm_head_token_chunk_size = "disabled"`.'
+                )
 
             if cp_enabled:
                 out["logprobs"] = gather_for_cp(out["logprobs"], cp_group)
                 out["entropy"] = gather_for_cp_wo_grad(out["entropy"], cp_size, cp_group)
+                if trainer_topk_logprobs is not None:
+                    trainer_topk_logprobs = gather_for_cp(trainer_topk_logprobs, cp_group)
 
             vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
             # This is not really necessary as the first token should be masked out, but we do it anyway to be sure
-            out["logprobs"] = shift_tensor_right(
-                out["logprobs"], pad_value=torch.log(torch.tensor(1.0 / vocab_size)).item()
-            )
+            uniform_logprob = torch.log(torch.tensor(1.0 / vocab_size)).item()
+            out["logprobs"] = shift_tensor_right(out["logprobs"], pad_value=uniform_logprob)
             out["entropy"] = shift_tensor_right(
                 out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
             )
+            if trainer_topk_logprobs is not None:
+                # Must get the same shift as the scalar logprobs or the support
+                # lands one token out of step with the teacher's.
+                trainer_topk_logprobs = shift_tensor_right(trainer_topk_logprobs, pad_value=uniform_logprob)
 
             # Compute loss
             sequence_lengths = micro_batch["sequence_lengths"]
@@ -453,12 +487,21 @@ def train(config: TrainerConfig):
                 trainer_logprobs=out["logprobs"].squeeze().split(sequence_lengths),
                 inference_logprobs=inference_logprobs.squeeze().split(sequence_lengths),
                 ref_logprobs=ref_logprobs.squeeze().split(sequence_lengths) if ref_logprobs is not None else None,
+                # squeeze(0), not squeeze(): a bare squeeze would collapse the
+                # support dim when the teacher's top-k width is 1.
+                ref_topk_logprobs=ref_topk_logprobs.squeeze(0).split(sequence_lengths)
+                if ref_topk_logprobs is not None
+                else None,
+                trainer_topk_logprobs=trainer_topk_logprobs.squeeze(0).split(sequence_lengths)
+                if trainer_topk_logprobs is not None
+                else None,
                 advantages=advantages.squeeze().split(sequence_lengths),
                 loss_mask=loss_mask.squeeze().split(sequence_lengths),
                 rl_weights=rl_weights.squeeze().split(sequence_lengths) if rl_weights is not None else None,
                 ce_weights=ce_weights.squeeze().split(sequence_lengths) if ce_weights is not None else None,
                 ref_kl_weights=ref_kl_weights.squeeze().split(sequence_lengths) if ref_kl_weights is not None else None,
                 rl_loss_fn=rl_loss_fn,
+                ref_kl_fn=ref_kl_fn,
                 rl_scale=rl_scale,
                 ce_scale=ce_scale,
                 ref_kl_scale=ref_kl_scale,
@@ -668,6 +711,14 @@ def train(config: TrainerConfig):
             step_message += f" | Max Vio {tensor_stats['max_vio/mean']:.4f}"
         if "routing_confidence/mean" in tensor_stats:
             step_message += f" | Routing Conf. {tensor_stats['routing_confidence/mean']:.4f}"
+        # Distillation diagnostics: the KL being minimized, and (for a top-k
+        # support) how much of the policy's mass that support actually covers —
+        # a small mass means k is too narrow to approximate the full-vocab KL.
+        if "ref_kl/topk_kl/mean" in tensor_stats:
+            step_message += f" | Ref KL {tensor_stats['ref_kl/topk_kl/mean']:.4f}"
+            step_message += f" | TopK Mass {tensor_stats['ref_kl/topk_mass/mean']:.4f}"
+        elif "ref_kl/mean" in tensor_stats:
+            step_message += f" | Ref KL {tensor_stats['ref_kl/mean']:.4f}"
         logger.success(step_message)
 
         # Log performance metrics
