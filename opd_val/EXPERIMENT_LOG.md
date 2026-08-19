@@ -1277,3 +1277,69 @@ arm including the GRPO runs that offline-score 0.726, because it uses
 `openai_chat_completions` rather than the renderer so `enable_thinking=false` never applies.
 The offline eval is clean and shows the top-k collapse is real (e.g. `M-k20-none-forward`:
 step_50 0.5719 at 2.6% truncation → step_300 0.0099 at 100%).
+
+---
+
+## 2026-08-19 — THE RE-RUN: 18 arms on a correct attention backward (jobs 43545-43584)
+
+First matrix measured without `FLASH_ATTENTION_TRITON_AMD_ENABLE`. Configs reverted to the
+prime-rl default `max_norm`. GSM8K band (327 problems), student 0.588, teacher 0.893,
+offline checkpoint scoring at steps 50/150/300, 300 steps, lr 3e-6 unless stated.
+
+Runs completed in 40-50 min rather than 2h10 (3x faster attention). RL-path grad norms are
+0.0005-0.023 — far below the default `max_norm = 1.0`, so clipping never binds. Same arms
+under the bug reported 9.3e7-4.6e8.
+
+| arm | step 50 | step 150 | step 300 |
+|---|---|---|---|
+| grpo s0 | 0.7890 | 0.8731 | **0.9213** |
+| grpo s1 | 0.7836 | 0.8800 | **0.9281** |
+| grpo s2 | 0.7997 | 0.8540 | **0.9167** |
+| sft | 0.7653 | 0.8028 | **0.8127** |
+| k0-noratio | 0.6070 | 0.6063 | 0.6239 |
+| k0-twosided | 0.6109 | 0.6024 | 0.5795 |
+| k0-mopd | 0.6002 | 0.5780 | 0.5688 |
+| opd s0 | 0.5856 | 0.5879 | 0.5650 |
+| opd s1 | 0.5849 | 0.5703 | 0.5879 |
+| opd s2 | 0.5956 | 0.5894 | 0.6047 |
+| opd lr1e-5 | 0.4709 | 0.4213 | 0.4044 |
+| grpo lr1e-5 | 0.6552 | 0.6430 | 0.7408 (step 250) |
+| k20 residual/reverse | 0.0902 | 0.0581 | 0.0313 |
+| k20 none/mixed | 0.0199 | 0.0206 | 0.0237 |
+| k20 none/forward | 0.0122 | 0.0176 | 0.0161 |
+| k20 renorm/reverse | 0.0107 | 0.0000 | 0.0000 |
+| k20 renorm/mixed | 0.0015 | 0.0000 | 0.0000 |
+| k100 residual/reverse | 0.0199 | 0.0268 (step 100) | timed out |
+
+**GRPO 0.9220 +/- 0.0057 (n=3)**, above the 0.893 teacher.
+**OPD 0.5859 +/- 0.0199 (n=3)**, 0.11 sd from the 0.588 student.
+
+Every headline number moved. Pre-fix this was GRPO 0.7256 vs OPD 0.6715 — a 5-point gap that
+looked like "GRPO somewhat better". Post-fix it is 33 points, and `opd` is flat. The corrupted
+gradients had been injecting enough noise to make `opd` look like it was learning.
+
+### What changed vs the pre-fix conclusions
+
+1. `opd` is flat, not merely worse. Not a tuning artifact: lr 1e-5 is *worse* (0.4044 and
+   declining), and clipping never binds.
+2. **`sft` reaches 0.8127 from the same teacher.** This is the sharpest result in the whole
+   investigation: the teacher's knowledge transfers fine by hard distillation, so the failure
+   is specific to the per-token reverse-KL score-function estimator, not to distillation.
+3. GRPO exceeds the teacher, so there is no headroom argument for distillation here at all.
+4. Top-k collapse is REAL. It was the result most likely to be a gradient artifact (top-k puts
+   exact gradient on the Q/K path, where the corruption was worst) and it survived unchanged
+   across all five formulations plus k=100.
+5. MOPD ablations reverse sign (noratio -0.065 pre-fix, +0.036 post-fix) but stay within
+   ~2 seed-sigma of `opd`. They do not rescue it.
+
+### Operational notes
+
+- **43553 `grpo lr1e-5` FAILED** with the shutdown deadlock: orchestrator finished cleanly in
+  40m, trainer hung ~1h then SIGABRT during the final checkpoint write. step_50..250 survived;
+  salvaged by scoring those (job 43581) rather than re-running 45 min for one point.
+- **43563 `k100` TIMEOUT** at the 4h wall, step ~135 of 300 (k=100 costs ~4.7x orchestrator
+  time). Its `afterok` eval could never fire; replaced with an `afterany` salvage eval (43584)
+  scoring steps 50/100.
+- **43565 `sft` produced no weights** — `gsm8k_sft.toml` had no `[ckpt]` section (the RL arms
+  inherit it from `base_gsm8k.toml`; this file did not), so its eval "completed" in 1 second.
+  Fixed and resubmitted as 43582.

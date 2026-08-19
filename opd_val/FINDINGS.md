@@ -13,6 +13,62 @@ Two infrastructure bugs — a broken gradient-norm computation that made the def
 
 ---
 
+## 1b. THE RE-RUN (2026-08-19) — 18 arms on a correct attention backward
+
+Everything below §1 was measured through the broken Triton backward. The full matrix was
+re-run after the fix; **this table supersedes every result in this document.** GSM8K band,
+327 problems, student 0.588, teacher 0.893, offline checkpoint scoring, 300 steps.
+
+| arm | step 50 | step 150 | step 300 | vs student |
+|---|---|---|---|---|
+| **grpo** s0/s1/s2 | 0.789 / 0.784 / 0.800 | 0.873 / 0.880 / 0.854 | **0.9213 / 0.9281 / 0.9167** | **+0.334** |
+| **sft** (hard distillation) | 0.7653 | 0.8028 | **0.8127** | **+0.225** |
+| k0-noratio (MOPD, no ratio) | 0.6070 | 0.6063 | 0.6239 | +0.036 |
+| k0-twosided (ICE-POP gate) | 0.6109 | 0.6024 | 0.5795 | -0.009 |
+| k0-mopd (both) | 0.6002 | 0.5780 | 0.5688 | -0.019 |
+| **opd** s0/s1/s2 | 0.586 / 0.585 / 0.596 | 0.588 / 0.570 / 0.589 | **0.5650 / 0.5879 / 0.6047** | **-0.002** |
+| opd lr 1e-5 | 0.4709 | 0.4213 | 0.4044 | -0.184 |
+| grpo lr 1e-5 | 0.6552 | 0.6430 | 0.7408 (step 250) | +0.153 |
+| k20 residual/reverse | 0.0902 | 0.0581 | 0.0313 | -0.557 |
+| k20 none/mixed | 0.0199 | 0.0206 | 0.0237 | -0.564 |
+| k20 none/forward | 0.0122 | 0.0176 | 0.0161 | -0.572 |
+| k20 renorm/reverse | 0.0107 | 0.0000 | 0.0000 | -0.588 |
+| k20 renorm/mixed | 0.0015 | 0.0000 | 0.0000 | -0.588 |
+| k100 residual/reverse | 0.0199 | 0.0268 (step 100) | (timed out) | -0.561 |
+
+**GRPO 0.9220 +/- 0.0057 (n=3)** — it exceeds the 0.893 teacher by 2.9 points.
+**OPD 0.5859 +/- 0.0199 (n=3)** — 0.11 sd from the 0.588 student. Across three seeds, on a
+correct backward, `opd` moves the model nowhere.
+
+Four conclusions, none of which survived from the pre-fix version of this document:
+
+1. **`opd` does nothing here, and it is not a tuning failure.** Raising the lr to 1e-5 makes
+   it *worse* (0.4044, declining across the run), so the flat curve is not an under-tuned
+   step size. Grad norms in the RL path are 0.0005-0.023, far under the default `max_norm`,
+   so clipping never binds and cannot be blamed either.
+2. **The teacher's knowledge IS transferable — by `sft`, from the same teacher.** Hard
+   distillation on teacher samples reaches 0.8127 (+0.225) where `opd` reaches -0.002. Same
+   teacher, same band, same budget. The failure is specific to the per-token reverse-KL
+   score-function estimator, not to distillation.
+3. **GRPO beats the teacher it would have distilled from.** On a task with a verifiable
+   reward, plain RL is simply the better instrument; there is no headroom argument left for
+   distillation on this setup.
+4. **The top-k collapse is real, and was not a gradient artifact.** All five formulations
+   collapse to 0.000-0.031 at 87-100% truncation, plus k=100. This was the result most
+   likely to have been caused by the corrupted Q/K gradients — it was not.
+
+The MOPD ablations land within ~2 seed-sigma of `opd` (0.5688-0.6239) and reverse their
+pre-fix sign: `noratio` was -0.065 before the fix and is +0.036 after. Neither direction is
+resolvable at n=1; the honest statement is that they do not rescue `opd`.
+
+**Caveats.** Two arms are partial: `grpo lr 1e-5` (43553) lost its final checkpoint to the
+shutdown deadlock and is reported at step 250; `k100` (43563) hit its 4h wall at step ~135
+because k=100 costs ~4.7x orchestrator time, and is reported at step 100. Neither changes a
+conclusion. `sft` needed a resubmit -- `gsm8k_sft.toml` had no `[ckpt]` section, so the first
+attempt wrote rollouts but no weights.
+
+---
+
 ## 2. Blocking infrastructure findings
 
 These affect everyone running prime-rl on this cluster, not just distillation.

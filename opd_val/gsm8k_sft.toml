@@ -140,3 +140,8 @@ type = "sft"
 [orchestrator.algo.sampling.source]
 name = "Qwen/Qwen3-8B"
 base_url = ["http://127.0.0.1:8001/v1"]
+
+# Without this the run writes rollouts but no weights, and the offline eval has
+# nothing to score. The RL arms inherit it from base_gsm8k.toml; this file does not.
+[ckpt]
+interval = 50
