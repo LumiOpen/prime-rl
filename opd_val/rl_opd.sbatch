@@ -77,9 +77,33 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_thres
 export NCCL_SOCKET_IFNAME=eno0
 export GLOO_SOCKET_IFNAME=eno0
 export PYTHONUNBUFFERED=1
-export WANDB_MODE=disabled
+# W&B: on unless a key is unavailable (set below, host-side).
+export WANDB_MODE=${WANDB_MODE:-online}
 ENVEOF
 mkdir -p "$SCRATCH"
+
+WANDB_KEY_FILE="${WANDB_KEY_FILE:-$HOME/.wandb_key}"
+if [ -z "${WANDB_API_KEY:-}" ] && [ -r "$WANDB_KEY_FILE" ]; then
+    WANDB_API_KEY=$(tr -d '\r\n' < "$WANDB_KEY_FILE")
+fi
+if [ -n "${WANDB_API_KEY:-}" ]; then
+    # APPTAINERENV_* survives --cleanenv; a plain export does not. The key is
+    # passed through the environment only, never written to shared scratch
+    # ($HOME/prime-rl scratch dirs are world-readable here).
+    export APPTAINERENV_WANDB_API_KEY="$WANDB_API_KEY"
+    export APPTAINERENV_WANDB_MODE=online
+    echo "W&B: enabled (key from ${WANDB_API_KEY:+<env or $WANDB_KEY_FILE>})"
+else
+    export APPTAINERENV_WANDB_MODE=disabled
+    WANDB_FLAG="--no-wandb"
+    echo "W&B: disabled (no WANDB_API_KEY and no $WANDB_KEY_FILE)"
+fi
+WANDB_FLAG="${WANDB_FLAG:-}"
+if [ -z "$WANDB_FLAG" ]; then
+    # Descriptive, collision-free: <arm>-<jobid>, grouped by arm so repeats and
+    # seeds of the same config sit together in the UI.
+    WANDB_FLAG="--wandb.project ${WANDB_PROJECT:-opd-tests} --wandb.name ${RUN_NAME}-${SLURM_JOB_ID} --wandb.group ${RUN_NAME}"
+fi
 
 CONTAINER_FLAGS="--rocm --cleanenv --containall"
 BIND_MOUNTS="-B /shared_silo/scratch:/shared_silo/scratch:rw"
@@ -150,7 +174,7 @@ echo "Starting rl entrypoint (policy server GPU 0, trainer GPU 1) ..."
 singularity exec $CONTAINER_FLAGS $BIND_MOUNTS "$IMG" \
     bash -c "source $ENV_SETUP && \
         uv run rl @ $CONFIG \
-            --no-wandb \
+            $WANDB_FLAG \
             --output-dir $RUN_DIR/run"
 RC=$?
 

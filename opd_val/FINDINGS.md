@@ -98,6 +98,28 @@ configs). Verified job 43825 -- 0/128 eval rollouts with `<think>`, truncation
 **Consequence:** in-run eval curves are now usable, and offline checkpoint
 scoring is no longer mandatory for every experiment.
 
+### 1d. Fully on-policy changes nothing (2026-08-20)
+
+`opd`'s `ref_kl` multiplies by an unbounded importance ratio purely to correct
+off-policy staleness, so staleness was a live confound. Re-ran GRPO and `opd`
+k=0 with `max_off_policy_steps = 0` (true lockstep, `Max Off-Policy 0` in every
+step line), 300 steps, offline-scored on the same band:
+
+| arm | async (`max_off_policy = 8`) | on-policy (`= 0`) |
+|---|---|---|
+| grpo @300 | 0.9220 +/- 0.0057 (n=3) | **0.9151** |
+| opd k=0 @300 | 0.5859 +/- 0.0199 (n=3) | **0.5894** |
+| student | 0.588 | 0.588 |
+
+`opd` on-policy across steps 50/150/300: 0.5948 / 0.5856 / 0.5894 — flat, on the
+student baseline, truncation 0.9-1.5%. **Removing staleness does not rescue
+`opd`**, so the flatness belongs to the estimator, not to the async loop. GRPO
+is unchanged within ~1.2 sd, confirming the lockstep switch is otherwise inert.
+
+Side benefit: `max_off_policy_steps = 0` also eliminates the trainer/orchestrator
+shutdown deadlock by removing its precondition (the trainer can no longer lag
+when the orchestrator drains). Both arms exited cleanly; see 2.2.
+
 ---
 
 ## 2. Blocking infrastructure findings

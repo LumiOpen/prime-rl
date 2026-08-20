@@ -1,0 +1,166 @@
+# Shared base for the GSM8K distillation comparison (opd / sft / grpo).
+# Not runnable alone — make_gsm8k_configs.py appends the algorithm block.
+#
+# Student Qwen/Qwen3-1.7B, teacher Qwen/Qwen3-8B. Verified OPD-legal: identical
+# tokenizer, vocab 151669, identical chat template and generation-prompt ids, so
+# the teacher prefill-scores in-distribution token sequences.
+#
+# Every number below is measured, not guessed (jobs 42470/42475/42486):
+#   thinking OFF        Qwen3 defaults to thinking; on short-form math that pins
+#                       the length distribution against the cap (49% truncation
+#                       at 1024) and turns reward into a "did it finish" proxy.
+#                       Off: 0.3% truncation, and BOTH pass rates went UP.
+#   max_completion 1024 student p99 = 686 on this task, so 1024 has real headroom
+#   task GSM8K not MATH GSM8K gave the bigger teacher gap (+11.4 vs +5.8 pts)
+#                       and the bigger band (100 vs 61 per 512 problems)
+#   filtered band       327 problems the student solves 20-80% of the time —
+#                       the operating point reverse-text never had at any
+#                       checkpoint (base 0.04, released SFT 0.72 vs teacher 0.799)
+#   group_size 16       GSM8K reward is binary per problem, so the graded signal
+#                       is the group pass rate; small groups would quantize it
+
+max_steps = 600
+seq_len = 4096
+
+[model]
+name = "Qwen/Qwen3-1.7B"
+
+[orchestrator]
+
+# Fully on-policy: a rollout must finish inside one policy version or be dropped.
+# Two reasons, per 2026-08-20:
+#  1. It removes the trainer/orchestrator lag that causes the shutdown deadlock
+#     (13 recorded: "trainer stalled 97/100" x8). With no lag the trainer is at
+#     most 1 step behind when the orchestrator drains, which the existing
+#     max_steps-1 broadcast guard already covers.
+#  2. It removes stale weights, and with them the confound in `opd`: ref_kl
+#     multiplies by an unbounded importance ratio purely to correct off-policy
+#     staleness, so at 0 that correction is a no-op and we measure the estimator
+#     itself. Watch for "Cancelled N train rollouts" — that would mean churn.
+max_off_policy_steps = 0
+
+# Eval through the renderer so enable_thinking=false actually applies; otherwise
+# eval silently runs in thinking mode (128/128 rollouts, 64-84% truncation).
+eval_via_renderer = true
+batch_size = 128
+group_size = 16
+
+[orchestrator.model.client]
+base_url = ["http://127.0.0.1:8000/v1"]
+
+# Qwen/Qwen3-1.7B maps to the `qwen3` renderer, which exposes enable_thinking.
+[orchestrator.renderer]
+name = "qwen3"
+enable_thinking = false
+
+[orchestrator.train.sampling]
+max_completion_tokens = 1024
+# Keep at 1.0: the teacher is prefill-scored at temperature 1 while the trainer
+# temperature-scales the student's logprobs, so T != 1 mismatches the two sides
+# of the ref_kl.
+temperature = 1.0
+
+[[orchestrator.train.env]]
+name = "gsm8k-band"
+harness = { id = "null", runtime = { type = "subprocess" } }
+
+# math-env-v1 rather than gsm8k-v1: gsm8k-v1 hardcodes its dataset and cannot
+# consume a filtered set. The band was measured under exactly this env's prompt
+# and \boxed{} scoring, so the 20-80% construction still holds here.
+[orchestrator.train.env.taskset]
+id = "math-env-v1"
+dataset_name = "/shared_silo/scratch/rahul.aralikatte@amd.com/prime-rl/opd_val/data/gsm8k_boxed_band"
+dataset_subset = "default"
+dataset_split = "train"
+question_key = "question"
+answer_key = "answer"
+
+# Disable the LLM reference judge (on by default, fires whenever math-verify
+# scores 0). It would need a third served model and would put a language model
+# inside the reward of an experiment whose whole value is an unambiguous metric.
+[orchestrator.train.env.taskset.task]
+judge = "None"
+
+[orchestrator.eval]
+interval = 5
+num_examples = 128
+
+[orchestrator.eval.sampling]
+max_completion_tokens = 1024
+# The renderer (and so `enable_thinking = false`) applies ONLY to train
+# rollouts: the orchestrator builds train clients as "renderer" and eval clients
+# as "openai_chat_completions" (orchestrator/utils.py:45-46). Without this,
+# eval runs with Qwen3's default thinking mode ON, blows the 1024 budget and
+# reports ~95% truncation / ~0.05 reward while the identical train rollouts
+# score 0.60 at 0% truncation. Pass the template kwarg explicitly.
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[[orchestrator.eval.env]]
+name = "gsm8k-band"
+harness = { id = "null", runtime = { type = "subprocess" } }
+
+[orchestrator.eval.env.taskset]
+id = "math-env-v1"
+dataset_name = "/shared_silo/scratch/rahul.aralikatte@amd.com/prime-rl/opd_val/data/gsm8k_boxed_band"
+dataset_subset = "default"
+dataset_split = "train"
+question_key = "question"
+answer_key = "answer"
+
+[orchestrator.eval.env.taskset.task]
+judge = "None"
+
+[trainer.optim]
+lr = 3e-6
+
+# max_norm left at the prime-rl default (1.0). The old `max_norm = 1e12`
+# workaround compensated for FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE selecting
+# flash-attn's broken Triton AMD backward (gradients 1.4e7x too large). With
+# that variable removed the true norm is 2-25 and the default clips sanely.
+# Verified jobs 43543/43544. See FINDINGS.md 2.1.
+
+[trainer.model]
+# Inductor's meta kernel for flash_attn._flash_attn_varlen_forward reports a
+# transposed shape on ROCm and the trainer dies on assert_size_stride.
+compile = "None"
+
+[inference]
+seed = 0
+gpu_memory_utilization = 0.8
+
+[inference.server]
+port = 8000
+
+[inference.model]
+max_model_len = 4096
+
+# Set dp EXPLICITLY. prime-rl computes weight_broadcast.inference_world_size as
+# inference.parallel.dp * tp in a validator that runs BEFORE the one propagating
+# deployment.num_infer_gpus into inference.parallel.dp — so with dp left
+# implicit the NCCL broadcast group is built for 1 rank while the server runs 2,
+# and the orchestrator's POST /resume blocks forever on a collective that never
+# completes (httpx.ReadTimeout). Same root cause as the hendrycks-sanity
+# failures. Keep this in sync with deployment.num_infer_gpus.
+[inference.parallel]
+dp = 2
+tp = 1
+
+[deployment]
+num_infer_gpus = 2
+num_train_gpus = 2
+
+[orchestrator.algo]
+type = "opd"
+
+# 0 = the sampled-token score-function estimator. The top-k support machinery is
+# implemented and verified (see FINDINGS.md §5) but did not rescue opd on
+# reverse-text, so start from the default here and sweep k only if the baseline
+# arm shows life.
+teacher_top_k = 0
+
+[orchestrator.algo.teacher]
+name = "Qwen/Qwen3-8B"
+base_url = ["http://127.0.0.1:8001/v1"]
+
+[ckpt]
+interval = 50
