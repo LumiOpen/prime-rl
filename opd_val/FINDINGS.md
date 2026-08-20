@@ -67,6 +67,37 @@ because k=100 costs ~4.7x orchestrator time, and is reported at step 100. Neithe
 conclusion. `sft` needed a resubmit -- `gsm8k_sft.toml` had no `[ckpt]` section, so the first
 attempt wrote rollouts but no weights.
 
+### 1c. The in-run eval bug is FIXED (2026-08-20)
+
+Every number in this document came from offline checkpoint scoring because the
+in-run eval was untrustworthy. Root-caused and fixed.
+
+Eval clients were built as plain chat-completions, leaving the chat template to
+the server; for Qwen3 that means thinking mode, regardless of
+`[renderer] enable_thinking = false`. Job 43797 step 285, both streams from the
+same env and config:
+
+| stream | rollouts | containing `<think>` |
+|---|---|---|
+| train (renderer) | 128 | **0** |
+| eval (chat-completions) | 128 | **128** |
+
+Hence eval reading 0.2969 at 64% truncation where offline scoring of the same
+checkpoint gave 0.7401 at 5.7%.
+
+`eval.sampling.extra_body.chat_template_kwargs` does resolve into the config
+correctly (verified in the run's dumped `orchestrator.toml`) but never reaches
+the server: `deps/verifiers/.../dialects/chat.py::apply_overrides` splats the
+sampling dump into the body, leaving `extra_body` as a literal key. The direct
+`openai_chat_completions_client` unwraps it properly, so the two paths disagree.
+
+Fix: `orchestrator.eval_via_renderer` (default false; enabled in the band
+configs). Verified job 43825 -- 0/128 eval rollouts with `<think>`, truncation
+1.6-3.1%, step-1 reward 0.2812 on an untrained policy.
+
+**Consequence:** in-run eval curves are now usable, and offline checkpoint
+scoring is no longer mandatory for every experiment.
+
 ---
 
 ## 2. Blocking infrastructure findings
