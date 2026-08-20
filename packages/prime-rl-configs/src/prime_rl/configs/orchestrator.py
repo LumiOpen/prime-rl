@@ -449,6 +449,29 @@ class OrchestratorConfig(BaseConfig):
     for long multi-turn prompts where client-side jinja tokenization
     serializes."""
 
+    eval_via_renderer: bool = False
+    """Route eval rollouts through the renderer client instead of plain
+    chat-completions.
+
+    Eval defaults to chat-completions, which lets the *server* apply the model's
+    default chat template. For models whose template is mode-switched — Qwen3
+    defaults to thinking mode — that silently ignores ``[renderer]
+    enable_thinking = false``, and the documented workaround of setting
+    ``eval.sampling.extra_body.chat_template_kwargs`` does not reliably reach
+    the server either: ``dialects/chat.py``'s ``apply_overrides`` splats the
+    sampling dump into the request, leaving ``extra_body`` as a literal key the
+    server ignores.
+
+    Measured on job 43797 (Qwen3-0.6B, GSM8K band, ``enable_thinking = false``
+    resolved into the eval config): of 128 eval rollouts at step 285, 128
+    contained ``<think>`` tags, while 128 train rollouts from the same step
+    contained none. The eval read 0.2969 at 64% truncation where offline
+    scoring of the same checkpoint gave 0.7401 at 5.7%.
+
+    Enabling this makes eval use the same token-in/out path as training, so the
+    renderer's template settings apply. Requires an env that supports the
+    renderer client — if it is already a train env, it does."""
+
     optim: OptimizerConfig = OptimizerConfig()
     """Per-run optimizer configuration for multi-run training."""
 

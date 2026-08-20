@@ -1,7 +1,7 @@
 # Shared base for the GSM8K distillation comparison (opd / sft / grpo).
 # Not runnable alone — make_gsm8k_configs.py appends the algorithm block.
 #
-# Student Qwen/Qwen3-1.7B, teacher Qwen/Qwen3-8B. Verified OPD-legal: identical
+# Student Qwen/Qwen3-0.6B, teacher Qwen/Qwen3-8B. Verified OPD-legal: identical
 # tokenizer, vocab 151669, identical chat template and generation-prompt ids, so
 # the teacher prefill-scores in-distribution token sequences.
 #
@@ -19,11 +19,11 @@
 #   group_size 16       GSM8K reward is binary per problem, so the graded signal
 #                       is the group pass rate; small groups would quantize it
 
-max_steps = 100
+max_steps = 300
 seq_len = 4096
 
 [model]
-name = "Qwen/Qwen3-1.7B"
+name = "Qwen/Qwen3-0.6B"
 
 [orchestrator]
 # Route eval rollouts through the renderer. Without this, eval uses plain
@@ -32,12 +32,12 @@ name = "Qwen/Qwen3-1.7B"
 # rollouts with <think> tags and 64-84% truncation, against 0/128 and ~2% here.
 eval_via_renderer = true
 batch_size = 128
-group_size = 16  # replaced per-arm by make_gsm8k_configs.py
+group_size = 16
 
 [orchestrator.model.client]
 base_url = ["http://127.0.0.1:8000/v1"]
 
-# Qwen/Qwen3-1.7B maps to the `qwen3` renderer, which exposes enable_thinking.
+# Qwen/Qwen3-0.6B maps to the `qwen3` renderer, which exposes enable_thinking.
 [orchestrator.renderer]
 name = "qwen3"
 enable_thinking = false
@@ -100,7 +100,7 @@ answer_key = "answer"
 judge = "None"
 
 [trainer.optim]
-lr = 2e-5
+lr = 3e-6
 
 # max_norm left at the prime-rl default (1.0). The old `max_norm = 1e12`
 # workaround compensated for FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE selecting
@@ -114,6 +114,7 @@ lr = 2e-5
 compile = "None"
 
 [inference]
+seed = 0
 gpu_memory_utilization = 0.8
 
 [inference.server]
@@ -136,3 +137,9 @@ tp = 1
 [deployment]
 num_infer_gpus = 2
 num_train_gpus = 2
+
+[orchestrator.algo]
+type = "grpo"
+
+[ckpt]
+interval = 50

@@ -147,7 +147,16 @@ class StaticInferencePool:
             renderer_model_name=renderer_model_name,
             pool_size=pool_size,
         )
-        self._eval_clients = setup_clients(client_config, client_type=eval_client_type)
+        # Eval clients need the renderer forwarded too when they are renderer
+        # clients; without it setup_clients builds a TrainClientConfig whose
+        # renderer is None and the env server falls back to the default one.
+        self._eval_clients = setup_clients(
+            client_config,
+            client_type=eval_client_type,
+            renderer_config=renderer_config if eval_client_type == "renderer" else None,
+            renderer_model_name=model_name if eval_client_type == "renderer" else None,
+            pool_size=pool_size if eval_client_type == "renderer" else None,
+        )
         self._admin_clients = setup_admin_clients(client_config)
         self._skip_model_check = client_config.skip_model_check
         self._wait_for_ready_timeout = client_config.wait_for_ready_timeout

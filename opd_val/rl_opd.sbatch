@@ -65,7 +65,7 @@ export HOME=$SCRATCH/home
 mkdir -p \$TRITON_CACHE_DIR \$TORCHINDUCTOR_CACHE_DIR \$XDG_CACHE_HOME \$UV_CACHE_DIR \$HOME
 export UV_PYTHON=$PRIME_RL_DIR/.venv/bin/python3
 export UV_NO_SYNC=1
-export HF_HOME=/shared_silo/scratch/hf_cache
+export HF_HOME=${HF_HOME_OVERRIDE:-/shared_silo/scratch/hf_cache}
 export HF_HUB_OFFLINE=1
 # DO NOT set FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE. It selects flash-attn's
 # Triton AMD backend, whose BACKWARD is broken here: gradients come out ~1.4e7x

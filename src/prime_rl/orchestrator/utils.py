@@ -28,7 +28,9 @@ async def setup_policy_inference_pool(*, config: OrchestratorConfig, tokenizer):
     attribution) and is always built. The renderer-client sampling path is
     wired onto the pool; when no train env samples from the live policy the
     renderer is still kept for client-side tokenization and the pool's evals
-    use plain chat-completions."""
+    use plain chat-completions unless ``eval_via_renderer`` is set (see that
+    config field: chat-completions lets the server apply the model's default
+    chat template, which silently ignores ``enable_thinking = false``)."""
     from renderers.base import create_renderer
 
     client_config = config.model.client
@@ -39,11 +41,14 @@ async def setup_policy_inference_pool(*, config: OrchestratorConfig, tokenizer):
         get_logger().info("Using direct renderer rollout client")
     else:
         get_logger().info("No policy-sourced train env — renderer kept for client-side tokenization only")
+    eval_client_type = "renderer" if config.eval_via_renderer else "openai_chat_completions"
+    if config.eval_via_renderer:
+        get_logger().info("Eval rollouts routed through the renderer (renderer template settings apply)")
     inference_pool = await setup_inference_pool(
         client_config,
         model_name=model_name,
         train_client_type="renderer",
-        eval_client_type="openai_chat_completions",
+        eval_client_type=eval_client_type,
         renderer_config=config.renderer,
         pool_size=config.pool_size,
     )
