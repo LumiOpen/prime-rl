@@ -144,11 +144,18 @@ class WandbMonitor(Monitor):
         # take down training.
         if is_online and (primary if shared_mode else True):
             try:
+                # ref_kl/* only exists for opd runs; adding the section
+                # unconditionally would give GRPO a page of empty panels.
+                is_distillation = bool(
+                    run_config is not None
+                    and getattr(getattr(run_config, "algo", None), "type", None) == "opd"
+                )
                 url = ensure_overview_view(
                     self.wandb.entity,
                     self.wandb.project,
                     train_envs=train_env_names,
                     eval_envs=eval_env_names,
+                    is_distillation=is_distillation,
                 )
                 if url:
                     self.logger.info(f"Created W&B overview view - {url}")
@@ -310,6 +317,23 @@ COMMON_METRICS = [
 
 STABILITY_METRICS = ["optim/grad_norm", "entropy/all/mean", "mismatch_kl/all/mean", "kl_ent_ratio/mean"]
 
+# On-policy distillation (algo.type = "opd"). Only emitted when a ref_kl loss runs, so the section
+# is added conditionally — a GRPO run would otherwise get a page of empty panels.
+#   topk_mass     how much student probability the teacher's top-k covers. THE diagnostic for
+#                 whether k is large enough; if it stays small, top-k is too coarse a support.
+#   topk_kl       the divergence actually being minimized over that support.
+#   topk_residual off-support mass, i.e. what the top-k approximation is throwing away.
+#   *_mismatch_kl trainer-vs-inference logprob disagreement, split by the keep mask.
+#   is_masked     fraction of tokens the one-sided mask drops from the ref_kl term.
+DISTILLATION_METRICS = [
+    "ref_kl/topk_mass",
+    "ref_kl/topk_kl",
+    "ref_kl/topk_residual",
+    "ref_kl/masked_mismatch_kl",
+    "ref_kl/unmasked_mismatch_kl",
+    "ref_kl/is_masked",
+]
+
 PERFORMANCE_METRICS = [
     "perf/mfu",
     "time/step",
@@ -358,7 +382,9 @@ def eval_section(name: str, env_pattern: str) -> ws.Section:
     )
 
 
-def build_sections(train_envs: Sequence[str] = (), eval_envs: Sequence[str] = ()) -> list[ws.Section]:
+def build_sections(
+    train_envs: Sequence[str] = (), eval_envs: Sequence[str] = (), is_distillation: bool = False
+) -> list[ws.Section]:
     # With one env the aggregate == that env, so show only its section. With several, put the
     # cross-env aggregate on top followed by a section per env.
     if len(train_envs) == 1:
@@ -375,6 +401,8 @@ def build_sections(train_envs: Sequence[str] = (), eval_envs: Sequence[str] = ()
         # Env names unknown (e.g. SFT): one regex section matching any eval env.
         sections.append(eval_section("eval", ".*"))
     sections.append(section("stability", metrics=STABILITY_METRICS))
+    if is_distillation:
+        sections.append(section("distillation", metrics=DISTILLATION_METRICS))
     sections.append(section("performance", metrics=PERFORMANCE_METRICS))
     return sections
 
@@ -420,6 +448,7 @@ def ensure_overview_view(
     name: str = OVERVIEW_NAME,
     train_envs: Sequence[str] = (),
     eval_envs: Sequence[str] = (),
+    is_distillation: bool = False,
 ) -> str | None:
     """Ensure an overview saved view exists for this run's env set. Reuses an existing overview built
     for the same envs; when the env set is new, creates a fresh versioned view (``overview`` →
@@ -441,7 +470,7 @@ def ensure_overview_view(
         entity=entity,
         project=project,
         name=next_overview_name(name, [dn for dn, _ in overviews]),
-        sections=build_sections(train_envs, eval_envs),
+        sections=build_sections(train_envs, eval_envs, is_distillation),
         auto_generate_panels=False,
         settings=ws.WorkspaceSettings(x_axis="step"),
     )
