@@ -341,7 +341,13 @@ def ref_kl_loss_fn(inputs: LossInputs, config: RefKLConfig | None = None) -> Los
     drop_mask = loss_mask & is_masked
     keep_mask = loss_mask & ~is_masked
 
-    ratio = importance_ratio.detach() if config.importance_ratio else torch.ones_like(importance_ratio)
+    # Detached ratio, for the top-k branch only: there the divergence itself is
+    # differentiated, and the ratio merely reweights for stale states.
+    #
+    # The sampled-token branch must NOT use this. It is a score-function
+    # estimator, so the ratio (or log pi) is the sole carrier of grad log pi --
+    # detaching it makes the whole policy-gradient term a constant. See below.
+    detached_ratio = importance_ratio.detach() if config.importance_ratio else torch.ones_like(importance_ratio)
 
     ref_kl = ref_logprobs - trainer_logprobs
 
@@ -359,12 +365,28 @@ def ref_kl_loss_fn(inputs: LossInputs, config: RefKLConfig | None = None) -> Los
         per_token_kl, policy_mass, residual = _topk_divergence(trainer_topk, ref_topk, config)
         # Sign is opposite the sampled-token branch: per_token_kl is the
         # divergence itself (>= 0, minimized), not a reward to ascend.
-        per_token_loss = keep_mask * ratio * per_token_kl + config.mismatch_kl_coef * kl_loss
+        per_token_loss = keep_mask * detached_ratio * per_token_kl + config.mismatch_kl_coef * kl_loss
         metrics["ref_kl/topk_mass"] = _safe_mean(policy_mass, loss_mask)
         metrics["ref_kl/topk_kl"] = _safe_mean(per_token_kl, loss_mask)
         metrics["ref_kl/topk_residual"] = _safe_mean(residual, loss_mask)
     else:
-        pg_loss = keep_mask * ref_kl.detach() * ratio
+        # Score-function estimator: A * grad log pi, with A = (log pi_ref - log pi)
+        # detached as the per-token advantage. The SECOND factor must stay
+        # attached — it is the only source of grad log pi.
+        #
+        #   importance_ratio=True  -> PPO form, d/dtheta exp(log pi - log pi_old)
+        #                             = ratio * grad log pi. Matches default_loss_fn,
+        #                             which likewise leaves importance_ratio attached.
+        #   importance_ratio=False -> REINFORCE form, d/dtheta log pi = grad log pi.
+        #                             (Previously ones_like, i.e. no gradient at all.)
+        #
+        # Detaching both factors -- as this did -- makes pg_loss a constant, leaving
+        # only mismatch_kl_coef * kl_loss, a drift term pulling the trainer toward the
+        # *inference engine* rather than the teacher. Measured: with
+        # mismatch_kl_coef=0 the policy gradient was exactly 0.0, versus 4.8e1 for
+        # GRPO on the same inputs.
+        score_fn_term = importance_ratio if config.importance_ratio else trainer_logprobs
+        pg_loss = keep_mask * ref_kl.detach() * score_fn_term
         per_token_loss = -pg_loss + config.mismatch_kl_coef * kl_loss
 
     if inputs.loss_weights is not None:
