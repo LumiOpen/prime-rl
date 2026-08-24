@@ -116,8 +116,16 @@ historical record and is not superseded by this addendum.
   outside the support into one extra bucket for both distributions (a genuine, provably
   non-negative (k+1)-category KL); confirmed fixed in the logs — every post-fix top-k `Ref KL`
   value across 42387-42391 (400 combined trainer steps) is positive.
-- **Post-fix sweep (Finding 15): the fix works mechanically, but top-k does NOT rescue OPD from a
-  base-model student.** `Ref KL` descends and `TopK Mass` rises as designed for every k tested
+- **VOID (2026-08-24) — every `teacher_top_k >= 1` row and conclusion below.** The teacher's
+  top-k support was aligned one token out of step with the policy's logits, so all six top-k
+  arms minimized a scrambled objective: the policy's mass on position `t-1`'s candidate ids,
+  compared against the teacher's probabilities for position `t`'s. `TopK Mass` and `Ref KL`
+  were measuring the wrong quantity, which is why they improved while the text got worse.
+  Fixed in `b03e7ee7`; see FINDINGS.md §5.6. The k=0 rows are separately void — that branch
+  contributed zero gradient until `27c0493b`. **Re-run k in {0, 8, 20, 50, 100} before citing
+  anything here.**
+- ~~**Post-fix sweep (Finding 15): the fix works mechanically, but top-k does NOT rescue OPD from a
+  base-model student.**~~ `Ref KL` descends and `TopK Mass` rises as designed for every k tested
   (8/20/50/100) — but eval reward still collapses to **0.0000** and eval truncation still saturates
   at **100%** for every arm tried, pre-fix and post-fix, at every k (0, 8, 20, 50, 100) and both
   learning rates (2e-5, 5e-6). Leading interpretation: on-policy reverse KL is mode-seeking and
