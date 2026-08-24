@@ -1351,3 +1351,77 @@ gradients had been injecting enough noise to make `opd` look like it was learnin
 - **43565 `sft` produced no weights** — `gsm8k_sft.toml` had no `[ckpt]` section (the RL arms
   inherit it from `base_gsm8k.toml`; this file did not), so its eval "completed" in 1 second.
   Fixed and resubmitted as 43582.
+
+## 2026-08-24 — THE ALIGNED SWEEP: opd works once the top-k support is aligned (jobs 44051-44071)
+
+First k sweep on a code path with BOTH opd bugs fixed: the zero policy gradient in the
+sampled-token branch (`27c0493b`) and the off-by-one in the teacher's top-k support
+(`b03e7ee7`). Every previous `opd` number in this log is void; this section supersedes the
+2026-08-19 re-run for all `opd` arms. The GRPO and SFT arms there were never affected and
+remain the reference.
+
+GSM8K band (327 problems, 1308 rollouts/eval), student 0.588, teacher 0.893,
+GRPO 0.9220 +/- 0.0057 (n=3), sft 0.8127. 300 steps, lr 3e-6, `max_off_policy_steps = 0`,
+`eval_via_renderer = true`, offline checkpoint scoring.
+
+| arm | step 50 | step 150 | step 250 | step 300 |
+|---|---|---|---|---|
+| k0 (sampled-token) | 0.7370 | 0.8119 | 0.8280 | 0.8318 |
+| k8 | 0.7622 | 0.8356 | **0.8731** | 0.8639 |
+| k20 | 0.7729 | 0.8066 | 0.8463 | **0.8777** |
+| k50 | 0.7668 | 0.8417 | 0.8700 | 0.8586 |
+| k100 | 0.7714 | 0.8280 | 0.8563 | timed out at step 299 |
+
+`TopK Mass` (student mass on the teacher's support) at step 1: 0.9981 / 0.9996 / 0.9999 /
+1.0000 for k = 8/20/50/100. Pre-fix the same metric opened at 0.25-0.54 and "improved" to
+0.75 — a real measurement of the wrong quantity. This is the direct readout that the fix
+landed.
+
+### What this establishes
+
+1. **`opd` learns.** Pre-fix it was 0.5859 +/- 0.0199, statistically indistinguishable from
+   the untrained student, and every top-k arm collapsed to 0.0000 reward at 100% truncation.
+   Every arm now climbs monotonically to 0.83-0.88 at <1% truncation.
+2. **`opd` now clears `sft` (0.8127).** This reverses the sharpest pre-fix conclusion — that
+   the teacher's knowledge transferred by hard distillation but not by per-token reverse KL.
+   That finding was an artifact of the two bugs.
+3. **Coverage (k >= 1) beats the sampled-token estimator**, by +0.033 on average. This is the
+   effect the top-k plan was built to test: the score-function estimator can only push down
+   tokens the student actually emitted, never promote one the teacher prefers. All 8
+   arm-x-step comparisons against k0 at the same step favour k >= 8 (mean +0.033 at step 250,
+   +0.035 at step 300).
+4. **`opd` still trails GRPO** by ~4.4 points (0.8777 best vs 0.9220), and GRPO still exceeds
+   the teacher, so there remains no headroom argument for distillation on this pair.
+
+### What this does NOT establish
+
+**Any ranking among k = 8/20/50/100.** The ordering inverts between measurement points: k8 is
+best at step 250 (0.8731) and mid-pack at 300 (0.8639); k20 is worst of the group at 250
+(0.8463) and best at 300 (0.8777). Per-arm swing between adjacent checkpoints is up to 0.031,
+which is larger than the entire between-k spread (0.019-0.027). With `TopK Mass` already
+0.9987 at k=8 there is no mechanism for larger k to see a different distribution. Treat k >= 8
+as one condition.
+
+Caveat on point 3: n=1 per arm, and all arms share `inference.seed = 0`, so the four k arms are
+not independent seeds. The consistency across 8 comparisons is what carries the claim, not any
+single gap — each is only ~1-2x the per-checkpoint noise.
+
+### Cost
+
+k=100 costs 4.5x k=8 in wall-clock (2h18 vs 60m for k=50/k8; k100 did not finish in 4h) to
+measure the same distribution. Not worth repeating. The binding constraint on every claim above
+is now seeds, not k.
+
+### Operational notes
+
+- **44059 `k100` TIMEOUT** at step 299 of 300 — one step short, at ~52 s/step against a 4h
+  wall. `scontrol update TimeLimit` is denied to non-admins here, so the limit cannot be
+  raised on a running job. Its `afterok` eval would have been stranded forever; switched to
+  `--dependency=afterany` and resubmitted (44062) with a widened step list, which salvaged
+  step 250. `scontrol` cannot rewrite a job's `--export` environment, so changing the step
+  list required cancel + resubmit.
+- **44071** back-filled step 250 for k0/k8/k20/k50 so all five arms share a common step; k100
+  otherwise would have been the one arm not comparable to the rest.
+- Obsolete checkpoints from all prior experiments were deleted this session (~7 TB, 87 runs).
+  `run/logs`, `run/rollouts`, `run/configs` and `run/wandb` were preserved, so every recorded
+  result survives; only the model weights are gone.
