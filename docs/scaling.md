@@ -156,7 +156,7 @@ fused_lm_head_token_chunk_size = 1024       # default
 # fused_lm_head_token_chunk_size = "disabled"  # vanilla LM head
 ```
 
-Drop the chunk size further when peak memory is still tight (e.g. with very long sequences); raise it to amortize kernel-launch overhead. SFT training silently disables this (not supported yet). Only available with `model.impl = "custom"`.
+Drop the chunk size further when peak memory is still tight (e.g. with very long sequences); raise it to amortize kernel-launch overhead. SFT training silently disables this (not supported yet). Only available with `model.impl = "custom"`. `opd` with `teacher_top_k >= 1` requires `"disabled"` — it needs the logits the fused head never materializes — so that arm pays the full `[batch * seq, vocab]` fp32 tensor, linear in sequence length and independent of model size.
 
 ## Memory-Tight Recipe
 

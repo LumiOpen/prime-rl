@@ -372,28 +372,34 @@ Two requirements when `teacher_top_k >= 1`:
 
 Cost is linear in `k` — roughly 1 MB of wire traffic per 1k tokens per 10 units of `k` — and the trainer logs `TopK Mass`, the share of the policy's probability the support actually covers. A small mass means the KL is carried mostly by the coarse off-support term and `k` is too narrow to resolve much.
 
-> [!WARNING]
-> `teacher_top_k = 0` (the sampled-token estimator) is the default for a reason.
-> On a GSM8K student/teacher pair (`Qwen3-1.7B` ← `Qwen3-8B`, a 30-point gap on
-> the training distribution), every distributional variant tried **degraded the
-> policy to near-zero reward** while `k = 0` improved it from 0.59 to 0.68:
+> [!NOTE]
+> `teacher_top_k = 0` stays the default because it is the cheaper path, not the
+> stronger one: it adds no wire traffic and works with the fused lm head. On the
+> one pair measured end to end (`Qwen3-1.7B` <- `Qwen3-8B`, GSM8K competence
+> band, 300 steps at lr 3e-6, student 0.588 / teacher 0.893), widening the
+> support helped:
 >
-> | `teacher_top_k` | `topk_normalization` | `kl_type` | final reward |
+> | `teacher_top_k` | step 150 | step 250 | step 300 |
 > |---|---|---|---|
-> | 0 | — | — | **0.68** |
-> | 20 | `residual` | `reverse` | 0.02 |
-> | 20 | `renormalize` | `reverse` | 0.002 (repetition collapse) |
-> | 20 | `renormalize` | `mixed` | 0.000 (near-uniform) |
+> | 0 | 0.8119 | 0.8280 | 0.8318 |
+> | 8 | 0.8356 | **0.8731** | 0.8639 |
+> | 20 | 0.8066 | 0.8463 | **0.8777** |
+> | 50 | 0.8417 | 0.8700 | 0.8586 |
+> | 100 | 0.8280 | 0.8563 | — |
 >
-> The failures are not tuning artifacts: they persist across a 10x learning-rate
-> sweep, and the *more completely* the KL was minimized the worse the model got
-> (a run that cut the KL by 95% scored 0.02). Minimizing a per-token
-> distributional KL against a teacher, evaluated on the student's *own*
-> trajectories, is not the same objective as becoming a better model — and the
-> sampled-token estimator's high variance appears to protect against
-> over-optimizing that gap. Treat `teacher_top_k >= 1` as experimental, and
-> watch reward rather than `Ref KL`, which falls monotonically in every failing
-> run.
+> Every `k >= 8` arm beat `k = 0`, by +0.033 on average across both measurement
+> points — the coverage effect the estimator predicts, since the sampled-token
+> form can only move probability off a bad token and never onto one the teacher
+> prefers. For reference, `sft` reaches 0.8127 on the same pair and `grpo`
+> 0.9220 +/- 0.0057.
+>
+> Nothing separates `k = 8` from larger `k`. The ordering inverts between
+> checkpoints (`k = 8` leads at step 250, `k = 20` at step 300) and the spread is
+> smaller than a single arm's step-to-step swing. `TopK Mass` is already 0.9987
+> at `k = 8`, so larger `k` is resolving a distribution that is already covered —
+> prefer the smallest `k` whose `TopK Mass` is near 1, and spend the budget on
+> seeds instead. These are single runs per arm sharing one seed, so treat the
+> `k >= 8` group as one condition rather than a ranking.
 
 ## Filters
 
