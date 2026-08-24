@@ -120,6 +120,11 @@ lr = 3e-6
 # Verified jobs 43543/43544. See FINDINGS.md 2.1.
 
 [trainer.model]
+# teacher_top_k >= 1 needs the policy's logits to evaluate the KL over the
+# teacher's support, and the fused lm head never materializes them (chunked
+# online logsumexp, recomputed in backward). The trainer raises if this is left
+# at the default.
+fused_lm_head_token_chunk_size = "disabled"
 # Inductor's meta kernel for flash_attn._flash_attn_varlen_forward reports a
 # transposed shape on ROCm and the trainer dies on assert_size_stride.
 compile = "None"
@@ -152,11 +157,11 @@ num_train_gpus = 2
 [orchestrator.algo]
 type = "opd"
 
-# 0 = the sampled-token score-function estimator: the reference's logprob for
-# the token the policy actually sampled, used as a score-function (REINFORCE)
-# advantage. k >= 1 instead sums the KL over the reference's top-k support, so
-# probability can move ONTO tokens the policy would not have sampled.
-teacher_top_k = 0
+# Sum the reverse KL over the teacher's top-50 support rather than the single
+# sampled token, so probability can move ONTO tokens the policy would not have
+# sampled. The support ships as 50+1 entries per token (vLLM puts the sampled
+# id first); the teacher serves with --model.max-logprobs 128, which bounds k.
+teacher_top_k = 50
 
 [orchestrator.algo.teacher]
 name = "Qwen/Qwen3-8B"
