@@ -381,6 +381,17 @@ def train(config: TrainerConfig):
             seq_lens = micro_batch["seq_lens"].to("cuda")
 
             labels = shift_tensor_left(input_ids)
+            if teacher_topk_ids is not None:
+                # The teacher's support arrives on the "probability of current
+                # token" convention -- vLLM's prompt_logprobs[t] is the
+                # distribution predicting token t, with the target id first, so
+                # teacher_topk_ids[t][0] == input_ids[t]. The policy's logits are
+                # on the other convention (logits[t] predicts token t+1), which
+                # is what `labels` corrects for. The support needs the SAME
+                # correction, or the policy's distribution gets evaluated at the
+                # previous position's candidate ids while being compared against
+                # the teacher's probabilities for this position's.
+                teacher_topk_ids = shift_tensor_left(teacher_topk_ids)
 
             # VLM + CP is not supported: MRoPE requires global positions but CP shards the sequence
             if cp_enabled and mm_kwargs is not None:

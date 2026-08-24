@@ -81,14 +81,18 @@ def compute_entropy(shifted_logits: Float[Tensor, "batch seq vocab"]) -> Float[T
     return entropy
 
 
-def shift_tensor_left(t: Float[Tensor, "batch seq"]) -> Float[Tensor, "batch seq"]:
+def shift_tensor_left(t: Tensor) -> Tensor:
     """Shifts the tensor one token to the left.
 
     Used to create labels from input_ids: labels[i] = input_ids[i+1].
     The last position is padded with 0 (a valid token index) since this value
     will be shifted off by shift_tensor_right and never used.
+
+    Accepts ``[batch, seq]`` and also ``[batch, seq, k]``, so a per-token top-k
+    support can be brought onto the same convention as the labels.
     """
-    return torch.cat([t[:, 1:], torch.full((t.shape[0], 1), 0, device=t.device, dtype=t.dtype)], dim=1)
+    pad_shape = (t.shape[0], 1, *t.shape[2:])
+    return torch.cat([t[:, 1:], torch.zeros(pad_shape, device=t.device, dtype=t.dtype)], dim=1)
 
 
 def shift_tensor_right(t: Tensor, pad_value: float | None = None) -> Tensor:
@@ -249,6 +253,20 @@ def _topk_divergence(
     ref_topk = torch.where(valid, ref_topk, torch.full_like(ref_topk, -1e4))
     T = config.temperature
 
+    # Both payloads are LOG-PROBABILITIES, not logits. A logprob differs from its
+    # logit by the full-vocab logsumexp, a per-position constant, so dividing by T
+    # and re-softmaxing over the support -- what `renormalize` does -- recovers
+    # exactly the tempered distribution. The other two modes use exp(logprob) as an
+    # ABSOLUTE probability, and exp(logprob / T) is not one: it need not sum to
+    # <= 1, so the off-support residual mass goes negative. Refuse rather than
+    # compute nonsense.
+    if T != 1.0 and config.topk_normalization != "renormalize":
+        raise ValueError(
+            f"ref_kl temperature={T} requires topk_normalization='renormalize'; "
+            f"'{config.topk_normalization}' reads the support as absolute probabilities, "
+            "which tempering a log-probability does not preserve."
+        )
+
     policy_mass = (torch.exp(trainer_topk) * valid).sum(-1)
 
     if config.topk_normalization == "renormalize":
@@ -268,13 +286,13 @@ def _topk_divergence(
         # sum_v q(v)(log q(v) - log p(v)) with q constant, i.e. soft-label cross
         # entropy on the support — it cannot be gamed by moving mass off the
         # support, which is what makes this safe despite not being a true KL.
-        log_p, log_q = trainer_topk / T, ref_topk / T
+        log_p, log_q = trainer_topk, ref_topk
         p_, q_ = torch.exp(log_p) * valid, torch.exp(log_q) * valid
         reverse = (p_ * (log_p - log_q)).sum(-1)
         forward = (q_ * (log_q - log_p)).sum(-1)
         residual = torch.zeros_like(reverse)
     else:
-        log_p, log_q = trainer_topk / T, ref_topk / T
+        log_p, log_q = trainer_topk, ref_topk
         p, q = torch.exp(log_p) * valid, torch.exp(log_q) * valid
         eps = 1e-6
         p_out = (1.0 - p.sum(-1)).clamp_min(eps)

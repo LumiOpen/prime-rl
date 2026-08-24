@@ -321,11 +321,90 @@ All runs: base-model student, `max_norm = 1e12`, 100 steps.
 
 **Be explicit about this: the coverage asymmetry was a real defect, correctly diagnosed and correctly fixed, and it was NOT the reason `opd` failed.** The student is now provably matching the teacher's distribution better than before while producing strictly worse text.
 
+> **VOID (2026-08-24).** Every row in this table, and the conclusion drawn from
+> it, is invalidated by finding 5.6. The last sentence above was the tell and we
+> read it backwards: a student that matches a target better while writing worse
+> text is matching the *wrong target*.
+
+---
+
+### 5.6 The teacher's top-k support was off by one token (2026-08-24)
+
+**All k ≥ 1 results in this document are void.** The support was aligned to the
+wrong position, so every top-k run minimized a scrambled objective.
+
+vLLM's `prompt_logprobs[t]` is the distribution predicting token `t`, and it puts
+the target id first, so the payload obeys
+
+```
+teacher_topk_ids[t][0] == input_ids[t]
+```
+
+— the "probability of current token" convention, the same one `ref_logprobs`
+uses. The policy's logits are on the *other* convention: `logits[t]` predicts
+token `t+1`. That is exactly what `labels = shift_tensor_left(input_ids)`
+(`train.py:383`) exists to correct. The support got no such correction, so
+`gather_log_softmax(scaled_logits, teacher_topk_ids)` evaluated the policy at
+position `t`'s candidate ids against logits predicting token `t+1`. After the
+shared `shift_tensor_right` the *positions* line up but the *vocab indices* do
+not: slot `t` held the policy's mass on position `t−1`'s candidates, compared
+against the teacher's probabilities for position `t`'s.
+
+**Proof, no model required** (`opd_val/topk_alignment_test.py`). Column 0 of the
+support *is* the sampled token, so after the shift it must equal the scalar
+`trainer_logprobs` exactly:
+
+```
+max |topk[:,0] - scalar logprob|   as shipped:  2.851221
+max |topk[:,0] - scalar logprob|   ids shifted: 0.000000
+```
+
+**Why the metrics looked healthy.** Adjacent positions' top-k sets overlap
+heavily in natural text (punctuation, function words, digits), so the scrambled
+support still carried 0.35–0.75 of the policy's mass, and the KL over it was
+still minimizable. `TopK Mass` rising and `Ref KL` falling by an order of
+magnitude were real — of the wrong quantity.
+
+**Why it destroyed the model.** Placing probability mass on the *previous*
+position's candidate set is, mechanically, training the model to lag and repeat.
+Every top-k arm ended at **100% truncation and reward exactly 0.0000**, and the
+lr sweep showed the damage scaling with how hard the KL was minimized (reward
+0.605 → 0.541 → 0.024 as KL reduction went 0% → 27% → 95%). Optimizing this
+objective harder is optimizing degeneracy harder.
+
+**Why the earlier direction test missed it.** `opd_val/topk_direction_test.py`
+feeds tensors straight into `_topk_divergence`, bypassing the plumbing. The loss
+function was never the problem — every one of the 9 `topk_normalization ×
+kl_type` combinations is correctly directed, on the logits, both before and after
+this fix. The bug was one layer up, in `train.py`.
+
+Fixed by shifting the support onto the labels' convention at the same site the
+labels are built, before CP sharding. `shift_tensor_left` was rank-2 only and was
+extended to rank-3 to allow it (its sibling `shift_tensor_right` already had
+been).
+
+**Also fixed here (latent, inert at defaults):** `_topk_divergence` divided
+`trainer_topk / T`, but the payload holds **log-probabilities**, not logits.
+`renormalize` survives this — a logprob differs from its logit by a per-position
+constant that `log_softmax` cancels — but `none` and `residual` read
+`exp(logprob / T)` as an absolute probability, which it is not, so the
+off-support residual `1 − p.sum()` can go negative. Every run used `T = 1.0`, so
+nothing measured was affected. Those two modes now require `T = 1.0` and say so.
+
 ---
 
 ## 6. Current hypothesis and what is running
 
 ### Hypothesis (not yet tested)
+
+> **SUPERSEDED (2026-08-24).** This section was written to explain why `opd`
+> failed at every k. Two implementation bugs have since been found that account
+> for the failure directly: the k=0 objective contributed **zero gradient**
+> (§1e / commit `27c0493b`), and the k ≥ 1 support was **off by one token**
+> (§5.6). With the k=0 bug fixed, `opd` reaches 0.8203 on the GSM8K band from a
+> 0.588 student. The reasoning below is retained because it is not *wrong* as
+> theory, but it is no longer needed to explain anything we measured, and it
+> should not be cited as a finding.
 
 `opd` is on-policy: the KL is evaluated on the *student's own* trajectories. When the student starts far from the teacher, those trajectories are garbage, and the objective is satisfied by matching the teacher on meaningless contexts. Nothing anchors the student to good behaviour the way `sft`'s teacher-generated tokens do. The post-fix metrics are exactly what that predicts: the KL genuinely drops (0.88 at k=100, from 9.16) while the reward goes to zero — the student is learning to imitate the teacher *on states no competent model would ever visit*. Additionally, reverse KL is mode-seeking and unstable far from the target, whereas forward KL / cross-entropy is mode-covering and stable; that ordering matches the observed `sft` > `grpo` > `opd` result exactly.
 
@@ -347,7 +426,8 @@ The untested middle regime is a student **competent at the task but meaningfully
 4. **Fix or report the `/tmp/vf-scripts` path** (`deps/verifiers/.../base.py:173`) — a one-line `TMPDIR` fix upstream removes a class of node-dependent flakiness that already cost one 98-minute wasted job. *Confidence: high, root cause is certain.*
 5. **Report the shutdown deadlock.** Nine occurrences, ~a third of all runs, each holding a full node until walltime or an operator intervenes. The `zero_advantage` hypothesis does not survive the wider census (five of the nine are `opd`, which ships no advantages), so this needs fresh investigation of the orchestrator's batch-dispatch path. *Confidence in the symptom: certain. In any mechanism: none.*
 6. **Consider abandoning `reverse-text` for distillation validation.** Its reward is close to a binary "did it stop in time", it offers no student in the useful headroom band, and the released student is already at teacher level. A task with graded reward and a genuine capability gap would make any of these results far more interpretable. *Confidence: high — this is a measurement (42224, 42216 step-8 traces), not an inference.*
-7. **Keep the top-k work.** It is correct, the coarsened-residual KL is well-founded, and the metrics it added (`TopK Mass`, `Ref KL`, `topk_residual`) were what made the degenerate-minimum diagnosis possible in the first place. It just is not the fix for this failure.
+7. **Keep the top-k work — but every k ≥ 1 number in this document must be re-measured.** The loss function is correct (all 9 `topk_normalization × kl_type` combinations are correctly directed, verified on the logits) and the coarsened-residual KL is well-founded. The *plumbing* was not: the support was off by one token until 2026-08-24 (§5.6), so the whole sweep optimized a scrambled objective. Re-run k ∈ {8, 20, 50, 100} before drawing any conclusion about whether coverage helps. The metrics the work added (`TopK Mass`, `Ref KL`, `topk_residual`) are what made both diagnoses possible and should stay.
+8. **Treat "the objective improves while the output gets worse" as an alignment alarm, not a finding.** It was reported twice in this document as evidence about `opd`'s nature. Both times it was a bug: the metric and the text disagreed because the metric was measuring the wrong quantity. A KL that falls an order of magnitude while reward goes to exactly 0.0000 and truncation to 100% should trigger a plumbing audit first.
 
 ---
 

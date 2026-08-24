@@ -517,7 +517,11 @@ class RefKLConfig(BaseConfig):
     to soft-label cross-entropy on the support and anchors the objective."""
 
     temperature: float = Field(1.0, gt=0.0)
-    """Softmax temperature applied symmetrically to both sides of the top-k KL."""
+    """Softmax temperature applied symmetrically to both sides of the top-k KL.
+    Only meaningful with ``topk_normalization = "renormalize"``: the payload
+    carries log-probabilities, and tempering them is only well defined once the
+    support is renormalized. The other two modes read the same numbers as
+    absolute probabilities, which tempering would break, so they require 1.0."""
 
     importance_ratio: bool = True
     """Multiply the per-token signal by the trainer/inference importance ratio.
