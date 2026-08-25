@@ -18,7 +18,7 @@ from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
 from prime_rl.configs.trainer import TrainerConfig
-from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
+from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader, ReplayDataLoader
 from prime_rl.utils.cp import (
     gather_for_cp,
     gather_for_cp_wo_grad,
@@ -233,7 +233,7 @@ def train(config: TrainerConfig):
     if config.data.fake:
         dataloader = FakeDataLoader(config.data.fake, config.model.seq_len, parallel_dims.get_mesh("dp").size())
     else:
-        dataloader = DataLoader(
+        real_dataloader = DataLoader(
             config.output_dir,
             progress.step,
             parallel_dims.get_mesh("dp").size(),
@@ -242,6 +242,7 @@ def train(config: TrainerConfig):
             build_bin_cost(model.config),
             config.rollout_transport,
         )
+        dataloader = ReplayDataLoader(real_dataloader) if config.data.replay else real_dataloader
 
     token_exporter = setup_token_exporter(config, parallel_dims, world, logger)
 
@@ -676,6 +677,7 @@ def train(config: TrainerConfig):
             "perf/throughput_per_gpu": throughput / world.world_size,
             "perf/mfu": mfu,
             "perf/peak_memory": peak_memory,
+            "perf/effective_batch_size": batch_size,
             "step": progress.step,
         }
         monitor.log(perf_metrics, step=progress.step)

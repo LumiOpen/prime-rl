@@ -279,6 +279,28 @@ class DataLoader:
         )
 
 
+class ReplayDataLoader:
+    """Captures the first real batch from the orchestrator and replays it forever.
+
+    Used for overfitting / trainer sanity checks: the model should drive loss
+    to near-zero on the fixed batch, confirming the optimizer and loss function
+    are working correctly.
+    """
+
+    def __init__(self, inner: DataLoader):
+        self._inner = inner
+        self._cached: list[TensorMicroBatch] | None = None
+
+    def wait_for_batch(self) -> None:
+        if self._cached is None:
+            self._inner.wait_for_batch()
+
+    def get_batch(self) -> list[TensorMicroBatch]:
+        if self._cached is None:
+            self._cached = self._inner.get_batch()
+        return self._cached
+
+
 def _torch_dtype(name: str) -> torch.dtype:
     """Resolve a numpy/torch dtype name (e.g. ``"float32"``) to torch.dtype."""
     # Strip the ``numpy.`` prefix some dtype reprs carry.
