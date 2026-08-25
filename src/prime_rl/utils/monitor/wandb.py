@@ -198,7 +198,7 @@ class WandbMonitor(Monitor):
             or not isinstance(self.config, WandbWithExtrasConfig)
             or not self.config.log_extras
             or not self.config.log_extras.samples
-            or step % self.config.log_extras.interval != 0
+            or (step % self.config.log_extras.interval != 0 and step != 1)
         ):
             # Do not log samples if not enabled or not log interval step
             return
