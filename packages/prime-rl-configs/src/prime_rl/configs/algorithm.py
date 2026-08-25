@@ -199,6 +199,20 @@ class GRPOAlgoConfig(BaseAlgoConfig):
     length_penalty: LengthPenaltyConfig | None = None
     """Linear length penalty subtracted from each reward before the GRPO baseline (see ``LinearLengthPenaltyConfig``): a ``pass_rate``-scaled sum of output-token, input-token, and turns terms, each normalized by the group's own max for that quantity. None disables it."""
 
+    min_group_reward: float | None = None
+    """Drop groups whose mean reward is below this threshold (too hard — model cannot yet satisfy
+    these constraints). Zeroes advantages for the whole group; the ZeroAdvantageFilter then drops
+    the rollouts. None disables the check."""
+
+    max_group_reward: float | None = None
+    """Drop groups whose mean reward is above this threshold (too easy — model already reliably
+    satisfies these constraints, leaving no learning signal). None disables the check."""
+
+    min_group_reward_std: float | None = None
+    """Drop groups whose reward standard deviation is below this threshold. Catches uniform
+    intermediate-reward groups that ZeroAdvantageFilter misses (std > 0 but near zero). None
+    disables the check."""
+
 
 class EchoAlgoConfig(GRPOAlgoConfig):
     type: Literal["echo"] = "echo"  # type: ignore[assignment]
