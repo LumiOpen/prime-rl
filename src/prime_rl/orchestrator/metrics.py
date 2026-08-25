@@ -23,13 +23,19 @@ Subset = Literal["all", "effective"]
 
 
 class Stat:
-    """A distribution of per-rollout values with mean/max/min and p10/p90 accessors."""
+    """A distribution of per-rollout values with mean/std/max/min and p10/p90 accessors."""
 
     def __init__(self, values: list[float]) -> None:
         self.values = values
 
     def mean(self) -> float:
         return sum(self.values) / len(self.values) if self.values else 0.0
+
+    def std(self) -> float:
+        if len(self.values) < 2:
+            return 0.0
+        m = self.mean()
+        return float((sum((v - m) ** 2 for v in self.values) / (len(self.values) - 1)) ** 0.5)
 
     def max(self) -> float:
         return float(max(self.values)) if self.values else 0.0
@@ -54,11 +60,12 @@ class Stat:
         return self.percentile(90)
 
     def to_dict(self, prefix: str) -> dict[str, float]:
-        """``{prefix}/mean,max,min,p10,p90``; ``{}`` for an empty distribution."""
+        """``{prefix}/mean,std,max,min,p10,p90``; ``{}`` for an empty distribution."""
         if not self.values:
             return {}
         return {
             f"{prefix}/mean": self.mean(),
+            f"{prefix}/std": self.std(),
             f"{prefix}/max": self.max(),
             f"{prefix}/min": self.min(),
             f"{prefix}/p10": self.p10(),
