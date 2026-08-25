@@ -387,8 +387,18 @@ class ZeroAdvantageFilterConfig(BaseConfig):
     """When True, skip detected rollouts entirely so they are not sent to the trainer. When False, only track detection metrics."""
 
 
+class LengthFilterConfig(BaseConfig):
+    type: Literal["length"] = "length"
+
+    enforce: bool = False
+    """When True, skip detected rollouts entirely so they are not sent to the trainer. When False, only track detection metrics."""
+
+    max_output_tokens: int = Field(ge=1)
+    """Rollouts whose output exceeds this many tokens are flagged. Best used as a pre-batch filter so long rollouts are excluded before group advantage computation."""
+
+
 FilterConfig: TypeAlias = Annotated[
-    GibberishFilterConfig | RepetitionFilterConfig | ZeroAdvantageFilterConfig,
+    GibberishFilterConfig | RepetitionFilterConfig | ZeroAdvantageFilterConfig | LengthFilterConfig,
     Field(discriminator="type"),
 ]
 

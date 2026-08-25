@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from prime_rl.configs.orchestrator import FilterConfig
+from prime_rl.configs.orchestrator import FilterConfig, LengthFilterConfig
 from prime_rl.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -110,6 +110,22 @@ class ZeroAdvantageFilter:
         return FilterResult(detected=False)
 
 
+@dataclass
+class LengthFilter:
+    """Flags rollouts whose output exceeds a token budget.
+
+    Use as a pre-batch filter so long rollouts are excluded before group
+    advantage computation — this ensures the group mean baseline is computed
+    only over rollouts of acceptable length."""
+
+    name: str
+    max_output_tokens: int
+    enforce: bool = False
+
+    def check(self, rollout: Rollout) -> FilterResult:
+        return FilterResult(detected=rollout.num_output_tokens > self.max_output_tokens)
+
+
 def setup_filter(config: FilterConfig, vocab_size: int) -> RolloutFilter:
     """Create a RolloutFilter from a filter config."""
     if config.type == "gibberish":
@@ -129,6 +145,12 @@ def setup_filter(config: FilterConfig, vocab_size: int) -> RolloutFilter:
     elif config.type == "zero_advantage":
         return ZeroAdvantageFilter(
             name="zero_advantage",
+            enforce=config.enforce,
+        )
+    elif config.type == "length":
+        return LengthFilter(
+            name="length",
+            max_output_tokens=config.max_output_tokens,
             enforce=config.enforce,
         )
     raise ValueError(f"Unknown filter type: {config.type}")
