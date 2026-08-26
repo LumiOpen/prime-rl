@@ -499,6 +499,9 @@ class DataLoaderConfig(BaseConfig):
     fake: FakeDataLoaderConfig | None = None
     """Use a fake data loader sampling random micro-batches (for debugging)."""
 
+    replay: bool = False
+    """Capture the first real batch from the orchestrator and replay it for every subsequent step (overfitting / trainer sanity check)."""
+
 
 class BaseWeightBroadcastConfig(BaseConfig):
     pass

@@ -103,7 +103,7 @@ def load_environment(
     dataset_name: str = _DEFAULT_FI_DATASET,
     num_train_examples: int = -1,
     num_eval_examples: int = -1,
-    system_prompt: str = SYSTEM_PROMPT_FI,
+    system_prompt: str | None = SYSTEM_PROMPT_FI,
     language_reward_weight: float = 0.0,
     **kwargs,
 ) -> vf.Environment:
@@ -113,9 +113,10 @@ def load_environment(
         dataset_name: Path to fi_dataset.jsonl or a HuggingFace dataset identifier.
         num_train_examples: Subset size for training (-1 = full dataset).
         num_eval_examples: Subset size for eval (-1 = full dataset).
-        system_prompt: System message prepended to every prompt.
+        system_prompt: System message prepended to every prompt. Pass None or "" to disable.
         **kwargs: Forwarded to SingleTurnEnv.
     """
+    system_prompt = system_prompt or None
 
     def _load_raw() -> Dataset:
         import os

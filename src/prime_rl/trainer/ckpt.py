@@ -404,6 +404,7 @@ class WeightCheckpointManager:
 
                     gen_config = deepcopy(model.generation_config)
                     gen_config.use_cache = True
+                    gen_config.do_sample = True
                     gen_config.save_pretrained(path)
                 # Processor first: it saves its own (unmodified) tokenizer, which the
                 # configured tokenizer (pad token, custom chat template) must override.

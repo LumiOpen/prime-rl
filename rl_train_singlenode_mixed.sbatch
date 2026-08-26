@@ -96,9 +96,13 @@ EASY_THRESHOLD=${EASY_THRESHOLD:-1.0}
 HARD_THRESHOLD=${HARD_THRESHOLD:-0.0}
 ROLLOUT_TEMP=${ROLLOUT_TEMP:-1.0}
 MAX_STEPS=${MAX_STEPS:-500}
-CKPT_INTERVAL=${CKPT_INTERVAL:-10}
+MAX_OFF_POLICY=${MAX_OFF_POLICY:-8}
+CKPT_INTERVAL=${CKPT_INTERVAL:-100}
+KEEP_LAST=${KEEP_LAST:-30}
+EVAL_INTERVAL=${EVAL_INTERVAL:-100}
 WANDB_PROJECT=${WANDB_PROJECT:-reasoning}
-EXTRA_VLLM_ARGS=${EXTRA_VLLM_ARGS:-}
+TRAINER_ATTN=${TRAINER_ATTN:-flash_attention_2}
+TRAINER_MODEL_IMPL=${TRAINER_MODEL_IMPL:-hf}
 RENDERER=${RENDERER:-qwen3.5}
 
 PORT=8000
@@ -121,8 +125,8 @@ OUTPUT_DIR="$BASE/outputs/$FULL_RUN_NAME"
 mkdir -p "$OUTPUT_DIR/run_default"
 
 FI_JUDGE_DATASET="/shared_silo/scratch/datasets/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi.jsonl"
-EN_MATH_DATASET="/shared_silo/scratch/dzautner/prime-rl/data/klear_math_30k_en"
-FI_MATH_DATASET="/shared_silo/scratch/dzautner/prime-rl/data/klear_math_30k_fi"
+EN_MATH_DATASET="${EN_MATH_DATASET:-/shared_silo/scratch/dzautner/prime-rl/data/klear_math_30k_en}"
+FI_MATH_DATASET="${FI_MATH_DATASET:-/shared_silo/scratch/dzautner/prime-rl/data/klear_math_30k_fi}"
 
 echo "============================================"
 echo "  PRIME-RL Single-Node Training (Mixed): $FULL_RUN_NAME"
@@ -163,7 +167,7 @@ echo "============================================"
 
 # ── Generate configs ──
 cat > "$OUTPUT_DIR/infer.toml" << TOMLEOF
-enable_fp32_lm_head = false
+enable_fp32_lm_head = ${FP32_LM_HEAD:-false}
 
 [model]
 name = "$SFT_MODEL"
@@ -174,6 +178,7 @@ tp = 1
 
 [server]
 port = $PORT
+$(if [ -n "${VLLM_MODEL_IMPL:-}" ]; then echo "[vllm_extra]"; echo "model_impl = \"$VLLM_MODEL_IMPL\""; fi)
 TOMLEOF
 
 cat > "$OUTPUT_DIR/rm_infer.toml" << TOMLEOF
@@ -192,6 +197,7 @@ cat > "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
 batch_size = $BATCH_SIZE
 group_size = $ROLLOUTS
 max_steps = $MAX_STEPS
+max_off_policy_steps = $MAX_OFF_POLICY
 seq_len = $INF_SEQ_LEN
 
 [model]
@@ -225,7 +231,7 @@ name = "english-math"
 [train.env.args]
 dataset_name = "$EN_MATH_DATASET"
 dataset_subset = "default"
-question_key = "problem"
+question_key = "${MATH_QUESTION_KEY:-problem}"
 answer_key = "answer"
 math_verify_max_workers = 64
 math_verify_timeout = 60
@@ -239,6 +245,13 @@ cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
 id = "dolci-ifeval-env"
 name = "ifeval-en"
 TOMLEOF
+if [ "${NO_SYSTEM_PROMPT:-0}" = "1" ]; then
+cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
+
+[train.env.args]
+system_prompt = ""
+TOMLEOF
+fi
 fi
 
 if [ "$IFEVAL_ONLY" != "1" ] && [ "$MATH_ONLY" != "1" ]; then
@@ -254,6 +267,29 @@ judge_model_path = "$JUDGE_MODEL"
 rm_server_url = "http://127.0.0.1:${RM_PORT}"
 max_judge_tokens = 64
 TOMLEOF
+if [ "${NO_SYSTEM_PROMPT:-0}" = "1" ]; then
+cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
+system_prompt = ""
+TOMLEOF
+fi
+fi
+
+if [ "${NO_EVAL:-0}" != "1" ]; then
+cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
+
+[eval]
+interval = $EVAL_INTERVAL
+
+[[eval.env]]
+name = "aime25-eval"
+taskset = { id = "aime25-v1" }
+harness = { id = "null" }
+
+[[eval.env]]
+name = "ifbench-eval"
+taskset = { id = "ifbench-v1" }
+harness = { id = "null" }
+TOMLEOF
 fi
 
 cat > "$OUTPUT_DIR/train_config.toml" << TOMLEOF
@@ -265,6 +301,8 @@ name = "$SFT_MODEL"
 seq_len = $TRAINER_SEQ_LEN
 optim_cpu_offload = false
 compile = "None"
+impl = "$TRAINER_MODEL_IMPL"
+attn = "flash_attention_2"
 
 [model.ac]
 freq = 1
@@ -276,7 +314,7 @@ offline = $WANDB_OFFLINE
 
 [ckpt]
 interval = $CKPT_INTERVAL
-keep_last = 30
+keep_last = $KEEP_LAST
 
 [loss]
 type = "default"
@@ -305,8 +343,7 @@ export HOME=/tmp/home_\$(hostname)_\${SLURM_JOB_ID}
 mkdir -p \$TRITON_CACHE_DIR \$TORCHINDUCTOR_CACHE_DIR \$XDG_CACHE_HOME \$HOME
 
 export UV_PYTHON=$PRIME_RL_DIR/.venv/bin/python3
-export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.5
+export PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.5
 export RCCL_NET_GDR_LEVEL=2
 export NCCL_SOCKET_IFNAME=eno0
 export GLOO_SOCKET_IFNAME=eno0
@@ -361,13 +398,13 @@ singularity exec $CONTAINER_FLAGS $BIND_MOUNTS "$IMG" \
         uv run inference \
         @ $OUTPUT_DIR/infer.toml \
         --parallel.dp $NUM_INF_GPUS \
-        --gpu-memory-utilization 0.85 $EXTRA_VLLM_ARGS" \
+        --gpu-memory-utilization 0.85" \
     > "$OUTPUT_DIR/inference_0.log" 2>&1 &
 INF_PID=$!
 
 RM_PID=
-# ── Launch LLM judge server on RM GPUs (skipped for IFEVAL_ONLY) ──
-if [ "$IFEVAL_ONLY" != "1" ]; then
+# ── Launch LLM judge server on RM GPUs (skipped for IFEVAL_ONLY and MATH_ONLY) ──
+if [ "$IFEVAL_ONLY" != "1" ] && [ "$MATH_ONLY" != "1" ]; then
     echo "Starting judge server on GPUs $RM_GPU_LIST..."
     singularity exec $CONTAINER_FLAGS $BIND_MOUNTS "$IMG" \
         bash -c "source $ENV_SETUP && \
@@ -390,7 +427,7 @@ curl -sf "http://127.0.0.1:${PORT}/health" &>/dev/null \
     || { echo "ERROR: policy inference server did not start within 1200s"; kill $INF_PID ${RM_PID:-} 2>/dev/null; exit 1; }
 echo "Policy inference server ready."
 
-if [ "$IFEVAL_ONLY" != "1" ]; then
+if [ "$IFEVAL_ONLY" != "1" ] && [ "$MATH_ONLY" != "1" ]; then
     echo "Waiting for judge server on port $RM_PORT..."
     for attempt in $(seq 1 600); do
         curl -sf "http://127.0.0.1:${RM_PORT}/health" &>/dev/null && break
@@ -429,7 +466,7 @@ singularity exec $CONTAINER_FLAGS $BIND_MOUNTS "$IMG" \
         uv run torchrun \
             --standalone \
             --nproc-per-node $NUM_TRAIN_GPUS \
-            --local-ranks-filter 0 \
+            --log-dir $OUTPUT_DIR/logs/trainer/torchrun \
             -m prime_rl.trainer.rl.train \
             @ $OUTPUT_DIR/train_config.toml \
             --output-dir $OUTPUT_DIR

@@ -177,7 +177,7 @@ def load_environment(
     dataset_shuffle: bool = True,
     dataset_seed: int = 42,
     use_finnish: bool = False,
-    system_prompt: str | None = None,
+    system_prompt: str | None = _SYSTEM_PROMPT,
     map_kwargs: dict = {},
     # LLM-as-judge mode — activated when custom_rm=True.
     # The judge model is served via the same vLLM instance as the RM
@@ -206,7 +206,7 @@ def load_environment(
         max_passrate:           Drop examples above this passrate.
         dataset_shuffle:        Shuffle the dataset.
         dataset_seed:           Seed for shuffling.
-        system_prompt:          System prompt prepended to every conversation.
+        system_prompt:          System prompt prepended to every conversation. Pass None or "" to disable.
         custom_rm:              When True, use an LLM-as-judge via vLLM chat completions
                                 instead of a SequenceClassification reward model.
                                 The judge is served at rm_server_url (injected automatically).
@@ -217,8 +217,7 @@ def load_environment(
         max_judge_tokens:       Max tokens the judge may generate (default: 512).
         judge_temperature:      Sampling temperature for the judge (default: 0.0 = greedy).
     """
-    if system_prompt is None:
-        system_prompt = _SYSTEM_PROMPT
+    system_prompt = system_prompt or None
 
     if custom_rm:
         if judge_model_path is None:

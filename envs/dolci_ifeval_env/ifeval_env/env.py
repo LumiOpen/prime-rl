@@ -122,7 +122,7 @@ def load_environment(
     train_split: str = "train",
     num_train_examples: int = -1,
     num_eval_examples: int = -1,
-    system_prompt: str = SYSTEM_PROMPT,
+    system_prompt: str | None = SYSTEM_PROMPT,
     **kwargs,
 ) -> vf.Environment:
     """Build and return the IFEval verifiers environment.
@@ -132,9 +132,10 @@ def load_environment(
         train_split: Split to use for training and eval data.
         num_train_examples: Subset size for training (-1 = full split).
         num_eval_examples: Subset size for eval (-1 = full split).
-        system_prompt: System message prepended to every prompt.
+        system_prompt: System message prepended to every prompt. Pass None or "" to disable.
         **kwargs: Forwarded to SingleTurnEnv.
     """
+    system_prompt = system_prompt or None
 
     def _load_raw() -> Dataset:
         import os
