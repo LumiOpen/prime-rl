@@ -1,3 +1,4 @@
+import os
 import re
 
 # (regex, parser_name) — first match wins.
@@ -31,9 +32,44 @@ REASONING_PARSER_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+def _normalize(model_name: str) -> str:
+    """Return a canonical name that patterns can match against.
+
+    Handles three local path forms:
+    1. /scratch/models/Qwen3.5-35B-A3B  → "Qwen/Qwen3.5-35B-A3B"
+    2. HF cache: .../models--zai-org--GLM-5.2-FP8/snapshots/<hash>
+                                        → "zai-org/GLM-5.2-FP8"
+    """
+    if not model_name.startswith("/"):
+        return model_name
+    # Check all path components for HF cache "models--org--name" pattern.
+    for part in model_name.split("/"):
+        if part.startswith("models--"):
+            segments = part[len("models--"):].split("--", 1)
+            if len(segments) == 2:
+                return f"{segments[0]}/{segments[1]}"
+    basename = os.path.basename(model_name.rstrip("/"))
+    # Map known basename prefixes to their HF org.
+    _ORG_PREFIXES = [
+        ("Qwen3.5-", "Qwen/"),
+        ("Qwen3-", "Qwen/"),
+        ("DeepSeek-", "deepseek-ai/"),
+        ("GLM-", "zai-org/"),
+        ("MiniMax-", "MiniMaxAI/"),
+        ("NVIDIA-Nemotron-", "nvidia/"),
+        ("INTELLECT-", "PrimeIntellect/"),
+        ("Step-", "stepfun-ai/"),
+    ]
+    for prefix, org in _ORG_PREFIXES:
+        if basename.startswith(prefix):
+            return org + basename
+    return basename
+
+
 def _resolve(model_name: str, patterns: list[tuple[re.Pattern[str], str]]) -> str | None:
+    normalized = _normalize(model_name)
     for pattern, parser_name in patterns:
-        if pattern.search(model_name):
+        if pattern.search(normalized):
             return parser_name
     return None
 
