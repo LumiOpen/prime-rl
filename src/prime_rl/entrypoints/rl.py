@@ -42,6 +42,21 @@ RL_SBATCH = "rl.sbatch"
 TRAINER_TOML = "trainer.toml"
 ORCHESTRATOR_TOML = "orchestrator.toml"
 INFERENCE_TOML = "inference.toml"
+RM_INFERENCE_TOML = "rm_inference.toml"
+
+
+def make_gpu_env(gpu_ids: list[int]) -> dict[str, str]:
+    """Return env vars that restrict a subprocess to the given physical GPU IDs.
+
+    On ROCm, ROCR_VISIBLE_DEVICES selects physical GPUs and re-indexes them starting
+    from 0, so CUDA_VISIBLE_DEVICES must use local indices. On NVIDIA,
+    ROCR_VISIBLE_DEVICES is ignored and CUDA_VISIBLE_DEVICES takes physical IDs directly.
+    """
+    physical = ",".join(map(str, gpu_ids))
+    local = ",".join(map(str, range(len(gpu_ids))))
+    if os.path.exists("/dev/kfd"):  # ROCm driver present
+        return {"ROCR_VISIBLE_DEVICES": physical, "CUDA_VISIBLE_DEVICES": local}
+    return {"CUDA_VISIBLE_DEVICES": physical}
 
 
 def get_physical_gpu_ids() -> list[int]:
@@ -182,7 +197,7 @@ def rl_local(config: RLConfig):
                         **DEFAULT_INFERENCE_ENV_VARS,
                         **config.env_vars,
                         **config.inference.env_vars,
-                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, infer_gpu_ids)),
+                        **make_gpu_env(infer_gpu_ids),
                     },
                     stdout=log_file,
                     stderr=log_file,
@@ -291,7 +306,7 @@ def rl_local(config: RLConfig):
                     **config.trainer.env_vars,
                     **wandb_shared_env,
                     "WANDB_SHARED_LABEL": "trainer",
-                    "CUDA_VISIBLE_DEVICES": ",".join(map(str, trainer_gpu_ids)),
+                    **make_gpu_env(trainer_gpu_ids),
                 },
                 stdout=log_file,
                 stderr=log_file,
