@@ -4,14 +4,14 @@ import re
 
 import verifiers as vf
 
-logger = logging.getLogger("verifiers")
+logger = logging.getLogger("verifiers.v1")
 
-_LOG_SAMPLE_RATE = 0.01  # log ~1% of scored examples
+_LOG_SAMPLE_RATE = 0.05  # log ~5% of scored examples
 
 _GENERAL_CATEGORIES = {"general-quality", "general-quality_ref"}
 
 # Default judge prompt for LLMJudgeRubric.
-# Placeholders: {question}, {answer}.  Judge must emit "Score: N" (1-100).
+# Placeholders: {question}, {answer}.  Judge must emit "Score: N" (0-100).
 # Reward is normalized to [0, 1] by dividing by 100.
 # Used for "general-quality" examples (no reference answer).
 _DEFAULT_JUDGE_PROMPT = """\
@@ -21,8 +21,10 @@ AI assistant to the user query displayed below.
 
 Your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
 
+IMPORTANT: If the [AI Answer] is marked as [EMPTY RESPONSE] or [DEGENERATE RESPONSE], the AI produced no meaningful content and must receive Score: 1.
+
 You MUST respond in exactly this format:
-Score: <integer from 1 to 100>
+Score: <integer from 0 to 100>
 <your brief reasoning here>
 
 [Query]
@@ -43,8 +45,10 @@ Judge whether the provided answer is good by comparing it to the reference answe
 Besides comparing to the reference answer, your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
 Note that sometimes the reference answer is not the only answer. So any valid variation of the reference answer is also acceptable and can get a full score.
 
+IMPORTANT: If the [AI Answer] is marked as [EMPTY RESPONSE] or [DEGENERATE RESPONSE], the AI produced no meaningful content and must receive Score: 1.
+
 You MUST respond in exactly this format:
-Score: <integer from 1 to 100>
+Score: <integer from 0 to 100>
 <your brief reasoning here>
 
 [Query]
@@ -272,8 +276,6 @@ class LLMJudgeRubric(vf.Rubric):
 
     async def _call_judge(self, question: str, answer: str, reference: str = "", category: str = "") -> str:
         import aiohttp
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
         if category == "general-quality_ref" and reference:
             user_content = _JUDGE_PROMPT_WITH_REF.format(question=question, answer=answer, reference=reference)
         else:
@@ -288,12 +290,25 @@ class LLMJudgeRubric(vf.Rubric):
             "chat_template_kwargs": {"enable_thinking": False},
         }
         url = f"{self._judge_url}/v1/chat/completions"
-        async with self._session.post(url, json=payload) as resp:
-            if not resp.ok:
-                body = await resp.text()
-                raise RuntimeError(f"Judge server {url} returned {resp.status}: {body}")
-            data = await resp.json()
-        return data["choices"][0]["message"]["content"]
+        for attempt in range(3):
+            if self._session is None or self._session.closed or self._session.connector is None or self._session.connector.closed:
+                self._session = aiohttp.ClientSession()
+            try:
+                async with self._session.post(url, json=payload) as resp:
+                    if not resp.ok:
+                        body = await resp.text()
+                        raise RuntimeError(f"Judge server {url} returned {resp.status}: {body}")
+                    data = await resp.json()
+                return data["choices"][0]["message"]["content"]
+            except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectorError, RuntimeError) as e:
+                if "Connector is closed" in str(e) or isinstance(e, (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectorError)):
+                    await self._session.close()
+                    self._session = None
+                    if attempt == 2:
+                        raise
+                else:
+                    raise
+        raise RuntimeError("unreachable")
 
     @staticmethod
     def _parse_score(text: str) -> float:
@@ -314,23 +329,30 @@ class LLMJudgeRubric(vf.Rubric):
             match = re.match(r'(\d{1,3})\b', first_line)
         if match:
             raw = int(match.group(1))
-            # Always 1-100 scale as per the prompt
-            return max(1, min(100, raw)) / 100.0
+            return max(0, min(100, raw)) / 100.0
         logger.warning("LLM judge: could not parse score from output: %r", text[:200])
         return 0.0
 
-    async def llm_judge_score(self, completion, answer, info: dict, **kwargs) -> float:
+    async def llm_judge_score(self, completion, answer, info: dict, state=None, **kwargs) -> float:
         response_text = _extract_text(completion)
+        # If the stripped answer is empty or just an answer marker with no content,
+        # return 0 immediately — the judge hallucinates a correct answer otherwise.
+        stripped = response_text.strip().rstrip("*_: \n")
+        if not stripped:
+            logger.info("LLM judge: empty answer after stripping thinking blocks, returning 0.0")
+            return 0.0
         question = info.get("prompt_text", "")
         reference = info.get("reference", "")
         category = info.get("category", "")
         judge_output = await self._call_judge(question, response_text, reference=reference, category=category)
         score = self._parse_score(judge_output)
         if random.random() < _LOG_SAMPLE_RATE:
+            ref_line = f"  reference ({len(reference)} chars): {reference[:200]!r}\n" if reference else ""
             logger.info(
                 "LLM judge sample\n"
                 f"  question ({len(question)} chars): {question[:200]!r}\n"
                 f"  answer ({len(response_text)} chars): {response_text[:200]!r}\n"
+                + ref_line +
                 f"  judge output: {judge_output[:300]!r}\n"
                 f"  score: {score:.2f}"
             )

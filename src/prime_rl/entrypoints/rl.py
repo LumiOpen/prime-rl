@@ -106,6 +106,7 @@ def rl_local(config: RLConfig):
     infer_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_infer_gpus))
     gpu_offset += num_infer_gpus
     trainer_local_gpu_ids = list(range(gpu_offset, gpu_offset + config.deployment.num_train_gpus))
+    gpu_offset += config.deployment.num_train_gpus
 
     total_requested_gpus = num_infer_gpus + config.deployment.num_train_gpus
     physical_gpu_ids = get_physical_gpu_ids()
