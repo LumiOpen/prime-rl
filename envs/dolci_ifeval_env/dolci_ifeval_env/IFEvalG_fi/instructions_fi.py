@@ -134,7 +134,7 @@ class CapitalLettersFinnishChecker(Instruction):
             return value.isupper() and langdetect.detect(value) == "fi"
         except langdetect.LangDetectException as e:
             logging.error("Unable to detect language for text %s due to %s", value, e)
-            return True
+            return False
 
 
 class LowercaseLettersFinnishChecker(Instruction):
@@ -159,7 +159,7 @@ class LowercaseLettersFinnishChecker(Instruction):
             return value.islower() and langdetect.detect(value) == "fi"
         except langdetect.LangDetectException as e:
             logging.error("Unable to detect language for text %s due to %s", value, e)
-            return True
+            return False
 
 
 class ConstrainedResponseFinnishChecker(Instruction):

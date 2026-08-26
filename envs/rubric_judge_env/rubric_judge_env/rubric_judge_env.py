@@ -187,6 +187,7 @@ def load_environment(
     judge_prompt_template: str | None = None,
     max_judge_tokens: int = 512,
     judge_temperature: float = 0.0,
+    language_reward_weight: float = 0.0,
     **kwargs,
 ) -> vf.Environment:
     """
@@ -282,6 +283,8 @@ def load_environment(
             judge_prompt_template=judge_prompt_template or _DEFAULT_JUDGE_PROMPT,
             max_judge_tokens=max_judge_tokens,
             judge_temperature=judge_temperature,
+            use_finnish=use_finnish,
+            language_reward_weight=language_reward_weight,
         )
     else:
         rubric = RubricJudgeRubric(rm_model_path=rm_model_path, rm_device=rm_device, rm_server_url=rm_server_url, rm_max_response_chars=rm_max_response_chars)

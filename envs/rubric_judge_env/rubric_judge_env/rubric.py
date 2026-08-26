@@ -62,6 +62,54 @@ Score: <integer from 0 to 100>
 
 [Your judgement]"""
 
+# Finnish variants — identical to the above but with a language requirement.
+_DEFAULT_JUDGE_PROMPT_FI = """\
+### Task Description
+Please act as an impartial judge and evaluate the quality of the response provided by an
+AI assistant to the user query displayed below.
+
+Your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
+
+IMPORTANT: If the [AI Answer] is marked as [EMPTY RESPONSE] or [DEGENERATE RESPONSE], the AI produced no meaningful content and must receive Score: 1.
+
+You MUST respond in exactly this format:
+Score: <integer from 0 to 100>
+<your brief reasoning here>
+
+[Query]
+{question}
+
+[AI Answer]
+{answer}
+
+[Your judgement]"""
+
+_JUDGE_PROMPT_WITH_REF_FI = """\
+### Task Description
+Please act as an impartial judge and evaluate the quality of the answer provided by an
+AI assistant to the conversation history leading up to the answer displayed below.
+Judge whether the provided answer is good by comparing it to the reference answer.
+
+Besides comparing to the reference answer, your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
+Note that sometimes the reference answer is not the only answer. So any valid variation of the reference answer is also acceptable and can get a full score.
+
+IMPORTANT: If the [AI Answer] is marked as [EMPTY RESPONSE] or [DEGENERATE RESPONSE], the AI produced no meaningful content and must receive Score: 1.
+
+You MUST respond in exactly this format:
+Score: <integer from 0 to 100>
+<your brief reasoning here>
+
+[Query]
+{question}
+
+[AI Answer]
+{answer}
+
+[Reference Gold Answer]
+{reference}
+
+[Your judgement]"""
+
 
 def _strip_think_blocks(text: str) -> str:
     """Remove thinking content so scorers only see the final answer.
@@ -264,20 +312,25 @@ class LLMJudgeRubric(vf.Rubric):
         judge_prompt_template: str = _DEFAULT_JUDGE_PROMPT,
         max_judge_tokens: int = 1024,
         judge_temperature: float = 0.0,
+        use_finnish: bool = False,
+        language_reward_weight: float = 0.0,
     ):
         super().__init__()
         self._judge_model = judge_model_path
         self._judge_url = judge_server_url.rstrip("/")
-        self._judge_prompt_template = judge_prompt_template
+        self._use_finnish = use_finnish
+        self._judge_prompt_template = _DEFAULT_JUDGE_PROMPT_FI if use_finnish else judge_prompt_template
         self._max_judge_tokens = max_judge_tokens
         self._judge_temperature = judge_temperature
+        self._language_reward_weight = language_reward_weight
         self._session = None
         self.add_reward_func(self.llm_judge_score)
 
     async def _call_judge(self, question: str, answer: str, reference: str = "", category: str = "") -> str:
         import aiohttp
         if category == "general-quality_ref" and reference:
-            user_content = _JUDGE_PROMPT_WITH_REF.format(question=question, answer=answer, reference=reference)
+            prompt = _JUDGE_PROMPT_WITH_REF_FI if self._use_finnish else _JUDGE_PROMPT_WITH_REF
+            user_content = prompt.format(question=question, answer=answer, reference=reference)
         else:
             user_content = self._judge_prompt_template.format(question=question, answer=answer)
         payload = {
@@ -346,6 +399,19 @@ class LLMJudgeRubric(vf.Rubric):
         category = info.get("category", "")
         judge_output = await self._call_judge(question, response_text, reference=reference, category=category)
         score = self._parse_score(judge_output)
+
+        try:
+            from language_reward import compute_language_score
+            lang_score = compute_language_score(question, response_text)
+            if state is not None:
+                existing = state.get("metrics") or {}
+                existing["language_score"] = lang_score
+                state["metrics"] = existing
+            if self._language_reward_weight > 0.0:
+                score = score * (1.0 - self._language_reward_weight + self._language_reward_weight * lang_score)
+        except Exception:
+            pass
+
         if random.random() < _LOG_SAMPLE_RATE:
             ref_line = f"  reference ({len(reference)} chars): {reference[:200]!r}\n" if reference else ""
             logger.info(
