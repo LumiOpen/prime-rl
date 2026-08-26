@@ -98,6 +98,10 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
         with open(output_dir / INFERENCE_TOML, "wb") as f:
             tomli_w.dump(to_toml_dict(config.inference, exclude=exclude_inference), f)
 
+    if config.rm_inference is not None:
+        with open(output_dir / RM_INFERENCE_TOML, "wb") as f:
+            tomli_w.dump(to_toml_dict(config.rm_inference), f)
+
 
 def rl_local(config: RLConfig):
     assert config.deployment.type == "single_node"
