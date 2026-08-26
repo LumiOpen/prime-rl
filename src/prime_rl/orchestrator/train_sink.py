@@ -212,6 +212,17 @@ class TrainSink:
         # owns the grouping mechanics.
         await env.algorithm.finalize_group(survivors)
 
+        # Apply per-env reward_weight by scaling advantages before stamping onto samples.
+        # Must run before stamp_advantages (called inside finalize_group) would freeze them,
+        # so we re-scale and re-stamp here after finalize_group has set rollout.advantages.
+        reward_weight = getattr(env.config, "reward_weight", 1.0)
+        if reward_weight != 1.0:
+            from prime_rl.orchestrator.algo.routing import stamp_advantages
+            for r in survivors:
+                if r.advantages is not None:
+                    r.advantages = [a * reward_weight for a in r.advantages]
+                    stamp_advantages(r)  # re-stamp sample.advantages with scaled values
+
         # The env has a single sampling temperature; fan it out per token
         # (context tokens are masked out, so their temperature is don't-care).
         temperature = env.sampling_args["temperature"]
