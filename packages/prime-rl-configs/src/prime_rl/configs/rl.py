@@ -138,13 +138,16 @@ class SingleNodeDeploymentConfig(BaseDeploymentConfig):
     num_infer_gpus: int = 1
     """GPUs allocated to inference."""
 
+    num_rm_gpus: int | None = None
+    """GPUs allocated to reward model inference. When set, the rl entrypoint auto-launches an RM inference server."""
+
     @model_validator(mode="after")
     def validate_gpu_count(self):
-        total = self.num_train_gpus + self.num_infer_gpus
+        total = self.num_train_gpus + self.num_infer_gpus + (self.num_rm_gpus or 0)
         if total > self.gpus_per_node:
             raise ValueError(
-                f"Total GPU count ({total} = {self.num_train_gpus} train + {self.num_infer_gpus} infer)"
-                f" exceeds gpus_per_node ({self.gpus_per_node})."
+                f"Total GPU count ({total} = {self.num_train_gpus} train + {self.num_infer_gpus} infer"
+                f" + {self.num_rm_gpus or 0} rm) exceeds gpus_per_node ({self.gpus_per_node})."
             )
         return self
 
@@ -188,6 +191,9 @@ class RLConfig(BaseConfig):
 
     inference: InferenceConfig | None = None
     """Inference server configuration. If None, the rl entrypoint will not start an inference server (useful for elastic inference pools or manually started servers)."""
+
+    rm_inference: InferenceConfig | None = None
+    """Reward model inference config for vLLM-hosted RM scoring. If None, the rl entrypoint will not start an RM server. Only used when deployment.num_rm_gpus is set."""
 
     env_vars: EnvVars = {}
     """Extra environment variables for every launched RL component. Component-specific env_vars override these."""
@@ -630,6 +636,57 @@ class RLConfig(BaseConfig):
                 self.trainer.weight_broadcast.inference_world_size = total_infer_workers
                 assert self.orchestrator.weight_broadcast.type == "nccl"
                 self.orchestrator.weight_broadcast.inference_world_size = total_infer_workers
+
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_rm_inference(self):
+        """Auto-configure RM inference server and inject rm_server_url into matching env args."""
+        if self.deployment.type != "single_node":
+            return self
+        if not self.deployment.num_rm_gpus:
+            return self
+
+        # Auto-build rm_inference config if not explicitly set
+        if self.rm_inference is None:
+            self.rm_inference = InferenceConfig()
+
+        # Auto-assign port unless the user explicitly set it
+        port_explicitly_set = "port" in self.rm_inference.server.model_fields_set
+        if not port_explicitly_set:
+            base_port = self.inference.server.port if self.inference else 8000
+            self.rm_inference.server.port = base_port + 1
+        else:
+            if self.inference is not None and self.rm_inference.server.port == self.inference.server.port:
+                raise ValueError(
+                    f"rm_inference.server.port ({self.rm_inference.server.port}) conflicts with "
+                    f"inference.server.port ({self.inference.server.port})."
+                )
+
+        # Set DP from GPU count
+        tp = self.rm_inference.parallel.tp
+        num_rm_gpus = self.deployment.num_rm_gpus
+        if num_rm_gpus != self.rm_inference.parallel.dp * tp:
+            assert num_rm_gpus % tp == 0, "Number of RM GPUs must be divisible by tensor parallel size"
+            self.rm_inference.parallel.dp = num_rm_gpus // tp
+
+        # Inject rm_server_url into any env that has custom_rm=True or rm_model_path but no rm_server_url.
+        # Always sync model name from env args when it is still the default placeholder.
+        host = self.rm_inference.server.host or "localhost"
+        port = self.rm_inference.server.port
+        rm_server_url = f"http://{host}:{port}"
+        for env in self.orchestrator.train.env:
+            args = env.args or {}
+            if "rm_model_path" in args:
+                if self.rm_inference.model.name == "Qwen/Qwen3-0.6B":
+                    self.rm_inference.model.name = args["rm_model_path"]
+                args.setdefault("rm_server_url", rm_server_url)
+                env.args = args
+            elif args.get("custom_rm") and "judge_model_path" in args:
+                if self.rm_inference.model.name == "Qwen/Qwen3-0.6B":
+                    self.rm_inference.model.name = args["judge_model_path"]
+                args.setdefault("rm_server_url", rm_server_url)
+                env.args = args
 
         return self
 

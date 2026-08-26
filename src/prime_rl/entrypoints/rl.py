@@ -42,6 +42,21 @@ RL_SBATCH = "rl.sbatch"
 TRAINER_TOML = "trainer.toml"
 ORCHESTRATOR_TOML = "orchestrator.toml"
 INFERENCE_TOML = "inference.toml"
+RM_INFERENCE_TOML = "rm_inference.toml"
+
+
+def make_gpu_env(gpu_ids: list[int]) -> dict[str, str]:
+    """Return env vars that restrict a subprocess to the given physical GPU IDs.
+
+    On ROCm, ROCR_VISIBLE_DEVICES selects physical GPUs and re-indexes them starting
+    from 0, so CUDA_VISIBLE_DEVICES must use local indices. On NVIDIA,
+    ROCR_VISIBLE_DEVICES is ignored and CUDA_VISIBLE_DEVICES takes physical IDs directly.
+    """
+    physical = ",".join(map(str, gpu_ids))
+    local = ",".join(map(str, range(len(gpu_ids))))
+    if os.path.exists("/dev/kfd"):  # ROCm driver present
+        return {"ROCR_VISIBLE_DEVICES": physical, "CUDA_VISIBLE_DEVICES": local}
+    return {"CUDA_VISIBLE_DEVICES": physical}
 
 
 def get_physical_gpu_ids() -> list[int]:
@@ -83,6 +98,10 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
         with open(output_dir / INFERENCE_TOML, "wb") as f:
             tomli_w.dump(to_toml_dict(config.inference, exclude=exclude_inference), f)
 
+    if config.rm_inference is not None:
+        with open(output_dir / RM_INFERENCE_TOML, "wb") as f:
+            tomli_w.dump(to_toml_dict(config.rm_inference), f)
+
 
 def rl_local(config: RLConfig):
     assert config.deployment.type == "single_node"
@@ -91,6 +110,32 @@ def rl_local(config: RLConfig):
         config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"),
         json_logging=config.log.json_logging,
     )
+
+    # Apply port offsets when PRIME_RL_PORT_BASE is set (for sharing a node between experiments).
+    # Without it, ports stay at their config defaults (8000, 8001, etc.).
+    from prime_rl.utils.utils import get_free_port
+    port_base_env = os.environ.get("PRIME_RL_PORT_BASE")
+    if port_base_env is not None:
+        offset = int(port_base_env) - 8000
+        if config.inference is not None:
+            infer_port = int(port_base_env)
+            config.inference.server.port = infer_port
+            config.inference.data_parallel_rpc_port = get_free_port()
+            config.orchestrator.model.client.base_url = [f"http://localhost:{infer_port}/v1"]
+            logger.info(f"Port override: inference server on port {infer_port}")
+        if config.rm_inference is not None:
+            rm_port = int(port_base_env) + 1
+            config.rm_inference.server.port = rm_port
+            logger.info(f"Port override: RM inference server on port {rm_port}")
+            rm_server_url = f"http://localhost:{rm_port}"
+            for env in config.orchestrator.train.env:
+                if env.args and "rm_server_url" in env.args:
+                    env.args["rm_server_url"] = rm_server_url
+        if config.trainer.weight_broadcast.type == "nccl":
+            nccl_port = 29501 + offset
+            config.trainer.weight_broadcast.port = nccl_port
+            config.orchestrator.weight_broadcast.port = nccl_port
+            logger.info(f"Port override: NCCL broadcast on port {nccl_port}")
 
     config_dir = config.output_dir / "configs"
     write_subconfigs(config, config_dir)
@@ -106,8 +151,11 @@ def rl_local(config: RLConfig):
     infer_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_infer_gpus))
     gpu_offset += num_infer_gpus
     trainer_local_gpu_ids = list(range(gpu_offset, gpu_offset + config.deployment.num_train_gpus))
+    gpu_offset += config.deployment.num_train_gpus
+    num_rm_gpus = config.deployment.num_rm_gpus or 0
+    rm_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_rm_gpus)) if num_rm_gpus > 0 else []
 
-    total_requested_gpus = num_infer_gpus + config.deployment.num_train_gpus
+    total_requested_gpus = num_infer_gpus + config.deployment.num_train_gpus + num_rm_gpus
     physical_gpu_ids = get_physical_gpu_ids()
     if total_requested_gpus > len(physical_gpu_ids):
         raise ValueError(
@@ -119,6 +167,7 @@ def rl_local(config: RLConfig):
 
     infer_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in infer_local_gpu_ids]
     trainer_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in trainer_local_gpu_ids]
+    rm_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in rm_local_gpu_ids]
 
     start_command = sys.argv
     logger.info("Starting RL run")
@@ -181,7 +230,7 @@ def rl_local(config: RLConfig):
                         **DEFAULT_INFERENCE_ENV_VARS,
                         **config.env_vars,
                         **config.inference.env_vars,
-                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, infer_gpu_ids)),
+                        **make_gpu_env(infer_gpu_ids),
                     },
                     stdout=log_file,
                     stderr=log_file,
@@ -198,6 +247,25 @@ def rl_local(config: RLConfig):
             )
             monitor_thread.start()
             monitor_threads.append(monitor_thread)
+
+            # Wait for policy inference server to become healthy before starting trainer
+            import urllib.request
+            infer_port = config.inference.server.port
+            infer_health_url = f"http://localhost:{infer_port}/health"
+            logger.info(f"Waiting for policy inference server on port {infer_port}...")
+            for attempt in range(600):
+                try:
+                    with urllib.request.urlopen(infer_health_url, timeout=2) as resp:
+                        if resp.status == 200:
+                            break
+                except Exception:
+                    pass
+                if inference_process.poll() is not None:
+                    raise RuntimeError(f"Policy inference server exited early (code {inference_process.returncode})")
+                time.sleep(2)
+            else:
+                raise RuntimeError("Policy inference server did not become healthy within 1200s")
+            logger.success("Policy inference server ready.")
         else:
             logger.warning(
                 "No [inference] block configured - the policy inference server will not be started here. "
@@ -206,6 +274,62 @@ def rl_local(config: RLConfig):
                 f"({', '.join(config.orchestrator.model.client.base_url)}), otherwise the orchestrator "
                 "will hang waiting for it."
             )
+
+        # Optionally, start reward model inference process
+        if config.rm_inference:
+            if not rm_gpu_ids:
+                raise ValueError(
+                    "rm_inference is configured but deployment.num_rm_gpus is not set. "
+                    "Either set deployment.num_rm_gpus to start an RM inference server, "
+                    "or omit rm_inference and start the server manually."
+                )
+            rm_inference_cmd = ["inference", "@", (config_dir / RM_INFERENCE_TOML).as_posix()]
+            logger.info(f"Starting RM inference on GPU(s) {' '.join(map(str, rm_gpu_ids))}")
+            logger.debug(f"RM inference start command: {' '.join(rm_inference_cmd)}")
+            with open(log_dir / "rm_inference.log", "w") as log_file:
+                rm_inference_process = Popen(
+                    rm_inference_cmd,
+                    env={
+                        **os.environ,
+                        **DEFAULT_COMMON_ENV_VARS,
+                        **DEFAULT_INFERENCE_ENV_VARS,
+                        **config.env_vars,
+                        **config.rm_inference.env_vars,
+                        **make_gpu_env(rm_gpu_ids),
+                    },
+                    stdout=log_file,
+                    stderr=log_file,
+                )
+            processes.append(rm_inference_process)
+
+            stop_event = Event()
+            stop_events["rm_inference"] = stop_event
+            monitor_thread = Thread(
+                target=monitor_process,
+                args=(rm_inference_process, stop_event, error_queue, "rm_inference"),
+                daemon=True,
+            )
+            monitor_thread.start()
+            monitor_threads.append(monitor_thread)
+
+            # Wait for RM server to become healthy before starting orchestrator
+            import urllib.request
+            rm_port = config.rm_inference.server.port
+            rm_health_url = f"http://localhost:{rm_port}/health"
+            logger.info(f"Waiting for RM inference server on port {rm_port}...")
+            for attempt in range(600):
+                try:
+                    with urllib.request.urlopen(rm_health_url, timeout=2) as resp:
+                        if resp.status == 200:
+                            break
+                except Exception:
+                    pass
+                if rm_inference_process.poll() is not None:
+                    raise RuntimeError(f"RM inference server exited early (code {rm_inference_process.returncode})")
+                time.sleep(2)
+            else:
+                raise RuntimeError("RM inference server did not become healthy within 1200s")
+            logger.success("RM inference server ready.")
 
         frozen_endpoints: list[str] = []
         for env in config.orchestrator.train.env:
@@ -290,7 +414,7 @@ def rl_local(config: RLConfig):
                     **config.trainer.env_vars,
                     **wandb_shared_env,
                     "WANDB_SHARED_LABEL": "trainer",
-                    "CUDA_VISIBLE_DEVICES": ",".join(map(str, trainer_gpu_ids)),
+                    **make_gpu_env(trainer_gpu_ids),
                 },
                 stdout=log_file,
                 stderr=log_file,

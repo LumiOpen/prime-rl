@@ -160,6 +160,9 @@ class EnvConfig(vf.EnvServerConfig):
     ratio: float = Field(1.0, gt=0)
     """Sampling weight for this environment in the buffer. Relative weights are normalized to probabilities across envs (e.g. [1, 1] and [0.5, 0.5] are equivalent). Defaults to 1, i.e. equal weight per env."""
 
+    reward_weight: float = Field(1.0, gt=0)
+    """Scalar multiplier applied to the reward before advantage computation. Scales gradient magnitude for this env's rollouts relative to others. Defaults to 1.0 (no scaling)."""
+
     @model_validator(mode="before")
     @classmethod
     def _migrate_num_workers(cls, data):

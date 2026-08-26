@@ -104,6 +104,7 @@ def load_environment(
     num_train_examples: int = -1,
     num_eval_examples: int = -1,
     system_prompt: str | None = SYSTEM_PROMPT_FI,
+    language_reward_weight: float = 0.0,
     **kwargs,
 ) -> vf.Environment:
     """Build and return the Finnish Dolci IFEval verifiers environment.
@@ -139,12 +140,13 @@ def load_environment(
             ds = ds.select(range(num_eval_examples))
         return _to_verifiers_format_fi(ds)
 
-    def ifeval_reward_func_fi(completion: list[dict], answer: str, **kwargs) -> float:
+    def ifeval_reward_func_fi(completion: list[dict], answer: str, state=None, **kwargs) -> float:
         """Reward: fraction of IFEval constraints the Finnish response satisfies."""
         assistant_messages = [m for m in completion if m.get("role") == "assistant"]
         if not assistant_messages:
             return 0.0
-        response = assistant_messages[-1].get("content", "")
+        raw_response = assistant_messages[-1].get("content") or ""
+        response = _remove_thinking_section(raw_response)
         score = _check_constraints_fi(response, answer)
         if random.random() < _LOG_SAMPLE_RATE:
             try:
@@ -183,6 +185,22 @@ def load_environment(
                 f"  score: {score:.4f}  constraints: {sum(r.startswith('PASS') for r in results)}/{len(results)}\n"
                 + "\n".join(f"    {r}" for r in results)
             )
+
+        # Multiply by language consistency score
+        try:
+            from language_reward import compute_language_score
+            prompt = kwargs.get("prompt", [])
+            question = prompt[-1].get("content", "") if prompt else ""
+            lang_score = compute_language_score(question, _remove_thinking_section(response))
+            if state is not None:
+                existing = state.get("metrics") or {}
+                existing["language_score"] = lang_score
+                state["metrics"] = existing
+            if language_reward_weight > 0.0:
+                score = score * (1.0 - language_reward_weight + language_reward_weight * lang_score)
+        except Exception:
+            pass
+
         return score
 
     rubric = vf.Rubric(funcs=[ifeval_reward_func_fi])

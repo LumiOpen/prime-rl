@@ -54,6 +54,7 @@ def load_environment(
     num_train_examples: int = -1,
     num_eval_examples: int = -1,
     system_prompt: str | None = SYSTEM_PROMPT,
+    language_reward_weight: float = 0.0,
     **kwargs,
 ) -> vf.Environment:
     """Build and return the Dolci IFEval verifiers environment.
@@ -90,50 +91,87 @@ def load_environment(
             ds = ds.select(range(num_eval_examples))
         return _to_verifiers_format(ds)
 
-    def ifeval_reward_func(completion: list[dict], answer: str, **kwargs) -> float:
-        """Reward: fraction of IFEval constraints the response satisfies."""
+    def _parse_constraint_dict(answer: str) -> dict:
+        try:
+            cd = ast.literal_eval(answer)
+        except (ValueError, SyntaxError):
+            cd = json.loads(answer)
+        cd = cd[0]
+        if isinstance(cd, str):
+            try:
+                cd = json.loads(cd)
+            except json.JSONDecodeError:
+                cd = ast.literal_eval(cd)
+            if isinstance(cd, list):
+                cd = cd[0]
+        return cd
+
+    def _eval_constraints(response: str, answer: str) -> dict[str, bool]:
+        """Return {instruction_id: passed} for every constraint in the answer."""
+        answer_text = strip_think_blocks(response)
+        try:
+            constraint_dict = _parse_constraint_dict(answer)
+        except Exception:
+            return {}
+        instruction_keys = constraint_dict.get("instruction_id", [])
+        args_list = constraint_dict.get("kwargs", [])
+        results = {}
+        for iid, args in zip(instruction_keys, args_list):
+            if args is None:
+                args = {}
+            args = {k: v for k, v in args.items() if v is not None}
+            try:
+                instance = INSTRUCTION_DICT[iid](iid)
+                instance.build_description(**args)
+                passed = bool(instance.check_following(answer_text))
+            except Exception:
+                passed = False
+            results[iid] = passed
+        return results
+
+    def ifeval_reward_func(completion: list[dict], answer: str, state=None, **kwargs) -> float:
+        """Reward: fraction of IFEval constraints satisfied, with per-constraint metrics in state."""
         assistant_messages = [m for m in completion if m.get("role") == "assistant"]
         if not assistant_messages:
             return 0.0
-        response = assistant_messages[-1].get("content", "")
+        raw_response = assistant_messages[-1].get("content") or ""
+        response = strip_think_blocks(raw_response)
         score = _check_constraints(response, answer)
+        per_constraint = _eval_constraints(response, answer)
+
+        # Write per-constraint pass rates into state metrics so they flow to W&B
+        if state is not None and per_constraint:
+            existing = state.get("metrics") or {}
+            existing.update({f"ifeval/{iid}": float(passed) for iid, passed in per_constraint.items()})
+            state["metrics"] = existing
+
         if random.random() < _LOG_SAMPLE_RATE:
-            try:
-                constraint_dict = ast.literal_eval(answer)
-            except (ValueError, SyntaxError):
-                constraint_dict = json.loads(answer)
-            constraint_dict = constraint_dict[0]
-            if isinstance(constraint_dict, str):
-                try:
-                    constraint_dict = json.loads(constraint_dict)
-                except json.JSONDecodeError:
-                    constraint_dict = ast.literal_eval(constraint_dict)
-                if isinstance(constraint_dict, list):
-                    constraint_dict = constraint_dict[0]
-            answer_text = strip_think_blocks(response)
-            instruction_keys = constraint_dict.get("instruction_id", [])
-            args_list = constraint_dict.get("kwargs", [])
-            results = []
-            for iid, args in zip(instruction_keys, args_list):
-                if args is None:
-                    args = {}
-                args = {k: v for k, v in args.items() if v is not None}
-                try:
-                    instance = INSTRUCTION_DICT[iid](iid)
-                    instance.build_description(**args)
-                    passed = bool(instance.check_following(answer_text))
-                except Exception:
-                    passed = False
-                results.append(f"{'PASS' if passed else 'FAIL'} {iid}")
             prompt = kwargs.get("prompt", [])
             prompt_text = prompt[-1].get("content", "") if prompt else ""
+            results = [f"{'PASS' if p else 'FAIL'} {iid}" for iid, p in per_constraint.items()]
             logger.info(
                 "IFEval (en) sample\n"
                 f"  prompt ({len(prompt_text)} chars): {prompt_text[:200]!r}\n"
                 f"  response ({len(response)} chars): {response[:300]!r}\n"
-                f"  score: {score:.4f}  constraints: {sum(r.startswith('PASS') for r in results)}/{len(results)}\n"
+                f"  score: {score:.4f}  constraints: {sum(p for p in per_constraint.values())}/{len(per_constraint)}\n"
                 + "\n".join(f"    {r}" for r in results)
             )
+
+        # Multiply by language consistency score
+        try:
+            from language_reward import compute_language_score
+            prompt = kwargs.get("prompt", [])
+            question = prompt[-1].get("content", "") if prompt else ""
+            lang_score = compute_language_score(question, strip_think_blocks(response))
+            if state is not None:
+                existing = state.get("metrics") or {}
+                existing["language_score"] = lang_score
+                state["metrics"] = existing
+            if language_reward_weight > 0.0:
+                score = score * (1.0 - language_reward_weight + language_reward_weight * lang_score)
+        except Exception:
+            pass
+
         return score
 
     rubric = vf.Rubric(funcs=[ifeval_reward_func])

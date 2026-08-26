@@ -60,7 +60,7 @@ class Stat:
         return self.percentile(90)
 
     def to_dict(self, prefix: str) -> dict[str, float]:
-        """``{prefix}/mean,std,max,min,p10,p90``; ``{}`` for an empty distribution."""
+        """``{prefix}/mean,std,max,min``; ``{}`` for an empty distribution."""
         if not self.values:
             return {}
         return {
@@ -68,8 +68,6 @@ class Stat:
             f"{prefix}/std": self.std(),
             f"{prefix}/max": self.max(),
             f"{prefix}/min": self.min(),
-            f"{prefix}/p10": self.p10(),
-            f"{prefix}/p90": self.p90(),
         }
 
 

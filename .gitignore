@@ -5,6 +5,9 @@
 *.jsonl
 configs/endpoints.py
 
+# fastText language ID model (downloaded automatically on first use, too large for git)
+lid.176.bin
+
 # Artifacts
 **/slurm
 !src/prime_rl/slurm
