@@ -17,7 +17,7 @@ import json
 import logging
 import random
 
-from ifeval_env.env import SYSTEM_PROMPT, _check_constraints
+from ifeval_env.env import SYSTEM_PROMPT, _check_constraints, is_unterminated
 from ifeval_env.IFEvalG.instructions_registry import INSTRUCTION_DICT
 
 import verifiers as vf
@@ -54,6 +54,7 @@ def load_environment(
     num_train_examples: int = -1,
     num_eval_examples: int = -1,
     system_prompt: str | None = SYSTEM_PROMPT,
+    reasoning_model: bool = True,
     **kwargs,
 ) -> vf.Environment:
     """Build and return the Dolci IFEval verifiers environment.
@@ -64,6 +65,10 @@ def load_environment(
         num_train_examples: Subset size for training (-1 = full split).
         num_eval_examples: Subset size for eval (-1 = full split).
         system_prompt: System message prepended to every prompt. Pass None or "" to disable.
+        reasoning_model: Whether the policy emits <think> blocks. When True, a
+            response that never closes its block scores 0 instead of having the
+            reasoning trace graded as the answer. Set False for a model that
+            does not reason, otherwise every rollout scores 0.
         **kwargs: Forwarded to SingleTurnEnv.
     """
     system_prompt = system_prompt or None
@@ -90,12 +95,17 @@ def load_environment(
             ds = ds.select(range(num_eval_examples))
         return _to_verifiers_format(ds)
 
-    def ifeval_reward_func(completion: list[dict], answer: str, **kwargs) -> float:
+    def ifeval_reward_func(
+        completion: list[dict], answer: str, state: dict | None = None, **kwargs
+    ) -> float:
         """Reward: fraction of IFEval constraints the response satisfies."""
         assistant_messages = [m for m in completion if m.get("role") == "assistant"]
         if not assistant_messages:
             return 0.0
-        response = assistant_messages[-1].get("content", "")
+        message = assistant_messages[-1]
+        if is_unterminated(message, state, reasoning_model):
+            return 0.0
+        response = message.get("content", "")
         score = _check_constraints(response, answer)
         if random.random() < _LOG_SAMPLE_RATE:
             try:

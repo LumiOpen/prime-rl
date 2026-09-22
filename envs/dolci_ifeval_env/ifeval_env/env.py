@@ -43,6 +43,46 @@ def _remove_thinking_section(text: str) -> str:
     return text.strip()
 
 
+def _has_closed_reasoning(message: dict) -> bool:
+    """Whether the assistant message carries a *closed* reasoning block.
+
+    Two shapes reach the reward function. Under prime-rl's renderer the parser
+    splits the block off into ``reasoning_content`` and leaves only the final
+    answer in ``content``; against a plain chat endpoint the raw ``</think>``
+    survives inside ``content``. Either one proves the model stopped reasoning.
+
+    A response consisting of an empty ``<think></think>`` is reported by the
+    parser as having no reasoning at all, so it reads as unterminated here. The
+    parser cannot distinguish it from a block that was never closed, and such a
+    response is degenerate either way.
+    """
+    if message.get("reasoning_content"):
+        return True
+    return "</think>" in (message.get("content") or "")
+
+
+def is_unterminated(message: dict, state: dict | None, reasoning_model: bool) -> bool:
+    """Whether *message* failed to produce a final answer and must score 0.
+
+    Two failure modes, both of which otherwise collect partial credit:
+
+    1. The rollout ran into the token cap (``state["is_truncated"]``). Applies
+       to every model — an answer cut off mid-word is not an answer.
+    2. A reasoning model never closed its ``<think>`` block. The parser only
+       splits ``reasoning_content`` off when it finds ``</think>``; with no tag
+       at all the entire reasoning trace is handed back as ``content`` and the
+       constraint checkers grade the trace. Format constraints such as "no
+       commas" or "respond in all lowercase" are trivially satisfied by a
+       rambling trace, so scoring it rewards non-termination directly.
+
+    Non-reasoning models never emit ``</think>``, hence the ``reasoning_model``
+    flag: check 2 would zero every one of their rollouts.
+    """
+    if state is not None and state.get("is_truncated"):
+        return True
+    return reasoning_model and not _has_closed_reasoning(message)
+
+
 def _check_constraints(response: str, label: str) -> float:
     """Return the fraction of IFEval constraints satisfied by *response*.
 
@@ -123,6 +163,7 @@ def load_environment(
     num_train_examples: int = -1,
     num_eval_examples: int = -1,
     system_prompt: str | None = SYSTEM_PROMPT,
+    reasoning_model: bool = True,
     **kwargs,
 ) -> vf.Environment:
     """Build and return the IFEval verifiers environment.
@@ -133,6 +174,10 @@ def load_environment(
         num_train_examples: Subset size for training (-1 = full split).
         num_eval_examples: Subset size for eval (-1 = full split).
         system_prompt: System message prepended to every prompt. Pass None or "" to disable.
+        reasoning_model: Whether the policy emits <think> blocks. When True, a
+            response that never closes its block scores 0 instead of having the
+            reasoning trace graded as the answer. Set False for a model that
+            does not reason, otherwise every rollout scores 0.
         **kwargs: Forwarded to SingleTurnEnv.
     """
     system_prompt = system_prompt or None
@@ -157,13 +202,17 @@ def load_environment(
             ds = ds.select(range(num_eval_examples))
         return _to_verifiers_format(ds)
 
-    def ifeval_reward_func(completion: list[dict], answer: str, **_kwargs) -> float:
+    def ifeval_reward_func(
+        completion: list[dict], answer: str, state: dict | None = None, **_kwargs
+    ) -> float:
         """Reward: fraction of IFEval constraints the response satisfies."""
         assistant_messages = [m for m in completion if m.get("role") == "assistant"]
         if not assistant_messages:
             return 0.0
-        response = assistant_messages[-1].get("content", "")
-        return _check_constraints(response, answer)
+        message = assistant_messages[-1]
+        if is_unterminated(message, state, reasoning_model):
+            return 0.0
+        return _check_constraints(message.get("content", ""), answer)
 
     rubric = vf.Rubric(funcs=[ifeval_reward_func])
 

@@ -105,6 +105,15 @@ TRAINER_ATTN=${TRAINER_ATTN:-flash_attention_2}
 TRAINER_MODEL_IMPL=${TRAINER_MODEL_IMPL:-hf}
 RENDERER=${RENDERER:-qwen3.5}
 
+# ── Reasoning policy ──
+# The IF env grades the model's final answer. When the policy never closes its
+# <think> block the parser hands back the whole reasoning trace as the answer,
+# and format constraints ("no commas", "all lowercase") happily pass on a
+# rambling trace — rewarding non-termination. Setting this scores those
+# rollouts 0. Set to 0 for a non-reasoning policy, which never emits </think>
+# and would otherwise score 0 on every rollout.
+REASONING_MODEL=${REASONING_MODEL:-1}
+
 PORT=8000
 RM_PORT=8001
 TRAINER_RDZV_PORT=29501
@@ -244,11 +253,12 @@ cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
 [[train.env]]
 id = "dolci-ifeval-env"
 name = "ifeval-en"
+
+[train.env.args]
+reasoning_model = $(if [ "$REASONING_MODEL" = "1" ]; then echo true; else echo false; fi)
 TOMLEOF
 if [ "${NO_SYSTEM_PROMPT:-0}" = "1" ]; then
 cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
-
-[train.env.args]
 system_prompt = ""
 TOMLEOF
 fi
