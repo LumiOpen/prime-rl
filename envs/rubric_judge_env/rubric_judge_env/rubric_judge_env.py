@@ -114,6 +114,40 @@ _FI_ROLE = {
     "assistentti": "assistant",
 }
 
+# ~3% of Dolci rows carry a task system prompt *inside* the first user turn,
+# as "user: System: <instructions>".  The marker sits mid-line, so _TURN_RE
+# never sees it and the instructions would be delivered as user text.
+_SYSTEM_MARKER_RE = re.compile(
+    r"""^[\s"'*#>-]*(?:system|järjestelmä|instructions?|ohjeet)\s*:\s*""",
+    re.IGNORECASE,
+)
+
+_JUDGE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant"}
+
+
+def _normalize_messages(messages: list[dict]) -> list[dict]:
+    """Promote a leading system block, drop empty turns, merge adjacent same-role turns.
+
+    A bare trailing "Assistant:" cue parses into an empty message, which makes the
+    chat template emit an empty assistant turn before the generation turn.
+    """
+    # Only promote when something follows it — otherwise the whole prompt would
+    # become a system message with nothing for the model to answer.
+    if any(m["content"] for m in messages[1:]):
+        marker = _SYSTEM_MARKER_RE.match(messages[0]["content"])
+        if marker:
+            messages[0] = {"role": "system", "content": messages[0]["content"][marker.end() :].strip()}
+
+    merged: list[dict] = []
+    for m in messages:
+        if not m["content"]:
+            continue
+        if merged and merged[-1]["role"] == m["role"]:
+            merged[-1]["content"] += "\n\n" + m["content"]
+        else:
+            merged.append(dict(m))
+    return merged
+
 
 def _parse_prompt(prompt_text: str) -> list[dict]:
     """Parse a prompt string into a list of role/content message dicts.
@@ -123,7 +157,7 @@ def _parse_prompt(prompt_text: str) -> list[dict]:
     """
     matches = list(_TURN_RE.finditer(prompt_text))
     if not matches:
-        return [{"role": "user", "content": prompt_text.strip()}]
+        return _normalize_messages([{"role": "user", "content": prompt_text.strip()}])
     messages = []
     for i, m in enumerate(matches):
         role_raw = m.group(1).lower()
@@ -132,16 +166,12 @@ def _parse_prompt(prompt_text: str) -> list[dict]:
         end = matches[i + 1].start() if i + 1 < len(matches) else len(prompt_text)
         content = prompt_text[start:end].strip()
         messages.append({"role": role, "content": content})
-    return messages
+    return _normalize_messages(messages)
 
 
 def _format_dialog_for_judge(messages: list[dict]) -> str:
     """Format a message list as a readable dialog string for the judge prompt."""
-    parts = []
-    for m in messages:
-        label = "User" if m["role"] == "user" else "Assistant"
-        parts.append(f"{label}: {m['content']}")
-    return "\n\n".join(parts)
+    return "\n\n".join(f"{_JUDGE_LABELS[m['role']]}: {m['content']}" for m in messages)
 
 
 def _build_example(row: dict) -> dict | None:
