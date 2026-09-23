@@ -250,6 +250,8 @@ def load_environment(
                                 style needs max_judge_tokens >= ~256 to fit its reasoning.
         max_judge_tokens:       Max tokens the judge may generate (default: 512).
         judge_temperature:      Sampling temperature for the judge (default: 0.0 = greedy).
+                                Applies to the first attempt; retries after an unparseable
+                                answer sample, since a greedy retry replays it verbatim.
     """
     system_prompt = system_prompt or None
 

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import random
@@ -8,6 +9,17 @@ import verifiers as vf
 logger = logging.getLogger("verifiers")
 
 _LOG_SAMPLE_RATE = 0.01  # log ~1% of scored examples
+
+# Every rollout in the batch hits the judge at once, so a single request can sit behind
+# hundreds of others. aiohttp's default ClientTimeout is 300s total, which under load
+# turned into asyncio.TimeoutError — whose str() is empty, so verifiers logged a bare
+# "Error calling reward function llm_judge_score: " and scored the rollout 0.0.
+_JUDGE_TIMEOUT_S = 1800.0
+_JUDGE_MAX_ATTEMPTS = 3  # matches open_instruct.ground_truth_utils.LMJudgeVerifier
+_JUDGE_RETRY_DELAY_S = 1.0
+# Retrying an unparseable answer at temperature 0 replays it verbatim, so format retries
+# have to sample. Transport retries reuse the configured temperature.
+_JUDGE_RETRY_TEMPERATURE = 0.7
 
 _GENERAL_CATEGORIES = {"general-quality", "general-quality_ref"}
 
@@ -121,6 +133,19 @@ _JUDGE_STYLES = {
 }
 
 
+class JudgeRequestError(RuntimeError):
+    """Non-2xx response from the judge server.
+
+    ``retryable`` separates transient overload (429, 5xx) from a request the server will
+    reject however often we send it (e.g. an unsupported sampling argument).
+    """
+
+    def __init__(self, url: str, status: int, body: str):
+        super().__init__(f"Judge server {url} returned {status}: {body[:200]}")
+        self.status = status
+        self.retryable = status == 429 or status >= 500
+
+
 def _extract_json_score(text: str) -> float | None:
     """Port of open_instruct.judge_utils.extract_json_score_with_fallback.
 
@@ -141,6 +166,26 @@ def _extract_json_score(text: str) -> float | None:
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         match = re.search(r'"SCORE"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?', cleaned)
         return float(match.group(1)) if match else None
+
+
+def _parse_score_legacy(text: str) -> float | None:
+    """Raw 1-100 score from the score-first prompt, or None when nothing parses."""
+    first_line = text.strip().split("\n")[0]
+    # 1. Score-first format: "Score: N" on the first line (primary)
+    match = re.match(r"[Ss]core\s*:\s*(\d+)", first_line)
+    # 2. "Score: N" anywhere in text
+    if not match:
+        match = re.search(r"[Ss]core\s*:\s*(\d+)", text)
+    # 3. open-instruct format: {"SCORE": "7"} or {"SCORE": 7}
+    if not match:
+        match = re.search(r'"SCORE"\s*:\s*"?(\d+)"?', text)
+    # 4. "rating: N"
+    if not match:
+        match = re.search(r'[Rr]ating\s*:\s*(\d+)', text)
+    # 5. Last resort: leading number on first line
+    if not match:
+        match = re.match(r'(\d{1,3})\b', first_line)
+    return float(match.group(1)) if match else None
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -338,8 +383,13 @@ class LLMJudgeRubric(vf.Rubric):
       reasons first and answers in JSON with N in 1-10, so the reward is N / 10.
       Reasoning-first needs room: give ``max_judge_tokens`` at least ~256.
 
-    On parse failure the reward defaults to 0.0 so that malformed judge output
-    does not silently inflate rewards.
+    A judgement that cannot be obtained — the server timed out, was overloaded, or
+    answered in a format we cannot parse after ``_JUDGE_MAX_ATTEMPTS`` tries — marks the
+    rollout errored instead of scoring it 0.0. A fabricated 0.0 is indistinguishable from
+    a genuinely bad answer, and on the 1-10 scale it is not even reachable (the floor is
+    0.1), so it drags the whole GRPO group baseline down and manufactures advantage.
+    prime-rl drops errored rollouts from the batch and reports the rate as
+    ``all/has_error/mean`` plus ``all/error/<type>`` counts.
     """
 
     def __init__(
@@ -347,7 +397,7 @@ class LLMJudgeRubric(vf.Rubric):
         judge_model_path: str,
         judge_server_url: str,
         judge_prompt_template: str | None = None,
-        max_judge_tokens: int = 1024,
+        max_judge_tokens: int = 512,
         judge_temperature: float = 0.0,
         judge_prompt_style: str = "legacy",
     ):
@@ -384,16 +434,18 @@ class LLMJudgeRubric(vf.Rubric):
             return self._judge_ref_template.format(question=question, answer=answer, reference=reference)
         return self._judge_prompt_template.format(question=question, answer=answer)
 
-    async def _call_judge(self, question: str, answer: str, reference: str = "", category: str = "") -> str:
+    async def _call_judge(self, question: str, answer: str, reference: str, category: str, temperature: float) -> str:
         import aiohttp
         if self._session is None:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=_JUDGE_TIMEOUT_S)
+            )
         user_content = self._render_prompt(question, answer, reference, category)
         payload = {
             "model": self._judge_model,
             "messages": [{"role": "user", "content": user_content}],
             "max_tokens": self._max_judge_tokens,
-            "temperature": self._judge_temperature,
+            "temperature": temperature,
             # Disable Qwen3 thinking mode — without this the <think> block fills the
             # token budget before the model can emit "Score: N".
             "chat_template_kwargs": {"enable_thinking": False},
@@ -401,56 +453,85 @@ class LLMJudgeRubric(vf.Rubric):
         url = f"{self._judge_url}/v1/chat/completions"
         async with self._session.post(url, json=payload) as resp:
             if not resp.ok:
-                body = await resp.text()
-                raise RuntimeError(f"Judge server {url} returned {resp.status}: {body}")
+                raise JudgeRequestError(url, resp.status, await resp.text())
             data = await resp.json()
         return data["choices"][0]["message"]["content"]
 
-    def _parse_score_open_instruct(self, text: str) -> float:
-        raw = _extract_json_score(text)
+    async def _score_with_retries(
+        self, question: str, answer: str, reference: str, category: str
+    ) -> tuple[float | None, str, dict | None]:
+        """Judge one response, retrying transport failures and format drift alike.
+
+        Returns ``(score, last judge output, error)``. ``score`` is None exactly when
+        ``error`` is set — an error dict ready to assign to ``state["error"]``. Decoding
+        stays unconstrained (no guided JSON, no schema), matching open-instruct.
+        """
+        import aiohttp
+        last_output = ""
+        error: dict = {}
+        for attempt in range(_JUDGE_MAX_ATTEMPTS):
+            temperature = self._judge_temperature if attempt == 0 else _JUDGE_RETRY_TEMPERATURE
+            try:
+                last_output = await self._call_judge(question, answer, reference, category, temperature)
+            except JudgeRequestError as e:
+                error = {"type": "JudgeServerError", "message": str(e)}
+                if not e.retryable:
+                    # The server will reject the same request however often we send it.
+                    break
+            except (TimeoutError, aiohttp.ClientError) as e:
+                # asyncio.TimeoutError stringifies to "", so name the class explicitly.
+                error = {"type": "JudgeTimeout", "message": f"{type(e).__name__}: {e}"}
+            else:
+                score = self._parse_score(last_output)
+                if score is not None:
+                    return score, last_output, None
+                error = {
+                    "type": "JudgeParseFailure",
+                    "message": f"unparseable judge output: {last_output[:200]!r}",
+                }
+            if attempt < _JUDGE_MAX_ATTEMPTS - 1:
+                logger.warning(
+                    "LLM judge attempt %d/%d failed (%s); retrying",
+                    attempt + 1, _JUDGE_MAX_ATTEMPTS, error["message"][:200],
+                )
+                await asyncio.sleep(_JUDGE_RETRY_DELAY_S * 2**attempt)
+        return None, last_output, error
+
+    def _parse_score(self, text: str) -> float | None:
+        """Reward in [0, 1], or None when the judge's answer carries no usable score."""
+        if self._judge_prompt_style == "open-instruct":
+            raw = _extract_json_score(text)
+        else:
+            raw = _parse_score_legacy(text)
         if raw is None:
-            logger.warning("LLM judge: could not parse JSON score from output: %r", text[:200])
-            return 0.0
-        score = raw / self._score_scale
-        if not 0.0 <= score <= 1.0:
-            logger.warning("LLM judge: score %s is outside the 1-10 scale, clamping", raw)
-            score = max(0.0, min(1.0, score))
-        return score
+            return None
+        if not 1.0 <= raw <= self._score_scale:
+            logger.warning(
+                "LLM judge: raw score %s is outside the 1-%g scale, clamping", raw, self._score_scale
+            )
+            raw = max(1.0, min(self._score_scale, raw))
+        # Clamping to the bottom of the scale rather than to 0 keeps 0.0 unreachable, so a
+        # zero reward in the logs always means a dropped judgement.
+        return raw / self._score_scale
 
-    @staticmethod
-    def _parse_score(text: str) -> float:
-        # 1. Score-first format: "Score: N" on the first line (primary)
-        first_line = text.strip().split("\n")[0]
-        match = re.match(r"[Ss]core\s*:\s*(\d+)", first_line)
-        # 2. "Score: N" anywhere in text
-        if not match:
-            match = re.search(r"[Ss]core\s*:\s*(\d+)", text)
-        # 3. open-instruct format: {"SCORE": "7"} or {"SCORE": 7}
-        if not match:
-            match = re.search(r'"SCORE"\s*:\s*"?(\d+)"?', text)
-        # 4. "rating: N"
-        if not match:
-            match = re.search(r'[Rr]ating\s*:\s*(\d+)', text)
-        # 5. Last resort: leading number on first line
-        if not match:
-            match = re.match(r'(\d{1,3})\b', first_line)
-        if match:
-            raw = int(match.group(1))
-            # Always 1-100 scale as per the prompt
-            return max(1, min(100, raw)) / 100.0
-        logger.warning("LLM judge: could not parse score from output: %r", text[:200])
-        return 0.0
-
-    async def llm_judge_score(self, completion, answer, info: dict, **kwargs) -> float:
+    async def llm_judge_score(self, completion, answer, info: dict, state: dict, **kwargs) -> float:
         response_text = _extract_text(completion)
         question = info.get("prompt_text", "")
         reference = info.get("reference", "")
         category = info.get("category", "")
-        judge_output = await self._call_judge(question, response_text, reference=reference, category=category)
-        if self._judge_prompt_style == "open-instruct":
-            score = self._parse_score_open_instruct(judge_output)
-        else:
-            score = self._parse_score(judge_output)
+        score, judge_output, error = await self._score_with_retries(
+            question, response_text, reference, category
+        )
+        if score is None:
+            logger.error(
+                "LLM judge gave no usable score after %d attempts (%s) — dropping rollout",
+                _JUDGE_MAX_ATTEMPTS, error["message"][:300],
+            )
+            # prime-rl excludes errored rollouts from the batch and from the group's
+            # advantage baseline; the rate shows up as all/has_error/mean and
+            # all/error/<type> in wandb.
+            state["error"] = error
+            return 0.0
         if random.random() < _LOG_SAMPLE_RATE:
             logger.info(
                 "LLM judge sample\n"
