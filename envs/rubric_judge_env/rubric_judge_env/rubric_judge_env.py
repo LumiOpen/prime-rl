@@ -215,6 +215,7 @@ def load_environment(
     custom_rm: bool = False,
     judge_model_path: str | None = None,
     judge_prompt_template: str | None = None,
+    judge_prompt_style: str = "legacy",
     max_judge_tokens: int = 512,
     judge_temperature: float = 0.0,
     **kwargs,
@@ -241,8 +242,12 @@ def load_environment(
                                 The judge is served at rm_server_url (injected automatically).
         judge_model_path:       Path/name of the judge model as served by vLLM
                                 (must match --served-model-name).  Required when custom_rm=True.
-        judge_prompt_template:  Custom judge prompt with {question} and {answer} placeholders.
-                                Defaults to _DEFAULT_JUDGE_PROMPT.
+        judge_prompt_template:  Custom judge prompt, overriding the style's no-reference
+                                template.  Placeholders follow the chosen style.
+        judge_prompt_style:     "legacy" (our score-first plain-text prompt, 1-100 scale)
+                                or "open-instruct" (the verbatim open-instruct templates,
+                                reasoning-first JSON, 1-10 scale).  The open-instruct
+                                style needs max_judge_tokens >= ~256 to fit its reasoning.
         max_judge_tokens:       Max tokens the judge may generate (default: 512).
         judge_temperature:      Sampling temperature for the judge (default: 0.0 = greedy).
     """
@@ -304,11 +309,11 @@ def load_environment(
         return ds
 
     if custom_rm:
-        from .rubric import _DEFAULT_JUDGE_PROMPT
         rubric = LLMJudgeRubric(
             judge_model_path=judge_model_path,
             judge_server_url=rm_server_url,
-            judge_prompt_template=judge_prompt_template or _DEFAULT_JUDGE_PROMPT,
+            judge_prompt_template=judge_prompt_template,
+            judge_prompt_style=judge_prompt_style,
             max_judge_tokens=max_judge_tokens,
             judge_temperature=judge_temperature,
         )

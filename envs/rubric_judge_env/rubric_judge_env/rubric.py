@@ -1,3 +1,4 @@
+import json
 import logging
 import random
 import re
@@ -57,6 +58,89 @@ Score: <integer from 1 to 100>
 {reference}
 
 [Your judgement]"""
+
+# ---------------------------------------------------------------------------
+# open-instruct judge prompts, copied verbatim from
+# open_instruct/judge_utils.py (general_quality_template, general_quality_ref_template).
+# Their {input}/{output}/{label} placeholders and the doubled braces around the
+# JSON example are kept as-is so both frameworks send byte-identical text.
+# Scores are 1-10 and arrive JSON-encoded, reasoning first.
+# ---------------------------------------------------------------------------
+
+_OI_JUDGE_PROMPT = """
+### Task Description
+Please act as an impartial judge and evaluate the quality of the response provided by an
+AI assistant to the user query displayed below.
+
+Notes:
+- Your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
+- If there is a system prompt, ensure the AI answer prioritizes following it.
+- Begin your evaluation by providing a short explanation.
+- Be as objective as possible. After providing your short explanation, please output a score on a scale of 1 to 10.
+- Please adhere to the following format.
+
+[Conversation History]
+{input}
+
+[AI Answer]
+{output}
+
+[Your judgement]
+Respond in JSON format. {{"REASONING": "[...]", "SCORE": "<your-score>"}}"""
+
+_OI_JUDGE_PROMPT_WITH_REF = """
+### Task Description
+Please act as an impartial judge and evaluate the quality of the answer provided by an
+AI assistant to the conversation history leading up to the answer displayed below.
+Judge whether the provided answer is good by comparing it to the reference answer.
+
+Notes:
+- Besides comparing to the reference answer, your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
+- Note that sometimes the reference answer is not the only answer. So any valid variation of the reference answer is also acceptable and can get a full score.
+- If there is a system prompt, ensure the AI answer prioritizes following it.
+- Begin your evaluation by providing a short explanation.
+- Be as objective as possible. After providing your short explanation, please output a score on a scale of 1 to 10.
+- Please adhere to the following format.
+
+[Conversation History]
+{input}
+
+[AI Answer]
+{output}
+
+[Reference Gold Answer]
+{label}
+
+[Your judgement]
+Respond in JSON format. {{"REASONING": "[...]", "SCORE": "<your-score>"}}"""
+
+# style -> (no-reference prompt, with-reference prompt, score divisor)
+_JUDGE_STYLES = {
+    "legacy": (_DEFAULT_JUDGE_PROMPT, _JUDGE_PROMPT_WITH_REF, 100.0),
+    "open-instruct": (_OI_JUDGE_PROMPT, _OI_JUDGE_PROMPT_WITH_REF, 10.0),
+}
+
+
+def _extract_json_score(text: str) -> float | None:
+    """Port of open_instruct.judge_utils.extract_json_score_with_fallback.
+
+    Returns the raw (unscaled) score, or None when nothing parseable is found.
+    """
+    cleaned = text.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.replace("\r\n", "\n").replace("\n", "\\n")
+    cleaned = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", cleaned).strip()
+
+    try:
+        return float(json.loads(cleaned)["SCORE"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        match = re.search(r'"SCORE"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?', cleaned)
+        return float(match.group(1)) if match else None
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -246,38 +330,65 @@ class LLMJudgeRubric(vf.Rubric):
     ``[rm_inference]`` (``judge_server_url`` is injected automatically from
     ``rm_server_url`` by ``load_environment`` when ``custom_rm=True``).
 
-    The judge receives a structured prompt containing the original question and
-    the policy's answer and must emit a line matching ``Score: N`` (N in 1-10).
-    The reward is normalised to ``[0, 1]`` by dividing by 10.  On parse failure
-    the reward defaults to 0.0 so that malformed judge output does not silently
-    inflate rewards.
+    Two prompt styles are available, selected with ``judge_prompt_style``:
+
+    - ``"legacy"`` (default): our own score-first plain-text prompt.  The judge
+      emits ``Score: N`` with N in 1-100 and the reward is N / 100.
+    - ``"open-instruct"``: the verbatim open-instruct templates.  The judge
+      reasons first and answers in JSON with N in 1-10, so the reward is N / 10.
+      Reasoning-first needs room: give ``max_judge_tokens`` at least ~256.
+
+    On parse failure the reward defaults to 0.0 so that malformed judge output
+    does not silently inflate rewards.
     """
 
     def __init__(
         self,
         judge_model_path: str,
         judge_server_url: str,
-        judge_prompt_template: str = _DEFAULT_JUDGE_PROMPT,
+        judge_prompt_template: str | None = None,
         max_judge_tokens: int = 1024,
         judge_temperature: float = 0.0,
+        judge_prompt_style: str = "legacy",
     ):
         super().__init__()
+        if judge_prompt_style not in _JUDGE_STYLES:
+            raise ValueError(
+                f"Unknown judge_prompt_style={judge_prompt_style!r}. Choose one of {sorted(_JUDGE_STYLES)}."
+            )
+        default_prompt, ref_prompt, scale = _JUDGE_STYLES[judge_prompt_style]
         self._judge_model = judge_model_path
         self._judge_url = judge_server_url.rstrip("/")
-        self._judge_prompt_template = judge_prompt_template
+        self._judge_prompt_style = judge_prompt_style
+        self._judge_prompt_template = judge_prompt_template or default_prompt
+        self._judge_ref_template = ref_prompt
+        self._score_scale = scale
         self._max_judge_tokens = max_judge_tokens
         self._judge_temperature = judge_temperature
         self._session = None
+        if judge_prompt_style == "open-instruct" and max_judge_tokens < 256:
+            logger.warning(
+                "judge_prompt_style='open-instruct' reasons before scoring, but max_judge_tokens=%d. "
+                "The budget will likely run out before the JSON score is emitted.",
+                max_judge_tokens,
+            )
         self.add_reward_func(self.llm_judge_score)
+
+    def _render_prompt(self, question: str, answer: str, reference: str, category: str) -> str:
+        use_ref = category == "general-quality_ref" and reference
+        if self._judge_prompt_style == "open-instruct":
+            if use_ref:
+                return self._judge_ref_template.format(input=question, output=answer, label=reference)
+            return self._judge_prompt_template.format(input=question, output=answer)
+        if use_ref:
+            return self._judge_ref_template.format(question=question, answer=answer, reference=reference)
+        return self._judge_prompt_template.format(question=question, answer=answer)
 
     async def _call_judge(self, question: str, answer: str, reference: str = "", category: str = "") -> str:
         import aiohttp
         if self._session is None:
             self._session = aiohttp.ClientSession()
-        if category == "general-quality_ref" and reference:
-            user_content = _JUDGE_PROMPT_WITH_REF.format(question=question, answer=answer, reference=reference)
-        else:
-            user_content = self._judge_prompt_template.format(question=question, answer=answer)
+        user_content = self._render_prompt(question, answer, reference, category)
         payload = {
             "model": self._judge_model,
             "messages": [{"role": "user", "content": user_content}],
@@ -294,6 +405,17 @@ class LLMJudgeRubric(vf.Rubric):
                 raise RuntimeError(f"Judge server {url} returned {resp.status}: {body}")
             data = await resp.json()
         return data["choices"][0]["message"]["content"]
+
+    def _parse_score_open_instruct(self, text: str) -> float:
+        raw = _extract_json_score(text)
+        if raw is None:
+            logger.warning("LLM judge: could not parse JSON score from output: %r", text[:200])
+            return 0.0
+        score = raw / self._score_scale
+        if not 0.0 <= score <= 1.0:
+            logger.warning("LLM judge: score %s is outside the 1-10 scale, clamping", raw)
+            score = max(0.0, min(1.0, score))
+        return score
 
     @staticmethod
     def _parse_score(text: str) -> float:
@@ -325,7 +447,10 @@ class LLMJudgeRubric(vf.Rubric):
         reference = info.get("reference", "")
         category = info.get("category", "")
         judge_output = await self._call_judge(question, response_text, reference=reference, category=category)
-        score = self._parse_score(judge_output)
+        if self._judge_prompt_style == "open-instruct":
+            score = self._parse_score_open_instruct(judge_output)
+        else:
+            score = self._parse_score(judge_output)
         if random.random() < _LOG_SAMPLE_RATE:
             logger.info(
                 "LLM judge sample\n"
