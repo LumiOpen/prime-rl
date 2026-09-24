@@ -86,24 +86,79 @@ INF_SEQ_LEN=${INF_SEQ_LEN:-4096}
 RM_SEQ_LEN=${RM_SEQ_LEN:-32768}
 MAX_TOKENS=${MAX_TOKENS:-2048}
 BATCH_SIZE=${BATCH_SIZE:-128}
+# Hard cap on tokens spent inside <think>. vLLM injects </think> at the budget, so
+# the rollout always gets to write an answer instead of hitting MAX_TOKENS mid-thought.
+# Leave MAX_TOKENS - THINKING_BUDGET as answer headroom.
+#
+# extra_body lands in the request's sampling_params, so every key must be a real
+# SamplingParams field. chat_template_kwargs is NOT one — and it would be pointless
+# here anyway: /inference/v1/generate is tokens-in, the renderer builds the prompt
+# client-side, so there is no server-side chat template to configure.
+#
+# vLLM rejects thinking_token_budget outright unless the server was started with a
+# reasoning parser (v1/engine/input_processor.py:102). prime-rl resolves the parser by
+# regex on the model NAME, and we stage checkpoints at models/job_<id>_model, which
+# matches nothing — so it must be named explicitly. Gated on THINKING_BUDGET because no
+# other run has ever served with a parser and we don't want to change them silently.
+THINKING_BUDGET=${THINKING_BUDGET:-}
+REASONING_PARSER=${REASONING_PARSER:-qwen3}
+# max_inflight_rollouts = batch_size * oversampling_factor, i.e. this is the inference
+# concurrency knob. Unset means 1.0, which caps concurrency at batch_size.
+OVERSAMPLING=${OVERSAMPLING:-}
 ROLLOUTS=${ROLLOUTS:-8}
 LR=${LR:-1e-6}
 KL_TAU=${KL_TAU:-0}
 IPO_MASK_LOW=${IPO_MASK_LOW:-0.2}
 IPO_MASK_HIGH=${IPO_MASK_HIGH:-0.2}
 ADV_TAU=${ADV_TAU:-2.0}
-EASY_THRESHOLD=${EASY_THRESHOLD:-1.0}
-HARD_THRESHOLD=${HARD_THRESHOLD:-0.0}
 ROLLOUT_TEMP=${ROLLOUT_TEMP:-1.0}
 MAX_STEPS=${MAX_STEPS:-500}
 MAX_OFF_POLICY=${MAX_OFF_POLICY:-8}
 CKPT_INTERVAL=${CKPT_INTERVAL:-100}
 KEEP_LAST=${KEEP_LAST:-30}
-EVAL_INTERVAL=${EVAL_INTERVAL:-100}
 WANDB_PROJECT=${WANDB_PROJECT:-reasoning}
 TRAINER_ATTN=${TRAINER_ATTN:-flash_attention_2}
 TRAINER_MODEL_IMPL=${TRAINER_MODEL_IMPL:-hf}
 RENDERER=${RENDERER:-qwen3.5}
+
+# Transport for trainer -> inference weight updates. "filesystem" writes a full HF
+# checkpoint to Lustre every step and has the inference workers read it back; "nccl"
+# broadcasts the state dict straight into their GPUs. The `rl` entrypoint defaults to
+# nccl, but this launcher starts inference, orchestrator, and trainer as three separate
+# processes, so each falls back to its own default — which is filesystem. Keep that as
+# the default here so existing runs are unchanged.
+#
+# inference_world_size must equal dp * tp exactly; the rendezvous is world_size + 1
+# (trainer is rank 0) and a wrong value hangs rather than errors. tp is pinned to 1 in
+# infer.toml and dp is NUM_INF_GPUS, so the product is NUM_INF_GPUS.
+WEIGHT_BROADCAST=${WEIGHT_BROADCAST:-filesystem}
+case "$WEIGHT_BROADCAST" in
+    filesystem|nccl) ;;
+    *) echo "ERROR: WEIGHT_BROADCAST must be 'filesystem' or 'nccl', got '$WEIGHT_BROADCAST'"; exit 1 ;;
+esac
+# 29501 is the prime-rl default. torchrun runs --standalone and picks its own
+# rendezvous port, so there is no collision.
+BROADCAST_PORT=${BROADCAST_PORT:-29501}
+
+# Applies to trainer, orchestrator, and inference. "debug" is what surfaces the
+# receive side of a weight update ("Updated weights to step N in ...", watcher.py);
+# at info level that number only reaches wandb. Noisy — for short runs only.
+LOG_LEVEL=${LOG_LEVEL:-}
+
+# Expert parallelism. Unset leaves prime-rl's "auto", which for Qwen3.5 MoE resolves
+# through _is_moe_model — and that only inspects top-level config keys, so the
+# VL-wrapped 35B-A3B config (experts live under text_config) silently yields ep=1.
+# Set explicitly to say what you mean.
+EP=${EP:-}
+
+# ── Length penalty (OFF unless LENGTH_BUDGET is set) ──
+# Soft output-token budget: no penalty below LENGTH_BUDGET, then a linear ramp to
+# LENGTH_PENALTY_WEIGHT reward units over the next LENGTH_RAMP tokens. Keep
+# LENGTH_BUDGET + LENGTH_RAMP = MAX_TOKENS so the ramp is the headroom reserved for the
+# final answer (e.g. LENGTH_BUDGET=30720 LENGTH_RAMP=2048 against MAX_TOKENS=32768).
+LENGTH_BUDGET=${LENGTH_BUDGET:-}
+LENGTH_RAMP=${LENGTH_RAMP:-2048}
+LENGTH_PENALTY_WEIGHT=${LENGTH_PENALTY_WEIGHT:-1.0}
 
 # ── Reasoning policy ──
 # The IF env grades the model's final answer. When the policy never closes its
@@ -147,16 +202,20 @@ echo "Inference:    GPUs $INF_GPU_LIST (DP=$NUM_INF_GPUS)"
 echo "Judge:        GPUs $RM_GPU_LIST ($NUM_RM_GPUS GPUs, port $RM_PORT)"
 echo "Trainer:      GPUs $TRAIN_GPU_LIST ($NUM_TRAIN_GPUS workers)"
 NO_MATH=${NO_MATH:-0}
+JUDGE_FI=${JUDGE_FI:-0}
 if [ "$IFEVAL_ONLY" = "1" ]; then
     ENVS_DESC="ifeval-en only"
 elif [ "$JUDGE_ONLY" = "1" ]; then
-    ENVS_DESC="rubric-judge-en only"
+    ENVS_DESC="rubric-judge-en"
 elif [ "$MATH_ONLY" = "1" ]; then
     ENVS_DESC="english-math only"
 elif [ "$NO_MATH" = "1" ]; then
     ENVS_DESC="ifeval-en, rubric-judge-en"
 else
     ENVS_DESC="ifeval-en, rubric-judge-en, math-en"
+fi
+if [ "$JUDGE_FI" = "1" ] && [ "$IFEVAL_ONLY" != "1" ] && [ "$MATH_ONLY" != "1" ]; then
+    ENVS_DESC="$ENVS_DESC, rubric-judge-fi"
 fi
 echo "Envs:         $ENVS_DESC"
 echo "Model:        $SFT_MODEL"
@@ -168,8 +227,8 @@ echo "LR:           $LR"
 echo "KL tau:       $KL_TAU"
 echo "IPO mask:     $IPO_MASK_LOW / $IPO_MASK_HIGH"
 echo "Adv tau:      $ADV_TAU"
-echo "ODF thresh:   hard=$HARD_THRESHOLD easy=$EASY_THRESHOLD"
 echo "Steps:        $MAX_STEPS (ckpt every $CKPT_INTERVAL)"
+echo "Broadcast:    $WEIGHT_BROADCAST$([ "$WEIGHT_BROADCAST" = nccl ] && echo " (port $BROADCAST_PORT, world $NUM_INF_GPUS+1)")"
 echo "Container:    $IMG"
 echo "Output:       $OUTPUT_DIR"
 echo "============================================"
@@ -181,12 +240,16 @@ enable_fp32_lm_head = ${FP32_LM_HEAD:-false}
 [model]
 name = "$SFT_MODEL"
 max_model_len = $INF_SEQ_LEN
+$(if [ -n "$THINKING_BUDGET" ]; then echo "reasoning_parser = \"$REASONING_PARSER\""; fi)
 
 [parallel]
 tp = 1
 
 [server]
 port = $PORT
+
+[weight_broadcast]
+type = "$WEIGHT_BROADCAST"
 $(if [ -n "${VLLM_MODEL_IMPL:-}" ]; then echo "[vllm_extra]"; echo "model_impl = \"$VLLM_MODEL_IMPL\""; fi)
 TOMLEOF
 
@@ -208,6 +271,7 @@ group_size = $ROLLOUTS
 max_steps = $MAX_STEPS
 max_off_policy_steps = $MAX_OFF_POLICY
 seq_len = $INF_SEQ_LEN
+$(if [ -n "$OVERSAMPLING" ]; then echo "oversampling_factor = $OVERSAMPLING"; fi)
 
 [model]
 name = "$SFT_MODEL"
@@ -224,9 +288,19 @@ offline = $WANDB_OFFLINE
 [train.sampling]
 temperature = $ROLLOUT_TEMP
 max_completion_tokens = $MAX_TOKENS
+$(if [ -n "$THINKING_BUDGET" ]; then echo "extra_body = { thinking_token_budget = $THINKING_BUDGET }"; fi)
 
 [renderer]
 name = "$RENDERER"
+$(if [ -n "$LENGTH_BUDGET" ]; then cat << LPEOF
+
+[algo.length_penalty]
+type = "budget"
+num_output_tokens_budget = $LENGTH_BUDGET
+num_output_tokens_ramp = $LENGTH_RAMP
+weight = $LENGTH_PENALTY_WEIGHT
+LPEOF
+fi)
 
 TOMLEOF
 
@@ -265,6 +339,15 @@ fi
 fi
 
 if [ "$IFEVAL_ONLY" != "1" ] && [ "$MATH_ONLY" != "1" ]; then
+# "legacy" = our score-first prompt (1-100, no deliberation, 64 tokens is enough).
+# "open-instruct" = the verbatim open-instruct templates (1-10, reasoning-first JSON),
+# which need room to reason before the score appears.
+JUDGE_PROMPT_STYLE="${JUDGE_PROMPT_STYLE:-legacy}"
+if [ "$JUDGE_PROMPT_STYLE" = "open-instruct" ]; then
+  MAX_JUDGE_TOKENS="${MAX_JUDGE_TOKENS:-512}"
+else
+  MAX_JUDGE_TOKENS="${MAX_JUDGE_TOKENS:-64}"
+fi
 cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
 
 [[train.env]]
@@ -275,7 +358,33 @@ name = "rubric-judge-en"
 custom_rm = true
 judge_model_path = "$JUDGE_MODEL"
 rm_server_url = "http://127.0.0.1:${RM_PORT}"
-max_judge_tokens = 64
+judge_prompt_style = "$JUDGE_PROMPT_STYLE"
+max_judge_tokens = $MAX_JUDGE_TOKENS
+TOMLEOF
+if [ "${NO_SYSTEM_PROMPT:-0}" = "1" ]; then
+cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
+system_prompt = ""
+TOMLEOF
+fi
+
+# The Finnish twin: same judge, same rubric, machine-translated prompts. use_finnish
+# also selects the Finnish system prompt, so the policy is not told in English to
+# answer a Finnish question.
+if [ "$JUDGE_FI" = "1" ]; then
+cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
+
+[[train.env]]
+id = "rubric-judge-env"
+name = "rubric-judge-fi"
+
+[train.env.args]
+custom_rm = true
+judge_model_path = "$JUDGE_MODEL"
+rm_server_url = "http://127.0.0.1:${RM_PORT}"
+judge_prompt_style = "$JUDGE_PROMPT_STYLE"
+max_judge_tokens = $MAX_JUDGE_TOKENS
+dataset_path = "$FI_JUDGE_DATASET"
+use_finnish = true
 TOMLEOF
 if [ "${NO_SYSTEM_PROMPT:-0}" = "1" ]; then
 cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
@@ -283,24 +392,47 @@ system_prompt = ""
 TOMLEOF
 fi
 fi
+fi
 
-if [ "${NO_EVAL:-0}" != "1" ]; then
+# No in-loop eval: aime25 is 30 problems at 1 sample, so its score is dominated by
+# sampling noise, and ifbench costs generation without informing the run. Evaluate
+# saved checkpoints out-of-loop instead (aime25 at avg@64).
+
+# Opt-in: off by default so batch-size ablations keep an unfiltered baseline.
+# Setting pre_batch_filters replaces the default list wholesale, so all three types
+# are re-listed. zero_advantage enforces: degenerate groups are dropped before they
+# reach pending_batch, so the orchestrator backfills them with informative groups
+# instead of shipping a shrunken batch. Costs generation — expect the trainer to
+# wait on rollouts.
+if [ "${PREBATCH_FILTER:-0}" = "1" ]; then
 cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
 
-[eval]
-interval = $EVAL_INTERVAL
+[[pre_batch_filters]]
+type = "gibberish"
+enforce = false
 
-[[eval.env]]
-name = "aime25-eval"
-taskset = { id = "aime25-v1" }
-harness = { id = "null" }
+[[pre_batch_filters]]
+type = "repetition"
+enforce = false
 
-[[eval.env]]
-name = "ifbench-eval"
-taskset = { id = "ifbench-v1" }
-harness = { id = "null" }
+[[pre_batch_filters]]
+type = "zero_advantage"
+enforce = true
 TOMLEOF
 fi
+
+# Appended last: a table header here would otherwise swallow the trailing keys of
+# whichever [train.env.args] block was written before it.
+cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
+
+[weight_broadcast]
+type = "$WEIGHT_BROADCAST"
+$(if [ "$WEIGHT_BROADCAST" = "nccl" ]; then
+    echo "host = \"localhost\""
+    echo "port = $BROADCAST_PORT"
+    echo "inference_world_size = $NUM_INF_GPUS"
+fi)
+TOMLEOF
 
 cat > "$OUTPUT_DIR/train_config.toml" << TOMLEOF
 max_steps = $MAX_STEPS
@@ -313,6 +445,7 @@ optim_cpu_offload = false
 compile = "None"
 impl = "$TRAINER_MODEL_IMPL"
 attn = "flash_attention_2"
+$(if [ -n "$EP" ]; then echo "ep = $EP"; fi)
 
 [model.ac]
 freq = 1
@@ -339,6 +472,14 @@ max_norm = 1.0
 
 [scheduler]
 type = "constant"
+
+[weight_broadcast]
+type = "$WEIGHT_BROADCAST"
+$(if [ "$WEIGHT_BROADCAST" = "nccl" ]; then
+    echo "host = \"localhost\""
+    echo "port = $BROADCAST_PORT"
+    echo "inference_world_size = $NUM_INF_GPUS"
+fi)
 TOMLEOF
 
 # ── Environment setup ──
@@ -358,6 +499,7 @@ export RCCL_NET_GDR_LEVEL=2
 export NCCL_SOCKET_IFNAME=eno0
 export GLOO_SOCKET_IFNAME=eno0
 export PYTHONUNBUFFERED=1
+$([ -n "$LOG_LEVEL" ] && echo "export PRIME_LOG_LEVEL=$LOG_LEVEL")
 ENVEOF
 if [ -z "${WANDB_API_KEY:-}" ] && [ -f "$HOME/.bashrc" ]; then
     WANDB_API_KEY=$(grep -oP "(?<=WANDB_API_KEY=)['\"]?\K[^'\" ]+" "$HOME/.bashrc" | head -1 || true)

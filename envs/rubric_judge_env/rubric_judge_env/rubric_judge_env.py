@@ -31,7 +31,8 @@ _SYSTEM_PROMPT = (
 )
 
 _SYSTEM_PROMPT_FI = (
-    "Olet avulias assistentti. Noudata kaikkia käyttäjän pyyntöön sisältyviä ohjeita huolellisesti."
+    "Olet avulias assistentti. "
+    "Noudata KAIKKIA käyttäjän pyynnössä esitettyjä muotoilu- ja sisältövaatimuksia täsmällisesti."
 )
 
 
@@ -253,6 +254,10 @@ def load_environment(
                                 Applies to the first attempt; retries after an unparseable
                                 answer sample, since a greedy retry replays it verbatim.
     """
+    # The Finnish dataset ships Finnish prompts, so the English default would push
+    # replies back to English. An explicit override (including "") still wins.
+    if use_finnish and system_prompt == _SYSTEM_PROMPT:
+        system_prompt = _SYSTEM_PROMPT_FI
     system_prompt = system_prompt or None
 
     if custom_rm:
