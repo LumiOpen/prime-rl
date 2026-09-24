@@ -133,7 +133,11 @@ _JUDGE_STYLES = {
 }
 
 
-class JudgeRequestError(RuntimeError):
+class JudgeError(RuntimeError):
+    """A judgement we could not obtain. Assigned to ``state["error"]`` to drop the rollout."""
+
+
+class JudgeRequestError(JudgeError):
     """Non-2xx response from the judge server.
 
     ``retryable`` separates transient overload (429, 5xx) from a request the server will
@@ -144,6 +148,14 @@ class JudgeRequestError(RuntimeError):
         super().__init__(f"Judge server {url} returned {status}: {body[:200]}")
         self.status = status
         self.retryable = status == 429 or status >= 500
+
+
+class JudgeTimeout(JudgeError):
+    """The judge server did not answer within ``_JUDGE_TIMEOUT_S``."""
+
+
+class JudgeParseFailure(JudgeError):
+    """The judge answered, but with no score we can read."""
 
 
 def _extract_json_score(text: str) -> float | None:
@@ -459,40 +471,41 @@ class LLMJudgeRubric(vf.Rubric):
 
     async def _score_with_retries(
         self, question: str, answer: str, reference: str, category: str
-    ) -> tuple[float | None, str, dict | None]:
+    ) -> tuple[float | None, str, JudgeError | None]:
         """Judge one response, retrying transport failures and format drift alike.
 
         Returns ``(score, last judge output, error)``. ``score`` is None exactly when
-        ``error`` is set — an error dict ready to assign to ``state["error"]``. Decoding
+        ``error`` is set — the exception to assign to ``state["error"]``. Decoding
         stays unconstrained (no guided JSON, no schema), matching open-instruct.
         """
         import aiohttp
         last_output = ""
-        error: dict = {}
+        error: JudgeError | None = None
+        temperature = self._judge_temperature
         for attempt in range(_JUDGE_MAX_ATTEMPTS):
-            temperature = self._judge_temperature if attempt == 0 else _JUDGE_RETRY_TEMPERATURE
             try:
                 last_output = await self._call_judge(question, answer, reference, category, temperature)
             except JudgeRequestError as e:
-                error = {"type": "JudgeServerError", "message": str(e)}
+                error = e
                 if not e.retryable:
                     # The server will reject the same request however often we send it.
                     break
             except (TimeoutError, aiohttp.ClientError) as e:
                 # asyncio.TimeoutError stringifies to "", so name the class explicitly.
-                error = {"type": "JudgeTimeout", "message": f"{type(e).__name__}: {e}"}
+                error = JudgeTimeout(f"{type(e).__name__}: {e}")
             else:
                 score = self._parse_score(last_output)
                 if score is not None:
                     return score, last_output, None
-                error = {
-                    "type": "JudgeParseFailure",
-                    "message": f"unparseable judge output: {last_output[:200]!r}",
-                }
+                error = JudgeParseFailure(f"unparseable judge output: {last_output[:200]!r}")
+                # A greedy judge replays the same unparseable answer verbatim, so a format
+                # retry has to sample. Transport retries keep the configured temperature.
+                if not temperature:
+                    temperature = _JUDGE_RETRY_TEMPERATURE
             if attempt < _JUDGE_MAX_ATTEMPTS - 1:
                 logger.warning(
                     "LLM judge attempt %d/%d failed (%s); retrying",
-                    attempt + 1, _JUDGE_MAX_ATTEMPTS, error["message"][:200],
+                    attempt + 1, _JUDGE_MAX_ATTEMPTS, str(error)[:200],
                 )
                 await asyncio.sleep(_JUDGE_RETRY_DELAY_S * 2**attempt)
         return None, last_output, error
@@ -525,11 +538,12 @@ class LLMJudgeRubric(vf.Rubric):
         if score is None:
             logger.error(
                 "LLM judge gave no usable score after %d attempts (%s) — dropping rollout",
-                _JUDGE_MAX_ATTEMPTS, error["message"][:300],
+                _JUDGE_MAX_ATTEMPTS, str(error)[:300],
             )
             # prime-rl excludes errored rollouts from the batch and from the group's
-            # advantage baseline; the rate shows up as all/has_error/mean and
-            # all/error/<type> in wandb.
+            # advantage baseline; the rate shows up as all/has_error/mean in wandb. The
+            # per-type split does not: verifiers' rollout_output_to_trace reads the "type"
+            # key while error_data writes "error", so every error lands under all/error/Error.
             state["error"] = error
             return 0.0
         if random.random() < _LOG_SAMPLE_RATE:
