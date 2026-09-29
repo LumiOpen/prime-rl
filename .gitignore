@@ -204,3 +204,17 @@ debug_I2_zero_band
 outputs/
 
 third_party/
+
+# Local caches
+*_cache/
+pythonuserbase/
+
+# Local data and run artifacts (root-anchored so src/prime_rl/trainer/models stays tracked)
+/data/
+/models/
+/eval_results/
+/hf_home/
+/amd_smi/
+
+# Local patches kept out of the tree (e.g. rotary_fsdp_fix.patch)
+/*.patch
