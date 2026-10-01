@@ -6,9 +6,9 @@ import re
 
 import verifiers as vf
 
-logger = logging.getLogger("verifiers")
+logger = logging.getLogger("verifiers.v1")
 
-_LOG_SAMPLE_RATE = 0.01  # log ~1% of scored examples
+_LOG_SAMPLE_RATE = 0.05  # log ~5% of scored examples
 
 # Every rollout in the batch hits the judge at once, so a single request can sit behind
 # hundreds of others. aiohttp's default ClientTimeout is 300s total, which under load
@@ -34,8 +34,10 @@ AI assistant to the user query displayed below.
 
 Your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
 
+IMPORTANT: If the [AI Answer] is marked as [EMPTY RESPONSE] or [DEGENERATE RESPONSE], the AI produced no meaningful content and must receive Score: 1.
+
 You MUST respond in exactly this format:
-Score: <integer from 1 to 100>
+Score: <integer from 0 to 100>
 <your brief reasoning here>
 
 [Query]
@@ -56,8 +58,10 @@ Judge whether the provided answer is good by comparing it to the reference answe
 Besides comparing to the reference answer, your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
 Note that sometimes the reference answer is not the only answer. So any valid variation of the reference answer is also acceptable and can get a full score.
 
+IMPORTANT: If the [AI Answer] is marked as [EMPTY RESPONSE] or [DEGENERATE RESPONSE], the AI produced no meaningful content and must receive Score: 1.
+
 You MUST respond in exactly this format:
-Score: <integer from 1 to 100>
+Score: <integer from 0 to 100>
 <your brief reasoning here>
 
 [Query]
@@ -125,6 +129,54 @@ Notes:
 
 [Your judgement]
 Respond in JSON format. {{"REASONING": "[...]", "SCORE": "<your-score>"}}"""
+
+# Finnish variants — identical to the legacy prompts but with a language requirement added.
+_DEFAULT_JUDGE_PROMPT_FI = """\
+### Task Description
+Please act as an impartial judge and evaluate the quality of the response provided by an
+AI assistant to the user query displayed below.
+
+Your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
+
+IMPORTANT: If the [AI Answer] is marked as [EMPTY RESPONSE] or [DEGENERATE RESPONSE], the AI produced no meaningful content and must receive Score: 1.
+
+You MUST respond in exactly this format:
+Score: <integer from 0 to 100>
+<your brief reasoning here>
+
+[Query]
+{question}
+
+[AI Answer]
+{answer}
+
+[Your judgement]"""
+
+_JUDGE_PROMPT_WITH_REF_FI = """\
+### Task Description
+Please act as an impartial judge and evaluate the quality of the answer provided by an
+AI assistant to the conversation history leading up to the answer displayed below.
+Judge whether the provided answer is good by comparing it to the reference answer.
+
+Besides comparing to the reference answer, your evaluation should consider factors such as the helpfulness, relevance, accuracy, creativity, appropriate level of detail, and how well the response satisfies the user's explicit constraints or accurately follows their instructions.
+Note that sometimes the reference answer is not the only answer. So any valid variation of the reference answer is also acceptable and can get a full score.
+
+IMPORTANT: If the [AI Answer] is marked as [EMPTY RESPONSE] or [DEGENERATE RESPONSE], the AI produced no meaningful content and must receive Score: 1.
+
+You MUST respond in exactly this format:
+Score: <integer from 0 to 100>
+<your brief reasoning here>
+
+[Query]
+{question}
+
+[AI Answer]
+{answer}
+
+[Reference Gold Answer]
+{reference}
+
+[Your judgement]"""
 
 # style -> (no-reference prompt, with-reference prompt, score divisor)
 _JUDGE_STYLES = {
@@ -266,13 +318,25 @@ def _strip_think_blocks(text: str) -> str:
     return text.strip()
 
 
-def _extract_text(completion) -> str:
+def _extract_text(completion, strip_think: bool = True) -> str:
     if isinstance(completion, str):
-        return _strip_think_blocks(completion)
-    if isinstance(completion, list):
-        parts = [msg.get("content") or "" for msg in completion if msg.get("role") == "assistant"]
-        return _strip_think_blocks("\n".join(parts))
-    return _strip_think_blocks(str(completion))
+        raw = completion
+    elif isinstance(completion, list):
+        if strip_think:
+            parts = [msg.get("content") or "" for msg in completion if msg.get("role") == "assistant"]
+        else:
+            # Include reasoning_content (separate field on AssistantMessage) before content.
+            parts = []
+            for msg in completion:
+                if msg.get("role") != "assistant":
+                    continue
+                reasoning = msg.get("reasoning_content") or ""
+                content = msg.get("content") or ""
+                parts.append("\n".join(filter(None, [reasoning, content])))
+        raw = "\n".join(parts)
+    else:
+        raw = str(completion)
+    return _strip_think_blocks(raw) if strip_think else raw
 
 
 class RubricJudgeRubric(vf.Rubric):
@@ -412,6 +476,8 @@ class LLMJudgeRubric(vf.Rubric):
         max_judge_tokens: int = 512,
         judge_temperature: float = 0.0,
         judge_prompt_style: str = "legacy",
+        use_finnish: bool = False,
+        language_reward_weight: float = 0.0,
     ):
         super().__init__()
         if judge_prompt_style not in _JUDGE_STYLES:
@@ -422,11 +488,13 @@ class LLMJudgeRubric(vf.Rubric):
         self._judge_model = judge_model_path
         self._judge_url = judge_server_url.rstrip("/")
         self._judge_prompt_style = judge_prompt_style
-        self._judge_prompt_template = judge_prompt_template or default_prompt
-        self._judge_ref_template = ref_prompt
+        self._use_finnish = use_finnish
+        self._judge_prompt_template = _DEFAULT_JUDGE_PROMPT_FI if use_finnish else (judge_prompt_template or default_prompt)
+        self._judge_ref_template = _JUDGE_PROMPT_WITH_REF_FI if use_finnish else ref_prompt
         self._score_scale = scale
         self._max_judge_tokens = max_judge_tokens
         self._judge_temperature = judge_temperature
+        self._language_reward_weight = language_reward_weight
         self._session = None
         if judge_prompt_style == "open-instruct" and max_judge_tokens < 256:
             logger.warning(
@@ -518,13 +586,11 @@ class LLMJudgeRubric(vf.Rubric):
             raw = _parse_score_legacy(text)
         if raw is None:
             return None
-        if not 1.0 <= raw <= self._score_scale:
+        if not 0.0 <= raw <= self._score_scale:
             logger.warning(
-                "LLM judge: raw score %s is outside the 1-%g scale, clamping", raw, self._score_scale
+                "LLM judge: raw score %s is outside the 0-%g scale, clamping", raw, self._score_scale
             )
-            raw = max(1.0, min(self._score_scale, raw))
-        # Clamping to the bottom of the scale rather than to 0 keeps 0.0 unreachable, so a
-        # zero reward in the logs always means a dropped judgement.
+            raw = max(0.0, min(self._score_scale, raw))
         return raw / self._score_scale
 
     async def llm_judge_score(self, completion, answer, info: dict, state: dict, **kwargs) -> float:
@@ -546,12 +612,39 @@ class LLMJudgeRubric(vf.Rubric):
             # key while error_data writes "error", so every error lands under all/error/Error.
             state["error"] = error
             return 0.0
+
+        try:
+            from language_reward import compute_language_score
+            lang_text = _extract_text(completion, strip_think=False) if self._use_finnish else response_text
+            lang_score = compute_language_score(question, lang_text)
+            if state is not None:
+                existing = state.get("metrics") or {}
+                existing["language_score"] = lang_score
+                state["metrics"] = existing
+            if self._language_reward_weight > 0.0:
+                score = score * (1.0 - self._language_reward_weight + self._language_reward_weight * lang_score)
+        except Exception:
+            pass
+
         if random.random() < _LOG_SAMPLE_RATE:
+            if isinstance(completion, list):
+                reasoning_parts = [
+                    msg.get("reasoning_content") or ""
+                    for msg in completion
+                    if msg.get("role") == "assistant"
+                ]
+                reasoning_text = "\n".join(filter(None, reasoning_parts))
+            else:
+                reasoning_text = ""
+            ref_line = f"  reference ({len(reference)} chars): {reference!r}\n" if reference else ""
+            reasoning_line = f"  reasoning ({len(reasoning_text)} chars): {reasoning_text!r}\n" if reasoning_text else ""
             logger.info(
                 "LLM judge sample\n"
-                f"  question ({len(question)} chars): {question[:200]!r}\n"
-                f"  answer ({len(response_text)} chars): {response_text[:200]!r}\n"
-                f"  judge output: {judge_output[:300]!r}\n"
+                f"  question ({len(question)} chars): {question!r}\n"
+                + reasoning_line +
+                f"  answer ({len(response_text)} chars): {response_text!r}\n"
+                + ref_line +
+                f"  judge output: {judge_output!r}\n"
                 f"  score: {score:.2f}"
             )
         return score

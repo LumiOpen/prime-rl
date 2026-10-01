@@ -106,6 +106,7 @@ def load_environment(
     num_eval_examples: int = -1,
     system_prompt: str | None = SYSTEM_PROMPT_FI,
     reasoning_model: bool = True,
+    language_reward_weight: float = 0.0,
     **kwargs,
 ) -> vf.Environment:
     """Build and return the Finnish Dolci IFEval verifiers environment.
@@ -194,6 +195,21 @@ def load_environment(
                 f"  score: {score:.4f}  constraints: {sum(r.startswith('PASS') for r in results)}/{len(results)}\n"
                 + "\n".join(f"    {r}" for r in results)
             )
+
+        try:
+            from language_reward import compute_language_score
+            _prompt = kwargs.get("prompt", [])
+            question = _prompt[-1].get("content", "") if _prompt else ""
+            lang_score = compute_language_score(question, _remove_thinking_section(response))
+            if state is not None:
+                existing = state.get("metrics") or {}
+                existing["language_score"] = lang_score
+                state["metrics"] = existing
+            if language_reward_weight > 0.0:
+                score = score * (1.0 - language_reward_weight + language_reward_weight * lang_score)
+        except Exception:
+            pass
+
         return score
 
     rubric = vf.Rubric(funcs=[ifeval_reward_func_fi])
