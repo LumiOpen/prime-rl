@@ -8,7 +8,7 @@ import verifiers as vf
 
 logger = logging.getLogger("verifiers.v1")
 
-_LOG_SAMPLE_RATE = 0.05  # log ~5% of scored examples
+_LOG_SAMPLE_RATE = 0.01  # log ~1% of scored examples
 
 # Every rollout in the batch hits the judge at once, so a single request can sit behind
 # hundreds of others. aiohttp's default ClientTimeout is 300s total, which under load
