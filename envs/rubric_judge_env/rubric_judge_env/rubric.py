@@ -503,6 +503,7 @@ class LLMJudgeRubric(vf.Rubric):
                 max_judge_tokens,
             )
         self.add_reward_func(self.llm_judge_score)
+        self.add_metric(self.language_score_metric)
 
     def _render_prompt(self, question: str, answer: str, reference: str, category: str) -> str:
         use_ref = category == "general-quality_ref" and reference
@@ -618,9 +619,7 @@ class LLMJudgeRubric(vf.Rubric):
             lang_text = _extract_text(completion, strip_think=False) if self._use_finnish else response_text
             lang_score = compute_language_score(question, lang_text)
             if state is not None:
-                existing = state.get("metrics") or {}
-                existing["language_score"] = lang_score
-                state["metrics"] = existing
+                state["_lang_score"] = lang_score
             if self._language_reward_weight > 0.0:
                 score = score * (1.0 - self._language_reward_weight + self._language_reward_weight * lang_score)
         except Exception:
@@ -648,3 +647,6 @@ class LLMJudgeRubric(vf.Rubric):
                 f"  score: {score:.2f}"
             )
         return score
+
+    def language_score_metric(self, completion, answer, info, state, **kwargs) -> float:
+        return state.get("_lang_score", 1.0)

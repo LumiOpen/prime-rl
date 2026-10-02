@@ -3,11 +3,8 @@ Language consistency reward using fastText lid.176.bin.
 
 For each rollout:
   1. Detect the question's language.
-  2. Check for an explicit target-language marker in the question
-     (e.g. "in Finnish", "suomeksi", "translate to X") — if found, that
-     overrides the detected question language.
-  3. Detect the answer's language (after stripping think blocks).
-  4. Return a confidence-weighted score: 1.0 if languages match with high
+  2. Detect the answer's language (after stripping think blocks).
+  3. Return a confidence-weighted score: 1.0 if languages match with high
      confidence, graduating down toward 0.0 as confidence drops or languages
      diverge.
 
@@ -32,7 +29,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import threading
 from pathlib import Path
 from typing import Optional
@@ -121,27 +117,6 @@ def detect_language(text: str, model_path: str | None = None) -> tuple[str, floa
     return lang, conf
 
 
-# Maps natural-language target markers to ISO 639-1 codes.
-_TARGET_LANG_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r'\bin finnish\b|\bsuomeksi\b|\bsuomen kielell[äa]\b|\bkäännä suomeksi\b', re.I), "fi"),
-    (re.compile(r'\bin english\b|\btranslate to english\b|\bin the english language\b', re.I), "en"),
-    (re.compile(r'\bin french\b|\ben français\b|\btranslate to french\b', re.I), "fr"),
-    (re.compile(r'\bin german\b|\bauf deutsch\b|\btranslate to german\b', re.I), "de"),
-    (re.compile(r'\bin spanish\b|\ben español\b|\btranslate to spanish\b', re.I), "es"),
-    (re.compile(r'\bin swedish\b|\bpå svenska\b|\btranslate to swedish\b', re.I), "sv"),
-    (re.compile(r'\bin chinese\b|\b用中文\b|\btranslate to chinese\b', re.I), "zh"),
-    (re.compile(r'\bin japanese\b|\b日本語で\b|\btranslate to japanese\b', re.I), "ja"),
-]
-
-
-def detect_target_language(question: str) -> str | None:
-    """Return explicit target language ISO code if question specifies one, else None."""
-    for pattern, lang in _TARGET_LANG_PATTERNS:
-        if pattern.search(question):
-            return lang
-    return None
-
-
 def compute_language_score(
     question: str,
     answer: str,
@@ -163,14 +138,10 @@ def compute_language_score(
     if len(answer) < min_answer_len:
         return 1.0
 
-    explicit_target = detect_target_language(question)
-    if explicit_target:
-        expected_lang = explicit_target
-    else:
-        q_lang, q_conf = detect_language(question, model_path)
-        if q_conf < conf_threshold:
-            return 1.0
-        expected_lang = q_lang
+    q_lang, q_conf = detect_language(question, model_path)
+    if q_conf < conf_threshold:
+        return 1.0
+    expected_lang = q_lang
 
     a_lang, a_conf = detect_language(answer, model_path)
     if a_conf < conf_threshold:
@@ -206,10 +177,9 @@ def make_language_reward_func(model_path: str | None = None, log_sample_rate: fl
         if random.random() < log_sample_rate:
             q_lang, q_conf = detect_language(question) if question else ("?", 0.0)
             a_lang, a_conf = detect_language(answer_text) if answer_text.strip() else ("?", 0.0)
-            explicit = detect_target_language(question)
             logger.info(
                 "Language reward sample\n"
-                f"  question lang: {q_lang} ({q_conf:.2f}) | explicit target: {explicit}\n"
+                f"  question lang: {q_lang} ({q_conf:.2f})\n"
                 f"  answer lang:   {a_lang} ({a_conf:.2f})\n"
                 f"  score: {score:.2f}"
             )

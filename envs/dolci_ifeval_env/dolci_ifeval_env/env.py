@@ -152,9 +152,7 @@ def load_environment(
             question = _prompt[-1].get("content", "") if _prompt else ""
             lang_score = compute_language_score(question, strip_think_blocks(response))
             if state is not None:
-                existing = state.get("metrics") or {}
-                existing["language_score"] = lang_score
-                state["metrics"] = existing
+                state["_lang_score"] = lang_score
             if language_reward_weight > 0.0:
                 score = score * (1.0 - language_reward_weight + language_reward_weight * lang_score)
         except Exception:
@@ -162,7 +160,11 @@ def load_environment(
 
         return score
 
+    def _lang_score_metric(completion, answer, info, state=None, **kwargs) -> float:
+        return (state or {}).get("_lang_score", 1.0)
+
     rubric = vf.Rubric(funcs=[ifeval_reward_func])
+    rubric.add_metric(_lang_score_metric)
 
     return vf.SingleTurnEnv(
         dataset=build_dataset,
