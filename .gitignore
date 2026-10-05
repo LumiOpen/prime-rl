@@ -6,6 +6,8 @@
 configs/endpoints.py
 
 # Artifacts
+slurm_logs/
+lid.176.bin
 **/slurm
 !src/prime_rl/slurm
 !examples/slurm
