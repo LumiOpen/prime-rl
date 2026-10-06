@@ -188,9 +188,16 @@ FULL_RUN_NAME="${RUN_NAME}-${TIMESTAMP}"
 OUTPUT_DIR="$BASE/outputs/$FULL_RUN_NAME"
 mkdir -p "$OUTPUT_DIR/run_default"
 
-FI_JUDGE_DATASET="/shared_silo/scratch/datasets/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi.jsonl"
-EN_MATH_DATASET="${EN_MATH_DATASET:-/shared_silo/scratch/dzautner/prime-rl/data/klear_math_30k_en}"
-FI_MATH_DATASET="${FI_MATH_DATASET:-/shared_silo/scratch/dzautner/prime-rl/data/klear_math_30k_fi}"
+# Shared RL dataset directory. ifeval-en and rubric-judge-en read the same snapshot,
+# the local mirror of allenai/Dolci-Think-RL-7B, but filter it differently.
+DATASETS="${DATASETS:-/shared_silo/scratch/datasets/RL}"
+EN_IFEVAL_DATASET="${EN_IFEVAL_DATASET:-$DATASETS/Dolci-Think-RL-7B}"
+EN_JUDGE_DATASET="${EN_JUDGE_DATASET:-$DATASETS/Dolci-Think-RL-7B}"
+FI_JUDGE_DATASET="${FI_JUDGE_DATASET:-$DATASETS/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi.jsonl}"
+EN_MATH_DATASET="${EN_MATH_DATASET:-$DATASETS/klear_math_30k_en}"
+# No env block emits the Finnish math or Finnish ifeval envs yet; paths recorded here.
+FI_MATH_DATASET="${FI_MATH_DATASET:-$DATASETS/klear_math_30k_fi}"
+FI_IFEVAL_DATASET="${FI_IFEVAL_DATASET:-$DATASETS/ifeval-fi/fi_dataset.jsonl}"
 
 echo "============================================"
 echo "  PRIME-RL Single-Node Training (Mixed): $FULL_RUN_NAME"
@@ -329,6 +336,7 @@ id = "dolci-ifeval-env"
 name = "ifeval-en"
 
 [train.env.args]
+dataset_name = "$EN_IFEVAL_DATASET"
 reasoning_model = $(if [ "$REASONING_MODEL" = "1" ]; then echo true; else echo false; fi)
 TOMLEOF
 if [ "${NO_SYSTEM_PROMPT:-0}" = "1" ]; then
@@ -355,6 +363,7 @@ id = "rubric-judge-env"
 name = "rubric-judge-en"
 
 [train.env.args]
+dataset_path = "$EN_JUDGE_DATASET"
 custom_rm = true
 judge_model_path = "$JUDGE_MODEL"
 rm_server_url = "http://127.0.0.1:${RM_PORT}"
