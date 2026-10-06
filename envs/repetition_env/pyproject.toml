@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "repetition-env"
+version = "0.1.0"
+description = "Prime-RL environment rewarding only the absence of repetition loops"
+requires-python = ">=3.11"
+dependencies = [
+    "verifiers",
+    "datasets",
+    "pandas",
+    "pyarrow",
+    "rubric-judge-env",
+]
+
+[project.entry-points."verifiers.environments"]
+repetition-env = "repetition_env:load_environment"

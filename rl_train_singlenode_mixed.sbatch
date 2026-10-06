@@ -40,7 +40,12 @@ SFT_MODEL=${2:?Usage: sbatch rl_train_singlenode_mixed.sbatch <run_name> <model_
 IFEVAL_ONLY=${IFEVAL_ONLY:-0}
 MATH_ONLY=${MATH_ONLY:-0}
 JUDGE_ONLY=${JUDGE_ONLY:-0}
-if [ "$IFEVAL_ONLY" = "1" ] || [ "$MATH_ONLY" = "1" ]; then
+# Repetition-only: a surgical pass that scores nothing but the absence of loops.
+# NOTE there is no reference-policy anchor available — `kl_tau` penalises
+# trainer-vs-inference mismatch, not drift from the init — so nothing here protects
+# math ability. Run it short, checkpoint often, and watch the eval metrics.
+REPETITION_ONLY=${REPETITION_ONLY:-0}
+if [ "$IFEVAL_ONLY" = "1" ] || [ "$MATH_ONLY" = "1" ] || [ "$REPETITION_ONLY" = "1" ]; then
     JUDGE_MODEL=${JUDGE_MODEL:-}
 else
     JUDGE_MODEL=${JUDGE_MODEL:?ERROR: JUDGE_MODEL env var must be set to the judge model path}
@@ -53,11 +58,15 @@ IMG="${CONTAINER_IMG:-/shared_silo/scratch/containers/primus_v26.2_moefix.sif}"
 
 # ── Validate ──
 [ -d "$SFT_MODEL" ] || { echo "ERROR: model path does not exist: $SFT_MODEL"; exit 1; }
-if [ "$IFEVAL_ONLY" != "1" ] && [ "$MATH_ONLY" != "1" ]; then
+NEEDS_JUDGE=1
+if [ "$IFEVAL_ONLY" = "1" ] || [ "$MATH_ONLY" = "1" ] || [ "$REPETITION_ONLY" = "1" ]; then
+    NEEDS_JUDGE=0
+fi
+if [ "$NEEDS_JUDGE" = "1" ]; then
     [ -d "$JUDGE_MODEL" ] || { echo "ERROR: judge model path does not exist: $JUDGE_MODEL"; exit 1; }
 fi
 SFT_MODEL=$(realpath "$SFT_MODEL")
-if [ "$IFEVAL_ONLY" != "1" ] && [ "$MATH_ONLY" != "1" ]; then
+if [ "$NEEDS_JUDGE" = "1" ]; then
     JUDGE_MODEL=$(realpath "$JUDGE_MODEL")
 fi
 [ -d "$PRIME_RL_DIR" ] || { echo "ERROR: prime-rl repo not found at $PRIME_RL_DIR"; exit 1; }
@@ -195,6 +204,12 @@ EN_IFEVAL_DATASET="${EN_IFEVAL_DATASET:-$DATASETS/Dolci-Think-RL-7B}"
 EN_JUDGE_DATASET="${EN_JUDGE_DATASET:-$DATASETS/Dolci-Think-RL-7B}"
 FI_JUDGE_DATASET="${FI_JUDGE_DATASET:-$DATASETS/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi.jsonl}"
 EN_MATH_DATASET="${EN_MATH_DATASET:-$DATASETS/klear_math_30k_en}"
+# Repetition env: dolci math prompts, scored only on absence of loops. min_passrate
+# 0.05 drops exactly dolci's passrate == 0 rows (next value up is 1/8) — job 53239
+# showed those fire least and run 3k tokens shorter.
+REPETITION_DATASET="${REPETITION_DATASET:-$DATASETS/Dolci-Think-RL-7B}"
+REPETITION_REWARD_MODE="${REPETITION_REWARD_MODE:-blockcov}"
+REPETITION_MIN_PASSRATE="${REPETITION_MIN_PASSRATE:-0.05}"
 # No env block emits the Finnish math or Finnish ifeval envs yet; paths recorded here.
 FI_MATH_DATASET="${FI_MATH_DATASET:-$DATASETS/klear_math_30k_fi}"
 FI_IFEVAL_DATASET="${FI_IFEVAL_DATASET:-$DATASETS/ifeval-fi/fi_dataset.jsonl}"
@@ -206,7 +221,7 @@ echo "User:         $USER"
 echo "Job:          $SLURM_JOB_ID"
 echo "Node:         $SLURM_NODELIST"
 echo "Inference:    GPUs $INF_GPU_LIST (DP=$NUM_INF_GPUS)"
-echo "Judge:        GPUs $RM_GPU_LIST ($NUM_RM_GPUS GPUs, port $RM_PORT)"
+[ "$NEEDS_JUDGE" = "1" ] && echo "Judge:        GPUs $RM_GPU_LIST ($NUM_RM_GPUS GPUs, port $RM_PORT)"
 echo "Trainer:      GPUs $TRAIN_GPU_LIST ($NUM_TRAIN_GPUS workers)"
 NO_MATH=${NO_MATH:-0}
 JUDGE_FI=${JUDGE_FI:-0}
@@ -216,17 +231,19 @@ elif [ "$JUDGE_ONLY" = "1" ]; then
     ENVS_DESC="rubric-judge-en"
 elif [ "$MATH_ONLY" = "1" ]; then
     ENVS_DESC="english-math only"
+elif [ "$REPETITION_ONLY" = "1" ]; then
+    ENVS_DESC="repetition-en only (reward_mode=$REPETITION_REWARD_MODE)"
 elif [ "$NO_MATH" = "1" ]; then
     ENVS_DESC="ifeval-en, rubric-judge-en"
 else
     ENVS_DESC="ifeval-en, rubric-judge-en, math-en"
 fi
-if [ "$JUDGE_FI" = "1" ] && [ "$IFEVAL_ONLY" != "1" ] && [ "$MATH_ONLY" != "1" ]; then
+if [ "$JUDGE_FI" = "1" ] && [ "$NEEDS_JUDGE" = "1" ]; then
     ENVS_DESC="$ENVS_DESC, rubric-judge-fi"
 fi
 echo "Envs:         $ENVS_DESC"
 echo "Model:        $SFT_MODEL"
-[ "$IFEVAL_ONLY" = "1" ] || [ "$MATH_ONLY" = "1" ] || echo "Judge model:  $JUDGE_MODEL"
+[ "$NEEDS_JUDGE" = "1" ] && echo "Judge model:  $JUDGE_MODEL"
 echo "Seq len:      $INF_SEQ_LEN"
 echo "Temp:         $ROLLOUT_TEMP"
 echo "Rollouts:     $ROLLOUTS"
@@ -311,7 +328,7 @@ fi)
 
 TOMLEOF
 
-if [ "$NO_MATH" != "1" ] && [ "$IFEVAL_ONLY" != "1" ] && [ "$JUDGE_ONLY" != "1" ]; then
+if [ "$NO_MATH" != "1" ] && [ "$IFEVAL_ONLY" != "1" ] && [ "$JUDGE_ONLY" != "1" ] && [ "$REPETITION_ONLY" != "1" ]; then
 cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
 
 [[train.env]]
@@ -328,7 +345,7 @@ math_verify_timeout = 60
 TOMLEOF
 fi
 
-if [ "$MATH_ONLY" != "1" ] && [ "$JUDGE_ONLY" != "1" ]; then
+if [ "$MATH_ONLY" != "1" ] && [ "$JUDGE_ONLY" != "1" ] && [ "$REPETITION_ONLY" != "1" ]; then
 cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
 
 [[train.env]]
@@ -346,7 +363,7 @@ TOMLEOF
 fi
 fi
 
-if [ "$IFEVAL_ONLY" != "1" ] && [ "$MATH_ONLY" != "1" ]; then
+if [ "$NEEDS_JUDGE" = "1" ]; then
 # "legacy" = our score-first prompt (1-100, no deliberation, 64 tokens is enough).
 # "open-instruct" = the verbatim open-instruct templates (1-10, reasoning-first JSON),
 # which need room to reason before the score appears.
@@ -400,6 +417,25 @@ cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
 system_prompt = ""
 TOMLEOF
 fi
+fi
+fi
+
+if [ "$REPETITION_ONLY" = "1" ]; then
+cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
+
+[[train.env]]
+id = "repetition-env"
+name = "repetition-en"
+
+[train.env.args]
+dataset_path = "$REPETITION_DATASET"
+reward_mode = "$REPETITION_REWARD_MODE"
+min_passrate = $REPETITION_MIN_PASSRATE
+TOMLEOF
+if [ "${NO_SYSTEM_PROMPT:-0}" = "1" ]; then
+cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
+system_prompt = ""
+TOMLEOF
 fi
 fi
 
@@ -564,8 +600,8 @@ singularity exec $CONTAINER_FLAGS $BIND_MOUNTS "$IMG" \
 INF_PID=$!
 
 RM_PID=
-# ── Launch LLM judge server on RM GPUs (skipped for IFEVAL_ONLY and MATH_ONLY) ──
-if [ "$IFEVAL_ONLY" != "1" ] && [ "$MATH_ONLY" != "1" ]; then
+# ── Launch LLM judge server on RM GPUs (skipped unless an env needs it) ──
+if [ "$NEEDS_JUDGE" = "1" ]; then
     echo "Starting judge server on GPUs $RM_GPU_LIST..."
     singularity exec $CONTAINER_FLAGS $BIND_MOUNTS "$IMG" \
         bash -c "source $ENV_SETUP && \
@@ -588,7 +624,7 @@ curl -sf "http://127.0.0.1:${PORT}/health" &>/dev/null \
     || { echo "ERROR: policy inference server did not start within 1200s"; kill $INF_PID ${RM_PID:-} 2>/dev/null; exit 1; }
 echo "Policy inference server ready."
 
-if [ "$IFEVAL_ONLY" != "1" ] && [ "$MATH_ONLY" != "1" ]; then
+if [ "$NEEDS_JUDGE" = "1" ]; then
     echo "Waiting for judge server on port $RM_PORT..."
     for attempt in $(seq 1 600); do
         curl -sf "http://127.0.0.1:${RM_PORT}/health" &>/dev/null && break

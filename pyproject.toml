@@ -49,6 +49,7 @@ dependencies = [
     "math-env",
     "rubric-judge-env",
     "dolci-ifeval-env",
+    "repetition-env",
     "aime25-v1",
     "ifbench-v1",
 ]
@@ -184,6 +185,7 @@ amdsmi = { path = "/shared_silo/scratch/kahakala/lib/prime-rl-upstream/amd_smi" 
 math-env = { index = "primeintellect" }
 rubric-judge-env = { path = "envs/rubric_judge_env", editable = true }
 dolci-ifeval-env = { path = "envs/dolci_ifeval_env", editable = true }
+repetition-env = { path = "envs/repetition_env", editable = true }
 aime25-v1 = { workspace = true }
 ifbench-v1 = { workspace = true }
 # prime-rl depends on the one `verifiers` package (v0 + v1 + the legacy bridge + the built-in v1
