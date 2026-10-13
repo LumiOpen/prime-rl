@@ -42,6 +42,19 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_DATASET_PATH = "/shared_silo/scratch/datasets/RL/Dolci-Think-RL-7B"
 
+# Constraints that *order* the model to repeat itself. On dolci's ifeval split
+# 4334 of the 25387 rows surviving the passrate filter (17.1%) carry one, and on
+# those rows a compliant answer has a high block_coverage by construction -- this
+# reward would pay the model to disobey. Dropped by default; inert on math, where
+# no row matches.
+_REPEAT_INSTRUCTION_IDS = (
+    "copy:repeat_phrase",
+    "copy:copying_multiple",
+    "copy:copying_simple",
+    "copy:copy",
+    "combination:repeat_prompt",
+)
+
 # Neutral on purpose: the prompts are now math, and the env scores only repetition,
 # so nothing here should push the policy toward a particular answer format.
 _SYSTEM_PROMPT = "You are a helpful assistant."
@@ -266,6 +279,7 @@ def load_environment(
     use_finnish: bool = False,
     min_passrate: float = 0.05,
     max_passrate: float = 0.95,
+    exclude_instruction_ids: list[str] = _REPEAT_INSTRUCTION_IDS,
     dataset_shuffle: bool = True,
     dataset_seed: int = 42,
     system_prompt: str | None = _SYSTEM_PROMPT,
@@ -286,12 +300,20 @@ def load_environment(
         dataset_path:   Dolci parquet directory, or the Finnish translated jsonl.
         categories:     Dolci categories to keep. Math is the default because it is the
                         only split measured to loop often enough to train on (job 53239).
+                        Instantiate the env once per category rather than passing several
+                        at once -- separate envs give separate reward traces, which is the
+                        only way to see which prompt distribution is carrying the signal.
         use_finnish:    Read translated_prompt instead of prompt.
         min_passrate:   Drop examples below this passrate. The default drops dolci's
                         `passrate == 0` rows and nothing else: the next value up is
                         1/8, and that floor is the one selection the probe justified.
         max_passrate:   Drop examples above this passrate. Inert on the math split,
                         which the dataset authors already cut at 0.75.
+        exclude_instruction_ids:
+                        Drop examples whose ground_truth names one of these IFEval
+                        instruction ids. Needed for the ifeval split, where a sixth
+                        of the prompts demand literal repetition and complying with
+                        them is exactly what this reward punishes. Pass [] to keep them.
         system_prompt:  Prepended to every conversation. Pass None or "" to disable.
         reward_mode:    "blockcov" rewards `1 - block_coverage`, continuous, so every
                         group has gradient (100% of k=8 groups vary, against 28-56%
@@ -336,6 +358,14 @@ def load_environment(
                 ),
                 **map_kwargs,
             )
+
+        if exclude_instruction_ids and "ground_truth" in raw.column_names:
+            # ground_truth serialises the instruction list as a Python literal; the ids
+            # are namespaced tokens, so a substring test is exact here and cannot be
+            # tripped by the prose around them. Verified against an ast.literal_eval
+            # pass: identical 4334 rows on the ifeval split.
+            excluded = tuple(exclude_instruction_ids)
+            raw = raw.filter(lambda x: not any(e in str(x["ground_truth"]) for e in excluded), **map_kwargs)
 
         examples = [ex for ex in (_build_example(row) for row in raw) if ex is not None]
         if not examples:
