@@ -11,9 +11,8 @@ import json
 import logging
 import random
 
-from dolci_ifeval_env.IFEvalG_fi import instructions_registry_fi
-from dolci_ifeval_env.IFEvalG_fi import instructions_util_fi
-from dolci_ifeval_env.utils import strip_think_blocks
+import verifiers as vf
+from datasets import Dataset
 from ifeval_env.env import is_unterminated
 from language_reward import (
     apply_language_reward,
@@ -22,8 +21,8 @@ from language_reward import (
     select_text,
 )
 
-import verifiers as vf
-from datasets import Dataset
+from dolci_ifeval_env.IFEvalG_fi import instructions_registry_fi
+from dolci_ifeval_env.utils import strip_think_blocks
 
 INSTRUCTION_DICT = instructions_registry_fi.INSTRUCTION_DICT
 
@@ -141,6 +140,7 @@ def load_environment(
 
     def _load_raw() -> Dataset:
         import os
+
         from datasets import load_dataset, load_from_disk
 
         if dataset_name.endswith(".jsonl") or dataset_name.endswith(".json"):

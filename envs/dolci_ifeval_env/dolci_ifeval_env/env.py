@@ -17,6 +17,8 @@ import json
 import logging
 import random
 
+import verifiers as vf
+from datasets import Dataset
 from ifeval_env.env import SYSTEM_PROMPT, _check_constraints, is_unterminated
 from ifeval_env.IFEvalG.instructions_registry import INSTRUCTION_DICT
 from language_reward import (
@@ -25,9 +27,6 @@ from language_reward import (
     resolve_language_reward,
     select_text,
 )
-
-import verifiers as vf
-from datasets import Dataset
 
 from dolci_ifeval_env.utils import strip_think_blocks
 
@@ -88,6 +87,7 @@ def load_environment(
 
     def _load_raw() -> Dataset:
         import os
+
         from datasets import load_dataset, load_from_disk
 
         # save_to_disk output carries a state file; a plain HF repo snapshot

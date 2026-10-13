@@ -78,6 +78,7 @@ def _load_raw(dataset_path: str, categories: list[str], use_finnish: bool = Fals
     # parquet directory (original Dolci format)
     import glob
     import os
+
     import pandas as pd
 
     root = path
