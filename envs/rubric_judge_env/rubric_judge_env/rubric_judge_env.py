@@ -220,6 +220,7 @@ def load_environment(
     max_judge_tokens: int = 512,
     judge_temperature: float = 0.0,
     language_reward_weight: float = 0.0,
+    language_reward_scope: str | None = None,
     **kwargs,
 ) -> vf.Environment:
     """
@@ -254,6 +255,10 @@ def load_environment(
         judge_temperature:      Sampling temperature for the judge (default: 0.0 = greedy).
                                 Applies to the first attempt; retries after an unparseable
                                 answer sample, since a greedy retry replays it verbatim.
+        language_reward_weight: How much of the reward answering in the wrong language
+                                costs. 0 (default) only exports the language_score metric.
+        language_reward_scope:  What the language is judged on — "answer" (default) or
+                                "full", which includes the reasoning trace.
     """
     # The Finnish dataset ships Finnish prompts, so the English default would push
     # replies back to English. An explicit override (including "") still wins.
@@ -326,6 +331,7 @@ def load_environment(
             judge_temperature=judge_temperature,
             use_finnish=use_finnish,
             language_reward_weight=language_reward_weight,
+            language_reward_scope=language_reward_scope,
         )
     else:
         rubric = RubricJudgeRubric(rm_model_path=rm_model_path, rm_device=rm_device, rm_server_url=rm_server_url, rm_max_response_chars=rm_max_response_chars)

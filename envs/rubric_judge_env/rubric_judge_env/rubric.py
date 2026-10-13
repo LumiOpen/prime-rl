@@ -5,6 +5,12 @@ import random
 import re
 
 import verifiers as vf
+from language_reward import (
+    apply_language_reward,
+    language_score,
+    resolve_language_reward,
+    select_text,
+)
 
 logger = logging.getLogger("verifiers.v1")
 
@@ -466,6 +472,12 @@ class LLMJudgeRubric(vf.Rubric):
     0.1), so it drags the whole GRPO group baseline down and manufactures advantage.
     prime-rl drops errored rollouts from the batch and reports the rate as
     ``all/has_error/mean`` plus ``all/error/<type>`` counts.
+
+    ``language_reward_weight`` scales the judge score by how well the response's
+    language matches the question's, exactly as in the IFEval envs. What gets scored
+    follows ``use_finnish``: the Finnish arm grades the whole completion, reasoning
+    included, the English arm only the final answer. ``language_reward_scope``
+    overrides that choice.
     """
 
     def __init__(
@@ -478,6 +490,7 @@ class LLMJudgeRubric(vf.Rubric):
         judge_prompt_style: str = "legacy",
         use_finnish: bool = False,
         language_reward_weight: float = 0.0,
+        language_reward_scope: str | None = None,
     ):
         super().__init__()
         if judge_prompt_style not in _JUDGE_STYLES:
@@ -495,6 +508,9 @@ class LLMJudgeRubric(vf.Rubric):
         self._max_judge_tokens = max_judge_tokens
         self._judge_temperature = judge_temperature
         self._language_reward_weight = language_reward_weight
+        self._language_reward_scope = resolve_language_reward(
+            language_reward_weight, language_reward_scope, finnish=use_finnish
+        )
         self._session = None
         if judge_prompt_style == "open-instruct" and max_judge_tokens < 256:
             logger.warning(
@@ -503,7 +519,7 @@ class LLMJudgeRubric(vf.Rubric):
                 max_judge_tokens,
             )
         self.add_reward_func(self.llm_judge_score)
-        self.add_metric(self.language_score_metric)
+        self.add_metric(language_score)
 
     def _render_prompt(self, question: str, answer: str, reference: str, category: str) -> str:
         use_ref = category == "general-quality_ref" and reference
@@ -614,16 +630,12 @@ class LLMJudgeRubric(vf.Rubric):
             state["error"] = error
             return 0.0
 
-        try:
-            from language_reward import compute_language_score
-            lang_text = _extract_text(completion, strip_think=False) if self._use_finnish else response_text
-            lang_score = compute_language_score(question, lang_text)
-            if state is not None:
-                state["_lang_score"] = lang_score
-            if self._language_reward_weight > 0.0:
-                score = score * (1.0 - self._language_reward_weight + self._language_reward_weight * lang_score)
-        except Exception:
-            pass
+        lang_text = select_text(
+            self._language_reward_scope, response_text, _extract_text(completion, strip_think=False)
+        )
+        score = apply_language_reward(
+            score, question, lang_text, self._language_reward_weight, state
+        )
 
         if random.random() < _LOG_SAMPLE_RATE:
             if isinstance(completion, list):
@@ -647,6 +659,3 @@ class LLMJudgeRubric(vf.Rubric):
                 f"  score: {score:.2f}"
             )
         return score
-
-    def language_score_metric(self, completion, answer, info, state, **kwargs) -> float:
-        return state.get("_lang_score", 1.0)

@@ -19,6 +19,12 @@ import random
 
 from ifeval_env.env import SYSTEM_PROMPT, _check_constraints, is_unterminated
 from ifeval_env.IFEvalG.instructions_registry import INSTRUCTION_DICT
+from language_reward import (
+    apply_language_reward,
+    language_score,
+    resolve_language_reward,
+    select_text,
+)
 
 import verifiers as vf
 from datasets import Dataset
@@ -56,6 +62,7 @@ def load_environment(
     system_prompt: str | None = SYSTEM_PROMPT,
     reasoning_model: bool = True,
     language_reward_weight: float = 0.0,
+    language_reward_scope: str | None = None,
     **kwargs,
 ) -> vf.Environment:
     """Build and return the Dolci IFEval verifiers environment.
@@ -70,15 +77,25 @@ def load_environment(
             response that never closes its block scores 0 instead of having the
             reasoning trace graded as the answer. Set False for a model that
             does not reason, otherwise every rollout scores 0.
+        language_reward_weight: How much of the reward answering in the wrong
+            language costs. 0 (default) only exports the language_score metric.
+        language_reward_scope: What the language is judged on. This English env
+            defaults to "answer"; pass "full" to grade the reasoning trace too.
         **kwargs: Forwarded to SingleTurnEnv.
     """
     system_prompt = system_prompt or None
+    language_reward_scope = resolve_language_reward(language_reward_weight, language_reward_scope)
 
     def _load_raw() -> Dataset:
         import os
         from datasets import load_dataset, load_from_disk
 
-        if os.path.isdir(dataset_name):
+        # save_to_disk output carries a state file; a plain HF repo snapshot
+        # (README.md + data/*.parquet) does not and must go through load_dataset.
+        saved = os.path.exists(os.path.join(dataset_name, "dataset_state.json")) or os.path.exists(
+            os.path.join(dataset_name, "dataset_dict.json")
+        )
+        if os.path.isdir(dataset_name) and saved:
             ds = load_from_disk(dataset_name)
         else:
             ds = load_dataset(dataset_name, split=train_split)
@@ -146,25 +163,13 @@ def load_environment(
                 + "\n".join(f"    {r}" for r in results)
             )
 
-        try:
-            from language_reward import compute_language_score
-            _prompt = kwargs.get("prompt", [])
-            question = _prompt[-1].get("content", "") if _prompt else ""
-            lang_score = compute_language_score(question, strip_think_blocks(response))
-            if state is not None:
-                state["_lang_score"] = lang_score
-            if language_reward_weight > 0.0:
-                score = score * (1.0 - language_reward_weight + language_reward_weight * lang_score)
-        except Exception:
-            pass
-
-        return score
-
-    def _lang_score_metric(completion, answer, info, state=None, **kwargs) -> float:
-        return (state or {}).get("_lang_score", 1.0)
+        prompt = kwargs.get("prompt", [])
+        question = prompt[-1].get("content", "") if prompt else ""
+        text = select_text(language_reward_scope, strip_think_blocks(response), response)
+        return apply_language_reward(score, question, text, language_reward_weight, state)
 
     rubric = vf.Rubric(funcs=[ifeval_reward_func])
-    rubric.add_metric(_lang_score_metric)
+    rubric.add_metric(language_score)
 
     return vf.SingleTurnEnv(
         dataset=build_dataset,

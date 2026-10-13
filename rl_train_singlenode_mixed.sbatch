@@ -178,6 +178,25 @@ LENGTH_PENALTY_WEIGHT=${LENGTH_PENALTY_WEIGHT:-1.0}
 # and would otherwise score 0 on every rollout.
 REASONING_MODEL=${REASONING_MODEL:-1}
 
+# ── Language-consistency reward ──
+# fastText LID compares the language of the answer to the language of the question
+# and scales the env reward: reward *= (1 - w) + w * language_score. w = 0.2 caps the
+# penalty at 20%; w = 0 (default) only logs the language_score metric, which is the
+# way to measure the problem before paying for it. Applied identically by ifeval-en,
+# ifeval-fi, rubric-judge-en and rubric-judge-fi.
+# Scope: "answer" grades the final answer only, "full" also grades the reasoning trace
+# (a model that thinks in English and answers in Finnish passes "answer", fails "full").
+# Left unset the envs pick their own: Finnish arms grade "full" because the point of
+# training on Finnish is that the model reasons in Finnish too, English arms "answer".
+# Setting it here overrides that asymmetry for every arm at once.
+LANGUAGE_REWARD_WEIGHT=${LANGUAGE_REWARD_WEIGHT:-0.0}
+LANGUAGE_REWARD_SCOPE=${LANGUAGE_REWARD_SCOPE:-}
+LANGUAGE_REWARD_SCOPE_LINE=""
+[ -n "$LANGUAGE_REWARD_SCOPE" ] && LANGUAGE_REWARD_SCOPE_LINE="language_reward_scope = \"$LANGUAGE_REWARD_SCOPE\""
+# The LID model is 126 MB and not in the repo; it is fetched below if missing. This is
+# where language_reward looks by default, so a manual `python -m language_reward` lands here.
+FASTTEXT_LID_PATH=${FASTTEXT_LID_PATH:-$BASE/lid.176.bin}
+
 PORT=8000
 RM_PORT=8001
 TRAINER_RDZV_PORT=29501
@@ -204,13 +223,16 @@ EN_IFEVAL_DATASET="${EN_IFEVAL_DATASET:-$DATASETS/Dolci-Think-RL-7B}"
 EN_JUDGE_DATASET="${EN_JUDGE_DATASET:-$DATASETS/Dolci-Think-RL-7B}"
 FI_JUDGE_DATASET="${FI_JUDGE_DATASET:-$DATASETS/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi.jsonl}"
 EN_MATH_DATASET="${EN_MATH_DATASET:-$DATASETS/klear_math_30k_en}"
-# Repetition env: dolci math prompts, scored only on absence of loops. min_passrate
-# 0.05 drops exactly dolci's passrate == 0 rows (next value up is 1/8) — job 53239
-# showed those fire least and run 3k tokens shorter.
+# Repetition env: dolci prompts, scored only on absence of loops. min_passrate 0.05
+# drops exactly dolci's passrate == 0 rows (next value up is 1/8) — job 53239 showed
+# those fire least and run 3k tokens shorter. REPETITION_CATEGORIES is a space-separated
+# list of dolci splits; each gets its own env replica, and therefore its own reward
+# trace, so "math ifeval" shows which prompt distribution is carrying the signal.
 REPETITION_DATASET="${REPETITION_DATASET:-$DATASETS/Dolci-Think-RL-7B}"
+REPETITION_CATEGORIES="${REPETITION_CATEGORIES:-math}"
 REPETITION_REWARD_MODE="${REPETITION_REWARD_MODE:-blockcov}"
 REPETITION_MIN_PASSRATE="${REPETITION_MIN_PASSRATE:-0.05}"
-# No env block emits the Finnish math or Finnish ifeval envs yet; paths recorded here.
+# FI_IFEVAL_DATASET is emitted when IFEVAL_FI=1; no env block emits Finnish math yet.
 FI_MATH_DATASET="${FI_MATH_DATASET:-$DATASETS/klear_math_30k_fi}"
 FI_IFEVAL_DATASET="${FI_IFEVAL_DATASET:-$DATASETS/ifeval-fi/fi_dataset.jsonl}"
 
@@ -225,6 +247,9 @@ echo "Inference:    GPUs $INF_GPU_LIST (DP=$NUM_INF_GPUS)"
 echo "Trainer:      GPUs $TRAIN_GPU_LIST ($NUM_TRAIN_GPUS workers)"
 NO_MATH=${NO_MATH:-0}
 JUDGE_FI=${JUDGE_FI:-0}
+# The Finnish IFEval twin, gated like JUDGE_FI. Same constraint checkers adapted to
+# Finnish, prompts from the strip-translate-regenerate pipeline.
+IFEVAL_FI=${IFEVAL_FI:-0}
 if [ "$IFEVAL_ONLY" = "1" ]; then
     ENVS_DESC="ifeval-en only"
 elif [ "$JUDGE_ONLY" = "1" ]; then
@@ -232,16 +257,20 @@ elif [ "$JUDGE_ONLY" = "1" ]; then
 elif [ "$MATH_ONLY" = "1" ]; then
     ENVS_DESC="english-math only"
 elif [ "$REPETITION_ONLY" = "1" ]; then
-    ENVS_DESC="repetition-en only (reward_mode=$REPETITION_REWARD_MODE)"
+    ENVS_DESC="repetition only, categories: $REPETITION_CATEGORIES (reward_mode=$REPETITION_REWARD_MODE)"
 elif [ "$NO_MATH" = "1" ]; then
     ENVS_DESC="ifeval-en, rubric-judge-en"
 else
     ENVS_DESC="ifeval-en, rubric-judge-en, math-en"
 fi
+if [ "$IFEVAL_FI" = "1" ] && [ "$MATH_ONLY" != "1" ] && [ "$JUDGE_ONLY" != "1" ] && [ "$REPETITION_ONLY" != "1" ]; then
+    ENVS_DESC="$ENVS_DESC, ifeval-fi"
+fi
 if [ "$JUDGE_FI" = "1" ] && [ "$NEEDS_JUDGE" = "1" ]; then
     ENVS_DESC="$ENVS_DESC, rubric-judge-fi"
 fi
 echo "Envs:         $ENVS_DESC"
+echo "Lang reward:  weight $LANGUAGE_REWARD_WEIGHT, scope ${LANGUAGE_REWARD_SCOPE:-auto (fi=full, en=answer)}$([ "$LANGUAGE_REWARD_WEIGHT" = "0.0" ] && echo " (metric only)")"
 echo "Model:        $SFT_MODEL"
 [ "$NEEDS_JUDGE" = "1" ] && echo "Judge model:  $JUDGE_MODEL"
 echo "Seq len:      $INF_SEQ_LEN"
@@ -355,11 +384,34 @@ name = "ifeval-en"
 [train.env.args]
 dataset_name = "$EN_IFEVAL_DATASET"
 reasoning_model = $(if [ "$REASONING_MODEL" = "1" ]; then echo true; else echo false; fi)
+language_reward_weight = $LANGUAGE_REWARD_WEIGHT
+$LANGUAGE_REWARD_SCOPE_LINE
 TOMLEOF
 if [ "${NO_SYSTEM_PROMPT:-0}" = "1" ]; then
 cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
 system_prompt = ""
 TOMLEOF
+fi
+
+if [ "$IFEVAL_FI" = "1" ]; then
+cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
+
+[[train.env]]
+id = "dolci-ifeval-env-fi"
+name = "ifeval-fi"
+
+[train.env.args]
+dataset_name = "$FI_IFEVAL_DATASET"
+reasoning_model = $(if [ "$REASONING_MODEL" = "1" ]; then echo true; else echo false; fi)
+language_reward_weight = $LANGUAGE_REWARD_WEIGHT
+$LANGUAGE_REWARD_SCOPE_LINE
+TOMLEOF
+# The Finnish env's own default system prompt is Finnish; NO_SYSTEM_PROMPT still wins.
+if [ "${NO_SYSTEM_PROMPT:-0}" = "1" ]; then
+cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
+system_prompt = ""
+TOMLEOF
+fi
 fi
 fi
 
@@ -386,6 +438,8 @@ judge_model_path = "$JUDGE_MODEL"
 rm_server_url = "http://127.0.0.1:${RM_PORT}"
 judge_prompt_style = "$JUDGE_PROMPT_STYLE"
 max_judge_tokens = $MAX_JUDGE_TOKENS
+language_reward_weight = $LANGUAGE_REWARD_WEIGHT
+$LANGUAGE_REWARD_SCOPE_LINE
 TOMLEOF
 if [ "${NO_SYSTEM_PROMPT:-0}" = "1" ]; then
 cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
@@ -411,6 +465,8 @@ judge_prompt_style = "$JUDGE_PROMPT_STYLE"
 max_judge_tokens = $MAX_JUDGE_TOKENS
 dataset_path = "$FI_JUDGE_DATASET"
 use_finnish = true
+language_reward_weight = $LANGUAGE_REWARD_WEIGHT
+$LANGUAGE_REWARD_SCOPE_LINE
 TOMLEOF
 if [ "${NO_SYSTEM_PROMPT:-0}" = "1" ]; then
 cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
@@ -421,14 +477,16 @@ fi
 fi
 
 if [ "$REPETITION_ONLY" = "1" ]; then
+for CATEGORY in $REPETITION_CATEGORIES; do
 cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
 
 [[train.env]]
 id = "repetition-env"
-name = "repetition-en"
+name = "repetition-$CATEGORY"
 
 [train.env.args]
 dataset_path = "$REPETITION_DATASET"
+categories = ["$CATEGORY"]
 reward_mode = "$REPETITION_REWARD_MODE"
 min_passrate = $REPETITION_MIN_PASSRATE
 TOMLEOF
@@ -437,6 +495,7 @@ cat >> "$OUTPUT_DIR/orch_config.toml" << TOMLEOF
 system_prompt = ""
 TOMLEOF
 fi
+done
 fi
 
 # No in-loop eval: aime25 is 30 problems at 1 sample, so its score is dominated by
@@ -544,6 +603,7 @@ export RCCL_NET_GDR_LEVEL=2
 export NCCL_SOCKET_IFNAME=eno0
 export GLOO_SOCKET_IFNAME=eno0
 export PYTHONUNBUFFERED=1
+export FASTTEXT_LID_PATH=$FASTTEXT_LID_PATH
 $([ -n "$LOG_LEVEL" ] && echo "export PRIME_LOG_LEVEL=$LOG_LEVEL")
 ENVEOF
 if [ -z "${WANDB_API_KEY:-}" ] && [ -f "$HOME/.bashrc" ]; then
@@ -586,6 +646,16 @@ singularity exec $CONTAINER_FLAGS $BIND_MOUNTS "$IMG" \
 # ── Download NLTK data required by Finnish IFEval env ──
 singularity exec $CONTAINER_FLAGS $BIND_MOUNTS "$IMG" \
     bash -c "source $ENV_SETUP && uv run python -c \"import nltk; nltk.download('punkt_tab', quiet=True)\""
+
+# ── Download the fastText LID model used by the language-consistency reward ──
+# Fetched even at weight 0, so the language_score metric is never a flat 1.0 that
+# looks like perfect language consistency. The envs refuse to start without it when
+# the weight is non-zero.
+if [ ! -f "$FASTTEXT_LID_PATH" ]; then
+    echo "Fetching fastText LID model to $FASTTEXT_LID_PATH..."
+    singularity exec $CONTAINER_FLAGS $BIND_MOUNTS "$IMG" \
+        bash -c "source $ENV_SETUP && uv run python -m language_reward"
+fi
 
 # ── Launch policy inference server on INF GPUs ──
 echo "Starting policy inference server on GPUs $INF_GPU_LIST..."

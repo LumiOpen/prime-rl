@@ -15,6 +15,12 @@ from dolci_ifeval_env.IFEvalG_fi import instructions_registry_fi
 from dolci_ifeval_env.IFEvalG_fi import instructions_util_fi
 from dolci_ifeval_env.utils import strip_think_blocks
 from ifeval_env.env import is_unterminated
+from language_reward import (
+    apply_language_reward,
+    language_score,
+    resolve_language_reward,
+    select_text,
+)
 
 import verifiers as vf
 from datasets import Dataset
@@ -107,6 +113,7 @@ def load_environment(
     system_prompt: str | None = SYSTEM_PROMPT_FI,
     reasoning_model: bool = True,
     language_reward_weight: float = 0.0,
+    language_reward_scope: str | None = None,
     **kwargs,
 ) -> vf.Environment:
     """Build and return the Finnish Dolci IFEval verifiers environment.
@@ -120,9 +127,17 @@ def load_environment(
             response that never closes its block scores 0 instead of having the
             reasoning trace graded as the answer. Set False for a model that
             does not reason, otherwise every rollout scores 0.
+        language_reward_weight: How much of the reward answering in the wrong
+            language costs. 0 (default) only exports the language_score metric.
+        language_reward_scope: What the language is judged on. This Finnish env
+            defaults to "full" — the reasoning trace has to be Finnish too, matching
+            the Finnish judge arm. Pass "answer" to grade the final answer only.
         **kwargs: Forwarded to SingleTurnEnv.
     """
     system_prompt = system_prompt or None
+    language_reward_scope = resolve_language_reward(
+        language_reward_weight, language_reward_scope, finnish=True
+    )
 
     def _load_raw() -> Dataset:
         import os
@@ -196,25 +211,13 @@ def load_environment(
                 + "\n".join(f"    {r}" for r in results)
             )
 
-        try:
-            from language_reward import compute_language_score
-            _prompt = kwargs.get("prompt", [])
-            question = _prompt[-1].get("content", "") if _prompt else ""
-            lang_score = compute_language_score(question, _remove_thinking_section(response))
-            if state is not None:
-                state["_lang_score"] = lang_score
-            if language_reward_weight > 0.0:
-                score = score * (1.0 - language_reward_weight + language_reward_weight * lang_score)
-        except Exception:
-            pass
-
-        return score
-
-    def _lang_score_metric(completion, answer, info, state=None, **kwargs) -> float:
-        return (state or {}).get("_lang_score", 1.0)
+        prompt = kwargs.get("prompt", [])
+        question = prompt[-1].get("content", "") if prompt else ""
+        text = select_text(language_reward_scope, _remove_thinking_section(response), response)
+        return apply_language_reward(score, question, text, language_reward_weight, state)
 
     rubric = vf.Rubric(funcs=[ifeval_reward_func_fi])
-    rubric.add_metric(_lang_score_metric)
+    rubric.add_metric(language_score)
 
     return vf.SingleTurnEnv(
         dataset=build_dataset,

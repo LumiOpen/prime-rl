@@ -50,6 +50,7 @@ dependencies = [
     "rubric-judge-env",
     "dolci-ifeval-env",
     "repetition-env",
+    "language-reward",
     "aime25-v1",
     "ifbench-v1",
 ]
@@ -186,6 +187,10 @@ math-env = { index = "primeintellect" }
 rubric-judge-env = { path = "envs/rubric_judge_env", editable = true }
 dolci-ifeval-env = { path = "envs/dolci_ifeval_env", editable = true }
 repetition-env = { path = "envs/repetition_env", editable = true }
+# Shared by rubric-judge-env and dolci-ifeval-env. It is a root dependency rather
+# than a dependency of each env because those are plain path deps, not workspace
+# members, so uv would not resolve a `language-reward` of theirs to this directory.
+language-reward = { path = "envs/language_reward", editable = true }
 aime25-v1 = { workspace = true }
 ifbench-v1 = { workspace = true }
 # prime-rl depends on the one `verifiers` package (v0 + v1 + the legacy bridge + the built-in v1
