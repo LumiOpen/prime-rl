@@ -183,9 +183,7 @@ echo "Point pyproject.toml at it:"
 echo "  [tool.uv.sources]"
 echo "  flash-attn = { path = \"$WHEEL_DIR/$(basename "$WHEEL")\" }"
 echo
-echo "Then: uv lock && uv sync --extra flash-attn"
-echo "  Use --extra flash-attn, NOT --all-extras: the disagg extra pulls deep-ep and"
-echo "  quack pulls quack-kernels, both of which are CUDA-only and fail on LUMI."
+echo "Then: uv lock && uv sync --all-extras"
 BUILDEOF
 
 singularity exec --cleanenv \
