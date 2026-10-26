@@ -117,9 +117,13 @@ uv pip install "torch==$TORCH_VERSION" --index-url "$TORCH_INDEX"
 uv pip install cmake ninja packaging setuptools setuptools-scm wheel jinja2 regex numpy setuptools_rust
 
 # vLLM has a Rust component; the container ships no cargo.
+# --no-modify-path is required, not cosmetic: rustup-init appends to ~/.profile by
+# default and $HOME is bind-mounted read-only, so without it the installer aborts
+# with "could not amend shell profile ... Read-only file system". PATH is set below.
 if ! command -v cargo >/dev/null; then
     echo "--- installing rust toolchain ---"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --default-toolchain none
 fi
 export PATH="$CARGO_HOME/bin:$PATH"
 rustup show   # honours rust-toolchain.toml rather than pulling stable first

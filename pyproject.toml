@@ -135,7 +135,9 @@ environments = [
 override-dependencies = [
     "torch==2.13.0+rocm7.2",
     "torchvision==0.28.0+rocm7.2",
-    "triton-rocm==3.7.0",
+    # 3.7.1, not 3.7.0: this is what torch 2.13.0+rocm7.2 pulls in on its own, and
+    # it is what both wheels above were actually built against (job 23185302).
+    "triton-rocm==3.7.1",
     "openenv-core",
 ]
 
@@ -279,7 +281,7 @@ vllm-router = [
 # Each wheel is valid for exactly one (torch, python, GPU arch) triple — rebuild and
 # re-pin both whenever the torch override above moves.
 vllm = { path = "/scratch/project_462001516/users/khakala/wheels/REBUILD-vllm-0.32.0-rocm72-torch2.13-cp312-linux_x86_64.whl" }
-flash-attn = { path = "/scratch/project_462001516/users/khakala/wheels/REBUILD-flash_attn-2.8.3-rocm72-torch2.13-cp312-linux_x86_64.whl" }
+flash-attn = { path = "/scratch/project_462001516/users/khakala/wheels/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl" }
 deep-ep = [
     { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_x86_64.whl", marker = "platform_machine == 'x86_64'" },
     { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_aarch64.whl", marker = "platform_machine == 'aarch64'" },
