@@ -112,9 +112,12 @@ echo "--- build environment ---"
 uv venv --python "$PYTHON_VERSION" "$VENV"
 source "$VENV/bin/activate"
 uv pip install "torch==$TORCH_VERSION" --index-url "$TORCH_INDEX"
-# vLLM omits setuptools_rust from build-system.requires, which only bites with
-# --no-build-isolation; the rest is requirements/build.txt minus torch.
-uv pip install cmake ninja packaging setuptools setuptools-scm wheel jinja2 regex numpy setuptools_rust
+# Mirrors requirements/build/rocm.txt minus the torch lines. The bounds are not
+# decoration: the ROCm build caps cmake below 4 (left unpinned, uv installs 4.x and
+# the CMake run fails), and setuptools below 80. Re-read that file when bumping
+# VLLM_VERSION — it is the only authority on what this build expects.
+uv pip install "cmake>=3.26.1,<4" ninja "packaging>=26.2" "setuptools>=78.1.1,<80" \
+    "setuptools-scm>=8" "setuptools-rust>=1.9.0" wheel "jinja2>=3.1.6" regex numpy
 
 # vLLM has a Rust component; the container ships no cargo.
 # --no-modify-path is required, not cosmetic: rustup-init appends to ~/.profile by
@@ -131,7 +134,18 @@ rustup show   # honours rust-toolchain.toml rather than pulling stable first
 echo "--- pinning build to the installed torch ---"
 # Drops torch from vLLM's requirements: stops the build pulling its own copy, and
 # strips the torch== pin from the wheel metadata so uv can install the locked one.
-python use_existing_torch.py
+# It lived at the repo root through v0.26 and moved to tools/ by v0.32. Skipping it
+# is not an option — the build would silently pull vLLM's own torch and produce a
+# wheel linked against the wrong libtorch — so a miss is a hard error.
+if [ -f use_existing_torch.py ]; then
+    python use_existing_torch.py
+elif [ -f tools/use_existing_torch.py ]; then
+    python tools/use_existing_torch.py
+else
+    echo "ERROR: use_existing_torch.py not found at the repo root or in tools/."
+    echo "       It has moved again; locate it before building $VLLM_VERSION."
+    exit 1
+fi
 
 echo "--- compiling (30-60 min at 64 jobs) ---"
 export VLLM_TARGET_DEVICE=rocm
