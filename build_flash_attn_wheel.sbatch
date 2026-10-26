@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=08:00:00
-#SBATCH --output=/scratch/project_462001516/users/khakala/lib/prime-rl/logs/build_flash_attn_%j.out
-#SBATCH --error=/scratch/project_462001516/users/khakala/lib/prime-rl/logs/build_flash_attn_%j.err
+#SBATCH --output=/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main/logs/build_flash_attn_%j.out
+#SBATCH --error=/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main/logs/build_flash_attn_%j.err
 
 # =============================================================================
 #   Build a flash-attn wheel for LUMI-G (MI250X / gfx90a) against the exact
@@ -37,7 +37,7 @@
 set -euo pipefail
 
 PROJECT="project_462001516"
-BASE="/scratch/$PROJECT/users/khakala/lib/prime-rl"
+BASE="/scratch/$PROJECT/users/khakala/lib/prime-rl-upstream-main"
 IMG="${CONTAINER_IMG:-/appl/local/laifs/containers/lumi-multitorch-latest.sif}"
 
 # Cloned with --recursive: the ROCm path compiles csrc/composable_kernel, which is
@@ -49,7 +49,7 @@ TORCH_VERSION="${TORCH_VERSION:-2.11.0+rocm7.2}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/rocm7.2}"
 GPU_ARCH="${GPU_ARCH:-gfx90a}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
-WHEEL_DIR="${WHEEL_DIR:-$BASE/wheels}"
+WHEEL_DIR="${WHEEL_DIR:-/scratch/$PROJECT/users/khakala/wheels}"
 
 # Budget ~4-8 GB of RAM per concurrent hipcc; CK translation units are large. With
 # the default 128G/16cpu that is comfortable. If you raise --cpus-per-task, raise

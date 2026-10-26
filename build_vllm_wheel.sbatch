@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
-#SBATCH --output=/scratch/project_462001516/users/khakala/lib/prime-rl/logs/build_vllm_%j.out
-#SBATCH --error=/scratch/project_462001516/users/khakala/lib/prime-rl/logs/build_vllm_%j.err
+#SBATCH --output=/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main/logs/build_vllm_%j.out
+#SBATCH --error=/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main/logs/build_vllm_%j.err
 
 # =============================================================================
 #   Build a vLLM wheel for LUMI-G (MI250X / gfx90a), linked against the exact
@@ -30,7 +30,7 @@
 set -euo pipefail
 
 PROJECT="project_462001516"
-BASE="/scratch/$PROJECT/users/khakala/lib/prime-rl"
+BASE="/scratch/$PROJECT/users/khakala/lib/prime-rl-upstream-main"
 IMG="${CONTAINER_IMG:-/appl/local/laifs/containers/lumi-multitorch-latest.sif}"
 
 VLLM_VERSION="${VLLM_VERSION:-v0.26.0}"
@@ -38,7 +38,7 @@ TORCH_VERSION="${TORCH_VERSION:-2.11.0+rocm7.2}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/rocm7.2}"
 ROCM_ARCH="${ROCM_ARCH:-gfx90a}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
-WHEEL_DIR="${WHEEL_DIR:-$BASE/wheels}"
+WHEEL_DIR="${WHEEL_DIR:-/scratch/$PROJECT/users/khakala/wheels}"
 JOBS="${MAX_JOBS:-${SLURM_CPUS_PER_TASK:-16}}"
 
 # Node-local: a HIP build writes thousands of object files and Lustre is poor at that.
