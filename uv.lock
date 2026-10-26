@@ -3523,6 +3523,17 @@ wheels = [
 ]
 
 [[package]]
+name = "prime-kernels"
+version = "0.1.0"
+source = { directory = "deps/prime-kernels" }
+dependencies = [
+    { name = "torch" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "torch", specifier = ">=2.9.0" }]
+
+[[package]]
 name = "prime-pydantic-config"
 source = { editable = "deps/pydantic-config" }
 dependencies = [
@@ -3595,6 +3606,7 @@ all = [
     { name = "fastapi" },
     { name = "flash-attn" },
     { name = "flash-linear-attention" },
+    { name = "prime-kernels" },
     { name = "torch" },
     { name = "torchao" },
     { name = "torchdata" },
@@ -3614,6 +3626,7 @@ gpu = [
     { name = "amdsmi" },
     { name = "dion" },
     { name = "flash-linear-attention" },
+    { name = "prime-kernels" },
     { name = "torch" },
     { name = "torchao" },
     { name = "torchdata" },
@@ -3651,6 +3664,7 @@ requires-dist = [
     { name = "openai", specifier = ">=1.106.1" },
     { name = "orjson", specifier = ">=3.11.0" },
     { name = "prime", specifier = ">=0.8.0" },
+    { name = "prime-kernels", marker = "sys_platform == 'linux' and extra == 'gpu'", directory = "deps/prime-kernels" },
     { name = "prime-pydantic-config", editable = "deps/pydantic-config" },
     { name = "prime-rl", extras = ["dashboard"], marker = "extra == 'all'" },
     { name = "prime-rl", extras = ["flash-attn"], marker = "extra == 'all'" },

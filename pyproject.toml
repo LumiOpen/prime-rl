@@ -55,11 +55,13 @@ prime_rl = "prime_rl.inference.patches:apply_shared_vllm_patches"
 # `dynamo`, `flash-attn-3`, `flash-attn-cute`, `disagg`, `quack`, `sonic-moe`,
 # `kernels` — are therefore deleted outright rather than merely left out of `all`.
 #
-# This is not hypothetical tidiness: `flash-attn-4` (the `flash-attn-cute` extra) drops
-# a `cute/` subpackage into the same `flash_attn` namespace as our ROCm flash-attn and
-# pulls in `nvidia-cutlass-dsl`. Importing it raises AttributeError, and the guard in
-# trainer/models/layers/attn.py only catches ImportError — so the trainer dies at
-# startup with "module 'cutlass.cute.core' has no attribute 'ThrMma'".
+# This is not hypothetical tidiness. flash-attention v2.8.3 ships `flash_attn/cute/`,
+# so our own ROCm wheel already provides the module `attn.py` imports at module scope;
+# what `flash-attn-4` added was `nvidia-cutlass-dsl`, which made `import cutlass` inside
+# it *succeed* and then fail on a missing `cute.core.ThrMma`. The guard in
+# trainer/models/layers/attn.py only catches ImportError, so that AttributeError killed
+# the trainer at startup. Without the CUTLASS DSL the same import raises ImportError and
+# is caught, which is why removing these extras is the fix.
 #
 # `vllm-router` was rescued out of `disagg`: it is a prebuilt abi3 Rust binary with no
 # CUDA in it, and multi-node inference needs it. The rest of `disagg` (DeepEP, DeepGEMM,
@@ -87,6 +89,10 @@ gpu = [
     # Multi-node inference fronts the vLLM replicas with this; it is a cp38-abi3 Rust
     # wheel, so it is as ROCm-safe as it is CUDA-safe.
     "vllm-router ; sys_platform == 'linux'",
+    # NOT optional, whatever upstream's `kernels` extra implies: collectives.py imports
+    # it at module scope, so the trainer cannot start without it. Built from the
+    # submodule rather than the cu130 release wheel — see [tool.uv.sources].
+    "prime-kernels ; sys_platform == 'linux'",
 ]
 dashboard = [
     "fastapi>=0.115",
@@ -122,7 +128,14 @@ dev = [
 # *without* the cooldown — bypassing this security policy.
 required-version = ">=0.11.1"
 exclude-newer = "7 days"
-no-build-isolation-package = ["flash-attn"]
+# prime-kernels builds through setup.py, which imports torch to decide what to compile.
+# An isolated build env would resolve that `torch>=2.9.0` from PyPI — a CUDA wheel —
+# because [tool.uv.sources] does not reach build requirements, and `match-runtime` is
+# refused for a setup.py package ("does not declare static metadata"). Building against
+# the project environment instead gets it the ROCm torch, which is what makes setup.py
+# skip every CUDAExtension. Consequence: torch must already be installed when
+# prime-kernels is built, which holds on every sync into an existing environment.
+no-build-isolation-package = ["flash-attn", "prime-kernels"]
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
@@ -219,7 +232,6 @@ torch = { index = "pytorch-rocm" }
 torchvision = { index = "pytorch-rocm" }
 triton-rocm = { index = "pytorch-rocm" }
 torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "23e4dfc" }
-# Upstream's torchao wheel is a CUDA build; take the pure-Python sdist from PyPI.
 amdsmi = { path = "amd_smi" }
 dion = { git = "https://github.com/samsja/dion.git", rev = "0c801b0" }
 vllm-router = [
@@ -239,11 +251,17 @@ vllm-router = [
 # vllm = { path = "/scratch/project_462001516/users/khakala/wheels/REBUILD-vllm-0.32.0-rocm72-torch2.13-cp312-linux_x86_64.whl" }
 flash-attn = { path = "/scratch/project_462001516/users/khakala/wheels/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl" }
 flash-linear-attention = { git = "https://github.com/fla-org/flash-linear-attention" }
+# The submodule, not upstream's `+cu130torch2.13.0` release wheel. `prime_kernels` is a
+# pure-Python loader around optional compiled kernels; its setup.py skips every
+# CUDAExtension when it finds no nvcc and no `torch.version.cuda`, so on ROCm this
+# installs the loader alone. Every `prime_kernels.load(...)` call site is already
+# guarded, and `load()` itself raises a readable RuntimeError when a kernel is absent.
+prime-kernels = { path = "deps/prime-kernels" }
 
-# Upstream's sources for deep-ep, deep-gemm, prime-kernels, deep-select, flash-mla,
-# mamba-ssm, flash_attn_3 and the two flashinfer-* packages are gone with the extras
-# that referenced them. They were cu130/sm_100a wheel URLs; keeping them would leave
-# this file documenting a graph that can no longer be resolved here.
+# Upstream's sources for deep-ep, deep-gemm, deep-select, flash-mla, mamba-ssm,
+# flash_attn_3 and the two flashinfer-* packages are gone with the extras that
+# referenced them. They were cu130/sm_100a wheel URLs; keeping them would leave this
+# file documenting a graph that can no longer be resolved here.
 
 [tool.uv.extra-build-dependencies]
 flash-attn = [{ requirement = "torch", match-runtime = true }]
