@@ -1,12 +1,18 @@
 #!/bin/bash
 #SBATCH --job-name=build-vllm-wheel
-#SBATCH --partition=interactive
+#SBATCH --partition=dev-g
 #SBATCH --account=project_462001516
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --time=04:00:00
+# Without --hint=multithread, --cpus-per-task counts whole cores and only 56 of the
+# node's 64 are user-allocatable, so anything above 56 is rejected outright
+# ("Requested node configuration is not available"). With it, the unit is hardware
+# threads and the full CPUEfctv=112 is available.
+#SBATCH --cpus-per-task=112
+#SBATCH --hint=multithread
+#SBATCH --gpus-per-node=8
+#SBATCH --mem=0
+#SBATCH --time=03:00:00
 #SBATCH --output=/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main/logs/build_vllm_%j.out
 #SBATCH --error=/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main/logs/build_vllm_%j.err
 
@@ -19,8 +25,11 @@
 #   changing TORCH_VERSION:
 #     grep -A3 '^name = "torch"' pyproject-dir/uv.lock
 #
-#   Runs on `interactive` because it clones vLLM and downloads wheels — the GPU
-#   partitions have no outbound internet.
+#   Runs on `dev-g`, whole node: 64 parallel hipcc jobs are what fits the build
+#   inside dev-g's hard 3 h limit. dev-g has outbound internet, so the clone and
+#   the torch download work from the compute node.
+#   Holding the 8 GPUs also makes the post-build import check meaningful — vLLM
+#   probes the platform at import and cannot be verified on a CPU-only node.
 #
 #   Usage:
 #     sbatch build_vllm_wheel.sbatch
@@ -39,7 +48,9 @@ TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/rocm7.2}"
 ROCM_ARCH="${ROCM_ARCH:-gfx90a}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 WHEEL_DIR="${WHEEL_DIR:-/scratch/$PROJECT/users/khakala/wheels}"
-JOBS="${MAX_JOBS:-${SLURM_CPUS_PER_TASK:-16}}"
+# Pinned, not derived from SLURM_CPUS_PER_TASK: the allocation is the whole node
+# (112 threads), but 112 concurrent hipcc processes would exhaust the node's 491 GB.
+JOBS="${MAX_JOBS:-64}"
 
 # Node-local: a HIP build writes thousands of object files and Lustre is poor at that.
 BUILD_ROOT="/tmp/vllm_build_${SLURM_JOB_ID}"
@@ -118,7 +129,7 @@ echo "--- pinning build to the installed torch ---"
 # strips the torch== pin from the wheel metadata so uv can install the locked one.
 python use_existing_torch.py
 
-echo "--- compiling (this takes 30-60 min) ---"
+echo "--- compiling (30-60 min at 64 jobs) ---"
 export VLLM_TARGET_DEVICE=rocm
 export PYTORCH_ROCM_ARCH="$ROCM_ARCH"
 export MAX_JOBS="$JOBS"
@@ -137,8 +148,9 @@ uv pip install "$WHEEL"
 if python -c "import vllm, torch; print('import ok:', vllm.__version__, torch.__version__)"; then
     VERIFIED=yes
 else
-    # Expected on a CPU-only partition: vLLM probes the platform at import.
-    echo "NOTE: import check failed. Re-run it on a GPU node before trusting the wheel."
+    # On dev-g the GPUs are held, so this is a real failure, not a platform-probe
+    # artifact. Read the traceback before re-pinning the wheel in pyproject.toml.
+    echo "NOTE: import check FAILED on a GPU node. Do not trust this wheel."
     VERIFIED=no
 fi
 

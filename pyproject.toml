@@ -274,8 +274,8 @@ vllm-router = [
 # ROCm builds of vLLM and flash-attn. vLLM publishes no ROCm wheel and flash-attn's
 # ROCm path is a HIP extension that links libtorch, so both are built on LUMI by
 # build_vllm_wheel.sbatch / build_flash_attn_wheel.sbatch and pinned by path. A source
-# build during `uv sync` is not an option: it needs hours of nvcc/hipcc time and
-# outbound internet, which the compute partitions do not have.
+# build during `uv sync` is not an option: it needs hours of hipcc time, which it
+# would take out of the walltime of whatever job first creates the environment.
 # Each wheel is valid for exactly one (torch, python, GPU arch) triple — rebuild and
 # re-pin both whenever the torch override above moves.
 vllm = { path = "/scratch/project_462001516/users/khakala/wheels/REBUILD-vllm-0.32.0-rocm72-torch2.13-cp312-linux_x86_64.whl" }

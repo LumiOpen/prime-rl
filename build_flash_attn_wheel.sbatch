@@ -1,12 +1,18 @@
 #!/bin/bash
 #SBATCH --job-name=build-flash-attn-wheel
-#SBATCH --partition=interactive
+#SBATCH --partition=dev-g
 #SBATCH --account=project_462001516
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
-#SBATCH --time=08:00:00
+# Without --hint=multithread, --cpus-per-task counts whole cores and only 56 of the
+# node's 64 are user-allocatable, so anything above 56 is rejected outright
+# ("Requested node configuration is not available"). With it, the unit is hardware
+# threads and the full CPUEfctv=112 is available.
+#SBATCH --cpus-per-task=112
+#SBATCH --hint=multithread
+#SBATCH --gpus-per-node=8
+#SBATCH --mem=0
+#SBATCH --time=03:00:00
 #SBATCH --output=/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main/logs/build_flash_attn_%j.out
 #SBATCH --error=/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main/logs/build_flash_attn_%j.err
 
@@ -19,19 +25,21 @@
 #        and the count multiplies per GPU arch. torch's default arch list covers
 #        every AMD card it supports; pinning GPU_ARCHS to gfx90a alone is by far
 #        the biggest lever. Build once, install everywhere after that.
-#     2. Correctness. A source build needs outbound internet, which `standard-g`
-#        does not have. `uv sync` on a GPU node will fail, not fall back.
+#     2. Determinism. Folded into `uv sync`, that compile reruns on every fresh
+#        environment and would eat the walltime of whatever job triggered it.
 #
 #   Check the torch pin before changing TORCH_VERSION:
 #     grep -A3 '^name = "torch"' /scratch/.../prime-rl/uv.lock
 #   The wheel is valid for exactly one (torch, python, GPU arch) triple.
 #
-#   Runs on `interactive` because it clones the repo and downloads wheels.
+#   Runs on `dev-g`, whole node. dev-g has a hard 3 h limit and the CK compile is
+#   the long pole, so this takes the full node and runs 64 parallel hipcc jobs
+#   rather than the 16 it used to. dev-g has outbound internet, so the recursive
+#   clone and the torch download work from the compute node.
 #
 #   Usage:
 #     sbatch build_flash_attn_wheel.sbatch
 #     FA_VERSION=v2.8.3 GPU_ARCH=gfx90a sbatch build_flash_attn_wheel.sbatch
-#     sbatch --time=12:00:00 --cpus-per-task=32 --mem=256G build_flash_attn_wheel.sbatch
 # =============================================================================
 
 set -euo pipefail
@@ -51,10 +59,12 @@ GPU_ARCH="${GPU_ARCH:-gfx90a}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 WHEEL_DIR="${WHEEL_DIR:-/scratch/$PROJECT/users/khakala/wheels}"
 
-# Budget ~4-8 GB of RAM per concurrent hipcc; CK translation units are large. With
-# the default 128G/16cpu that is comfortable. If you raise --cpus-per-task, raise
-# --mem with it or the node OOMs mid-compile and ninja reports a bare "killed".
-JOBS="${MAX_JOBS:-${SLURM_CPUS_PER_TASK:-16}}"
+# Budget ~4-8 GB of RAM per concurrent hipcc; CK translation units are large. 64
+# jobs therefore wants ~450 GB and the node has 491. That memory ceiling — not the
+# allocation's 112 threads — is what caps JOBS, so it is pinned rather than read
+# from SLURM_CPUS_PER_TASK. Raise it and the node OOMs mid-compile, at which point
+# ninja reports a bare "killed".
+JOBS="${MAX_JOBS:-64}"
 
 # Node-local: a HIP build writes thousands of object files and Lustre is poor at that.
 BUILD_ROOT="/tmp/fa_build_${SLURM_JOB_ID}"
@@ -123,10 +133,10 @@ uv pip install "torch==$TORCH_VERSION" --index-url "$TORCH_INDEX"
 # --no-build-isolation means setup.py runs against exactly these, nothing else.
 uv pip install setuptools wheel packaging ninja psutil einops
 
-echo "--- compiling (expect 1-3 h for one arch; ccache makes reruns far shorter) ---"
-# setup.py defaults GPU_ARCHS to "native", which cannot be detected on a CPU-only
-# interactive node — and even on a GPU node "native" would silently widen to the
-# full torch arch list on some paths. Pin it.
+echo "--- compiling (expect 1-3 h for one arch at 64 jobs; ccache makes reruns far shorter) ---"
+# setup.py defaults GPU_ARCHS to "native". Even on a GPU node that silently widens
+# to the full torch arch list on some paths, multiplying the CK instantiation
+# count. Pin it — this is the single biggest lever on build time.
 export GPU_ARCHS="$GPU_ARCH"
 export PYTORCH_ROCM_ARCH="$GPU_ARCH"
 export MAX_JOBS="$JOBS"
@@ -160,8 +170,9 @@ uv pip install einops "$WHEEL"
 if python -c "import flash_attn, torch; print('import ok:', flash_attn.__version__, torch.__version__)"; then
     VERIFIED=yes
 else
-    # Plausible on a CPU-only partition: the extension links HIP runtime libs.
-    echo "NOTE: import check failed. Re-run it on a GPU node before trusting the wheel."
+    # On dev-g the GPUs are held and the HIP runtime libs are present, so this is
+    # a real failure. Read the traceback before re-pinning the wheel.
+    echo "NOTE: import check FAILED on a GPU node. Do not trust this wheel."
     VERIFIED=no
 fi
 
