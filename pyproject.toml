@@ -50,45 +50,33 @@ dashboard = "prime_rl.entrypoints.dashboard:main"
 prime_rl = "prime_rl.inference.patches:apply_shared_vllm_patches"
 
 [project.optional-dependencies]
+# LUMI (MI250X / gfx90a, ROCm 7.2). Upstream's `gpu` extra is CUDA-only: FlashInfer,
+# FlashMLA, cuDNN-frontend, CUTLASS DSL, NIXL-cu13, deep-select and modelexpress ship
+# no ROCm build, and TileLang/mamba-ssm need nvcc. None of them are imported at module
+# scope outside the DeepSeek-V4 sparse-MLA kernels and the NIXL weight transport, so a
+# ROCm install that omits them reaches the trainer and orchestrator intact.
 gpu = [
     "torch>=2.13.0 ; sys_platform == 'linux'",
     "torchvision ; sys_platform == 'linux'",
-    "torchaudio ; sys_platform == 'linux'",
+    # torchaudio is unused by prime-rl and the rocm7.2 index stops at 2.11, which
+    # would not match the torch 2.13 pin above.
     "torchdata>=0.11.0 ; sys_platform == 'linux'",
     "vllm>=0.32.0 ; sys_platform == 'linux'",
-    "mooncake-transfer-engine>=0.3.10.post2 ; sys_platform == 'linux'",
     "torchtitan ; sys_platform == 'linux'",
     "dion ; sys_platform == 'linux'",
-    "tilelang>=0.1.8 ; sys_platform == 'linux'",
-    # DSA sparse MLA backward kernel (CuTe DSL); >=1.29 matches the pinned CUTLASS DSL 4.7.
-    "nvidia-cudnn-frontend>=1.30.0 ; sys_platform == 'linux'",
-    # DSA sparse MLA forward for the default `model.dsa_backend = "cudnn_flashmla"` (sm_90a + sm_100f).
-    # FlashMLA is not on PyPI and only an x86_64 wheel is published.
-    "flash-mla ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "deep-select ; sys_platform == 'linux'",
     "flash-linear-attention>=0.6.0 ; sys_platform == 'linux'",
-    "mamba-ssm>=2.3.0 ; sys_platform == 'linux'",
-    "nvidia-ml-py>=12.575.51 ; sys_platform == 'linux'",
     "torchao>=0.18.0 ; sys_platform == 'linux'",
-    "modelexpress==0.3.0 ; sys_platform == 'linux'",
-    "nixl-cu13==0.10.1 ; sys_platform == 'linux'",
-    # Precompiled FlashInfer kernels for vLLM's flashinfer-python pin. Without them every fresh node
-    # downloads the trtllm-gen cubins and JIT-builds its modules into its node-local cache at startup.
-    "flashinfer-cubin==0.7.0.post1 ; sys_platform == 'linux'",
-    "flashinfer-jit-cache==0.7.0.post1+cu130 ; sys_platform == 'linux'",
+    "amdsmi ; sys_platform == 'linux'",
 ]
 dashboard = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
 ]
 dynamo = ["ai-dynamo==1.4.2 ; sys_platform == 'linux'"]
-# Both wheels are the same flash-attn 2.8.3 / cu130 / torch 2.13 / cp312 build and carry
-# sm_80 / sm_90 / sm_100 / sm_120 cubins. `attn="auto"` picks FA4 on sm_100 and FA3 on
-# sm_90, so FA2 is the resolved backend on sm_120 (see `_resolve_attn_impl` in
-# trainer/model.py).
+# The upstream prebuilt wheels are cu130 and unusable here; the ROCm build comes from
+# `build_flash_attn_wheel.sbatch` and is pinned by path in [tool.uv.sources].
 flash-attn = [
-    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.47/flash_attn-2.8.3+cu130torch2.13-cp312-cp312-linux_x86_64.whl ; platform_machine == 'x86_64'",
-    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.48/flash_attn-2.8.3+cu130torch2.13-cp312-cp312-linux_aarch64.whl ; platform_machine == 'aarch64'",
+    "flash-attn>=2.8.3 ; platform_machine == 'x86_64'",
 ]
 flash-attn-3 = ["flash_attn_3 ; sys_platform == 'linux'"]
 
@@ -110,14 +98,11 @@ sonic-moe = ["sonic-moe ; sys_platform == 'linux'"]
 kernels = [
     "prime-kernels ; sys_platform == 'linux'",
 ]
+# `disagg`, `quack`, `sonic-moe`, `flash-attn-3` and `flash-attn-cute` are CUDA-only
+# (DeepEP/DeepGEMM/NIXL, CuTe DSL kernels) and are left out of the LUMI aggregate.
 all = [
     "prime-rl[gpu]",
     "prime-rl[flash-attn]",
-    "prime-rl[disagg]",
-    "prime-rl[quack]",
-    "prime-rl[sonic-moe]",
-    "prime-rl[flash-attn-3]",
-    "prime-rl[flash-attn-cute]",
 ]
 
 [dependency-groups]
@@ -141,21 +126,16 @@ exclude-newer = "7 days"
 no-build-isolation-package = ["flash-attn"]
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "sys_platform == 'linux' and platform_machine == 'aarch64'",
-    "sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
-# Override torch's pinned cuDNN to fix the Conv3d performance regression.
-# See: https://github.com/pytorch/pytorch/issues/166122
+# Pin the ROCm builds of torch and triton. Transitive requirements name plain `torch`
+# and `triton`, which resolve to the CUDA wheels and drag in the whole nvidia-* stack;
+# the overrides force every consumer onto the rocm7.2 index instead. The torch version
+# must match whatever `build_vllm_wheel.sbatch` and `build_flash_attn_wheel.sbatch`
+# linked against — the vLLM and flash-attn wheels are valid for exactly one torch ABI.
 override-dependencies = [
-    # Keep vLLM's TileLang version; Nemotron uses Mamba-2's Triton kernels.
-    "tilelang==0.1.12",
-    # Shared by vLLM, TileLang, and the pinned FlashAttention 4 runtime.
-    "apache-tvm-ffi==0.1.11",
-    "nvidia-cudnn-cu13>=9.15 ; sys_platform == 'linux'",
-    # vLLM 0.32.0 requires this exact CUTLASS DSL version and quack-kernels 0.6.5.
-    # Keep this pin aligned with quack-kernels and the flash-attn-4 revision below.
-    "nvidia-cutlass-dsl==4.8.0",
-    "torch>=2.13.0",
+    "torch==2.13.0+rocm7.2",
+    "torchvision==0.28.0+rocm7.2",
+    "triton-rocm==3.7.0",
     "openenv-core",
 ]
 
@@ -277,14 +257,12 @@ prime-rl-configs = { path = "packages/prime-rl-configs", editable = true }
 verifiers = { path = "deps/verifiers", editable = true }
 renderers = { path = "deps/renderers", editable = true }
 prime-pydantic-config = { path = "deps/pydantic-config", editable = true }
-torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
-torchvision = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
-torchaudio = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+torch = { index = "pytorch-rocm" }
+torchvision = { index = "pytorch-rocm" }
+triton-rocm = { index = "pytorch-rocm" }
 torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "23e4dfc" }
-torchao = [
-    { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/torchao-0.18.0+git5f2baf9d5-cp310-abi3-linux_x86_64.whl", marker = "platform_machine == 'x86_64'" },
-    { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/torchao-0.18.0+git5f2baf9d5-cp310-abi3-linux_aarch64.whl", marker = "platform_machine == 'aarch64'" },
-]
+# Upstream's torchao wheel is a CUDA build; take the pure-Python sdist from PyPI.
+amdsmi = { path = "amd_smi" }
 dion = { git = "https://github.com/samsja/dion.git", rev = "0c801b0" }
 sonic-moe = { git = "https://github.com/S1ro1/sonic-moe", rev = "0bf06ac" }
 quack-kernels = { git = "https://github.com/S1ro1/quack", rev = "f62009f" }
@@ -293,10 +271,15 @@ vllm-router = [
     { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.2.3/vllm_router-0.2.3-cp38-abi3-manylinux_2_28_x86_64.whl", marker = "platform_machine == 'x86_64'" },
     { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.2.3/vllm_router-0.2.3-cp38-abi3-manylinux_2_28_aarch64.whl", marker = "platform_machine == 'aarch64'" },
 ]
-vllm = [
-    { url = "https://github.com/vllm-project/vllm/releases/download/v0.32.0/vllm-0.32.0-cp38-abi3-manylinux_2_28_x86_64.whl", marker = "platform_machine == 'x86_64'" },
-    { url = "https://github.com/vllm-project/vllm/releases/download/v0.32.0/vllm-0.32.0-cp38-abi3-manylinux_2_28_aarch64.whl", marker = "platform_machine == 'aarch64'" },
-]
+# ROCm builds of vLLM and flash-attn. vLLM publishes no ROCm wheel and flash-attn's
+# ROCm path is a HIP extension that links libtorch, so both are built on LUMI by
+# build_vllm_wheel.sbatch / build_flash_attn_wheel.sbatch and pinned by path. A source
+# build during `uv sync` is not an option: it needs hours of nvcc/hipcc time and
+# outbound internet, which the compute partitions do not have.
+# Each wheel is valid for exactly one (torch, python, GPU arch) triple — rebuild and
+# re-pin both whenever the torch override above moves.
+vllm = { path = "/scratch/project_462001516/users/khakala/wheels/REBUILD-vllm-0.32.0-rocm72-torch2.13-cp312-linux_x86_64.whl" }
+flash-attn = { path = "/scratch/project_462001516/users/khakala/wheels/REBUILD-flash_attn-2.8.3-rocm72-torch2.13-cp312-linux_x86_64.whl" }
 deep-ep = [
     { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_x86_64.whl", marker = "platform_machine == 'x86_64'" },
     { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_aarch64.whl", marker = "platform_machine == 'aarch64'" },
@@ -332,6 +315,11 @@ mamba-ssm = ["torch>=2.13.0"]
 
 [tool.uv.extra-build-variables]
 flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
