@@ -155,6 +155,11 @@ overrides = [
     { name = "triton-rocm", specifier = "==3.7.1", index = "https://download.pytorch.org/whl/rocm7.2" },
 ]
 
+[[manifest.dependency-metadata]]
+name = "modelexpress"
+version = "0.3.0"
+requires-dist = ["grpcio>=1.66.2", "huggingface-hub>=0.20.0", "numpy>=1.24.0", "protobuf>=5.27.0,<7.0.0", "pydantic>=2.0.0", "torch>=2.6.0"]
+
 [[package]]
 name = "absl-py"
 version = "2.4.0"
@@ -2751,6 +2756,22 @@ wheels = [
 ]
 
 [[package]]
+name = "modelexpress"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "huggingface-hub" },
+    { name = "numpy" },
+    { name = "protobuf" },
+    { name = "pydantic" },
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7c/b5/12f940a41940fd83b9e50ce46124695b68a80feab02612779f8fb584db09/modelexpress-0.3.0-py3-none-any.whl", hash = "sha256:6f93d8de74903f6c11ebf9b4621fa02e3c493a5e05207c38fb2c98395a774618", size = 44333, upload-time = "2026-04-17T20:17:29.478Z" },
+]
+
+[[package]]
 name = "more-itertools"
 version = "11.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3606,6 +3627,7 @@ all = [
     { name = "fastapi" },
     { name = "flash-attn" },
     { name = "flash-linear-attention" },
+    { name = "modelexpress" },
     { name = "prime-kernels" },
     { name = "torch" },
     { name = "torchao" },
@@ -3626,6 +3648,7 @@ gpu = [
     { name = "amdsmi" },
     { name = "dion" },
     { name = "flash-linear-attention" },
+    { name = "modelexpress" },
     { name = "prime-kernels" },
     { name = "torch" },
     { name = "torchao" },
@@ -3659,6 +3682,7 @@ requires-dist = [
     { name = "flash-linear-attention", marker = "sys_platform == 'linux' and extra == 'gpu'", git = "https://github.com/fla-org/flash-linear-attention" },
     { name = "jaxtyping", specifier = ">=0.3.2" },
     { name = "loguru", specifier = ">=0.7.3" },
+    { name = "modelexpress", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = "==0.3.0" },
     { name = "msgspec", specifier = ">=0.18" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "openai", specifier = ">=1.106.1" },

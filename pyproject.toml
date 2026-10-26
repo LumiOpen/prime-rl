@@ -78,7 +78,7 @@ gpu = [
     # torchaudio is unused by prime-rl and the rocm7.2 index stops at 2.11, which
     # would not match the torch 2.13 pin above.
     "torchdata>=0.11.0 ; sys_platform == 'linux'",
-    # TEMP(vllm-wheel): held out until job 23188733 lands the ROCm wheel. Restore
+    # TEMP(vllm-wheel): held out until job 23189736 lands the ROCm wheel. Restore
     # together with the [tool.uv.sources] entry — grep TEMP(vllm-wheel).
     # "vllm>=0.32.0 ; sys_platform == 'linux'",
     "torchtitan ; sys_platform == 'linux'",
@@ -93,6 +93,13 @@ gpu = [
     # it at module scope, so the trainer cannot start without it. Built from the
     # submodule rather than the cu130 release wheel — see [tool.uv.sources].
     "prime-kernels ; sys_platform == 'linux'",
+    # Also not optional: transports/weights/__init__.py imports the NIXL transport
+    # unconditionally, and that module imports `modelexpress.client` at module scope.
+    # Its own `nixl` requirement is dropped below — NIXL is the server-side transport
+    # and has no ROCm build. Kept at upstream's exact pin: unpinned, uv resolves 0.7.0,
+    # which is untested against this client API and drags in boto3 and the three runai
+    # cloud streamers for nothing.
+    "modelexpress==0.3.0 ; sys_platform == 'linux'",
 ]
 dashboard = [
     "fastapi>=0.115",
@@ -184,7 +191,23 @@ exclude = [
     "deps/prime-envs/environments/tool_use/apex_agents",
 ]
 
-# The upstream metadata overrides for modelexpress, ai-dynamo-runtime, nixl and
+# Upstream caps this to the validated protobuf major (ModelExpress 0.3.0 publishes
+# protobuf<6 metadata, but its generated proto is compatible with protobuf 6, and
+# prime-sandboxes requires >=6.31.1). We additionally drop its `nixl` requirement:
+# NIXL is CUDA-only, and the client half prime-rl imports does not touch it.
+[[tool.uv.dependency-metadata]]
+name = "modelexpress"
+version = "0.3.0"
+requires-dist = [
+    "grpcio>=1.66.2",
+    "huggingface_hub>=0.20.0",
+    "numpy>=1.24.0",
+    "protobuf>=5.27.0,<7.0.0",
+    "pydantic>=2.0.0",
+    "torch>=2.6.0",
+]
+
+# The upstream metadata overrides for ai-dynamo-runtime, nixl and
 # nvidia-cutlass-dsl went with the extras that pulled them. If any of those names ever
 # reappears in `uv tree`, something CUDA-only has crept back into the graph — fix that
 # rather than re-adding the override.
