@@ -189,3 +189,9 @@ debug_I2_zero_band
 .idea
 
 third_party/
+
+# LUMI: caches, job logs, and the container-extracted amdsmi bindings (scripts/setup_amdsmi.sh)
+cache/
+logs/
+amd_smi/
+core

@@ -20,6 +20,7 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 
 from prime_rl.control.controller import Controller
 from prime_rl.trainer.world import get_world
+from prime_rl.utils.gpu import is_rocm
 from prime_rl.utils.logger import format_time, get_logger
 from prime_rl.utils.pathing import get_ckpt_dir
 
@@ -140,10 +141,16 @@ def bind_process_to_gpu_numa_node() -> None:
     GPU hangs off. Must run before CPU optimizer state allocation and before the
     OMP thread pool spins up.
     """
-    import pynvml
-
     logger = get_logger()
     device_id = torch.cuda.current_device()
+    if is_rocm():
+        # The bus id comes from NVML, which does not exist here. Skipping costs some
+        # host-memory bandwidth on the offloaded optimizer; nothing is incorrect.
+        logger.warning("NUMA binding needs NVML and is unavailable on ROCm; skipping")
+        return
+
+    import pynvml
+
     pynvml.nvmlInit()
     try:
         bus_id = pynvml.nvmlDeviceGetPciInfo(pynvml.nvmlDeviceGetHandleByIndex(device_id)).busId

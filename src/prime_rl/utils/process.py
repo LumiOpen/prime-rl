@@ -47,15 +47,32 @@ DEFAULT_INFERENCE_ENV_VARS: dict[str, str] = {
 }
 
 
+# Probed in the order the runtimes apply them. ROCr filters the device set first, then
+# HIP/CUDA_VISIBLE_DEVICES indexes into what is left — so when a scheduler hands us
+# ROCR_VISIBLE_DEVICES, the ids below are indices into *that* set, and the per-child
+# CUDA_VISIBLE_DEVICES the launcher sets composes with the inherited filter rather than
+# replacing it. Which is why the launcher must pass logical ids, not node-absolute ones.
+GPU_VISIBILITY_ENV_VARS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
+
+
 def get_physical_gpu_ids() -> list[int]:
     """Return physical GPU IDs visible to the launcher."""
-    raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if raw_visible is None:
-        import pynvml
+    for var in GPU_VISIBILITY_ENV_VARS:
+        raw_visible = os.environ.get(var)
+        if raw_visible is not None:
+            return [int(token.strip()) for token in raw_visible.split(",") if token.strip()]
 
-        pynvml.nvmlInit()
-        return list(range(pynvml.nvmlDeviceGetCount()))
-    return [int(token.strip()) for token in raw_visible.split(",") if token.strip()]
+    from prime_rl.utils.gpu import is_rocm
+
+    if is_rocm():
+        import torch
+
+        return list(range(torch.cuda.device_count()))
+
+    import pynvml
+
+    pynvml.nvmlInit()
+    return list(range(pynvml.nvmlDeviceGetCount()))
 
 
 def partition_gpus(num_infer: int, num_train: int) -> tuple[list[int], list[int]]:

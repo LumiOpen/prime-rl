@@ -4,6 +4,7 @@ from collections.abc import Iterator
 import pynvml
 import torch
 
+from prime_rl.utils.gpu import is_rocm
 from prime_rl.utils.logger import get_logger
 
 
@@ -17,6 +18,10 @@ def disable_nccl_p2p_if_unavailable() -> None:
     Uses pynvml to check physical GPU topology, which works regardless of
     CUDA_VISIBLE_DEVICES restrictions on the current process.
     """
+    if is_rocm():
+        # RCCL's P2P rides Infinity Fabric / xGMI, which needs no NVLink and no
+        # opt-out — and NVML, the only thing this function probes with, is absent.
+        return
     pynvml.nvmlInit()
     try:
         n = pynvml.nvmlDeviceGetCount()

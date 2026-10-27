@@ -66,6 +66,7 @@ from prime_rl.trainer.moe_runtime import configure_moe_runtime
 from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.trainer.utils import get_dcp_group
 from prime_rl.trainer.world import get_world, wait_for_master
+from prime_rl.utils.gpu import is_rocm
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.utils import format_time
 from prime_rl.utils.vlm import get_language_model, get_vision_encoder, is_vlm_architecture
@@ -864,6 +865,13 @@ def resolve_auto_attn(config: ModelConfig) -> None:
     """
     if config.attn != "auto":
         return
+    logger = get_logger()
+    if is_rocm():
+        # gfx90a reports capability (9, 0), so the SM table below would pick FA3 on an
+        # MI250X. FA2 is the only implementation with a ROCm build anyway.
+        config.attn = "flash_attention_2"
+        logger.info(f"Auto-resolved attn='auto' to '{config.attn}' (ROCm {torch.version.hip})")
+        return
     major, minor = torch.cuda.get_device_capability()
     if major in (10, 11):
         resolved = "flash_attention_4"
@@ -871,7 +879,6 @@ def resolve_auto_attn(config: ModelConfig) -> None:
         resolved = "flash_attention_3"
     else:
         resolved = "flash_attention_2"
-    logger = get_logger()
     logger.info(f"Auto-resolved attn='auto' to '{resolved}' (SM{major}{minor})")
     config.attn = resolved
 
