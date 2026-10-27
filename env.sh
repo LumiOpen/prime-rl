@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-BASE=/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main
+# The clone root, derived from this file's own location so nothing here is user-specific.
+# BASH_SOURCE rather than $0 because this script is sourced, not executed.
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Python / pip
 export PIP_CACHE_DIR=$BASE/cache/pip

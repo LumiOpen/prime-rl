@@ -192,6 +192,7 @@ third_party/
 
 # LUMI: caches, job logs, and the container-extracted amdsmi bindings (scripts/setup_amdsmi.sh)
 cache/
-logs/
+logs/*
+!logs/.gitkeep
 amd_smi/
 core

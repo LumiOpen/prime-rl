@@ -16,19 +16,11 @@ git clone --recurse-submodules -b lumi/upstream-main https://github.com/LumiOpen
 cd prime-rl
 ```
 
-## 2. Fix the paths
+## 2. Paths
 
-Three files hardcode the clone location. Replace `khakala` with your own username:
-
-| File | What to change |
-|---|---|
-| `env.sh` line 2 | `BASE=` → your clone path |
-| `run_reverse_text_test.sbatch` line 33 | `BASE=` → your clone path |
-| `run_reverse_text_test.sbatch` lines 14–15 | `--output` / `--error` → your clone's `logs/` |
-
-```bash
-sed -i "s|users/khakala/lib/prime-rl-upstream-main|users/$USER/prime-rl|g" env.sh run_reverse_text_test.sbatch
-```
+**Nothing to edit.** `env.sh` derives the clone root from its own location, and
+`run_reverse_text_test.sbatch` takes it from `$SLURM_SUBMIT_DIR` — so just submit from
+the clone root. The job aborts immediately with a clear message if you don't.
 
 **Do not change the wheel paths** in `pyproject.toml` (`vllm = ...`, `flash-attn = ...`).
 They point at `/scratch/project_462001516/users/khakala/wheels/`, which is group-readable
@@ -77,6 +69,8 @@ Notes:
 
 ## 5. Run the smoke test
 
+From the clone root:
+
 ```bash
 sbatch run_reverse_text_test.sbatch
 ```
@@ -122,5 +116,6 @@ between the two `RUNEOF` markers). The four extra binds over `start_shell.sh` al
 | `Read-only file system: .../.cache/verifiers` | missing the `$HOME/.cache` bind (above) |
 | `undefined symbol: amdsmi_get_gpu_enumeration_info` | stale `amd_smi/`; re-run `scripts/setup_amdsmi.sh` |
 | `Distribution not found at: file:///.../wheels/...` | the wheel pin in `pyproject.toml` was edited or the wheels dir is unreadable |
-| Startup hangs forever with no error | MIOpen cache on Lustre; `MIOPEN_USER_DB_PATH` must be under `/tmp` |
+| Startup hangs forever with no error | MIOpen cache on Lustre; `MIOPEN_USER_DB_PATH` must be under `/tmp`. `env.sh` points it at `<clone>/cache/miopen`; the launcher overrides it, a hand-run does not |
+| `Batch job submission failed` / empty log | submitted from somewhere other than the clone root, so `logs/` did not exist |
 | `No space left` / `Disk quota exceeded` during `uv sync` | caches leaking into `$HOME`; `source env.sh` first |

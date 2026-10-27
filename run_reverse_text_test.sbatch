@@ -11,8 +11,12 @@
 #SBATCH --gpus-per-node=2
 #SBATCH --mem=224G
 #SBATCH --time=01:00:00
-#SBATCH --output=/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main/logs/reverse_text_%j.out
-#SBATCH --error=/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main/logs/reverse_text_%j.err
+# Relative, so this file needs no per-user edits. SLURM resolves these against the
+# submission directory, which is why the test must be submitted from the clone root —
+# and why logs/ is committed (an .sbatch directive cannot mkdir, and a missing output
+# directory kills the job before the first line runs).
+#SBATCH --output=logs/reverse_text_%j.out
+#SBATCH --error=logs/reverse_text_%j.err
 
 # =============================================================================
 #   Smoke test for the LUMI/ROCm port of upstream main: the reverse-text RL
@@ -23,14 +27,18 @@
 #   orchestrator, FSDP training and the NCCL weight transport — on a 0.6B model
 #   that fits anywhere, so a failure is a port bug and not a capacity problem.
 #
-#   Usage:
+#   Submit from the clone root; nothing in this file needs editing.
 #     sbatch run_reverse_text_test.sbatch
 #     MAX_STEPS=3 sbatch run_reverse_text_test.sbatch
 # =============================================================================
 
 set -euo pipefail
 
-BASE="/scratch/project_462001516/users/khakala/lib/prime-rl-upstream-main"
+# SLURM spools a copy of the batch script, so $0 points into /var/spool and BASH_SOURCE
+# is useless here. SLURM_SUBMIT_DIR is the submission directory — hence "from the clone
+# root". The fallback keeps the script runnable outside SLURM.
+BASE="${SLURM_SUBMIT_DIR:-$PWD}"
+[ -f "$BASE/env.sh" ] || { echo "ERROR: submit this from the clone root (no env.sh in $BASE)"; exit 1; }
 IMG="${CONTAINER_IMG:-/appl/local/laifs/containers/lumi-multitorch-latest.sif}"
 CONFIG="${CONFIG:-examples/basic/reverse-text/rl.toml}"
 # 5, not fewer: the example evaluates at interval 5, so this is the cheapest value that
