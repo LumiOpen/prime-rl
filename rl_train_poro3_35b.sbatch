@@ -126,7 +126,14 @@ LR=1e-6
 KL_TAU=0                  # trainer-vs-inference mismatch penalty, not a ref-policy anchor
 DPPO_MASK_LOW=0.2
 DPPO_MASK_HIGH=0.2
-ADV_TAU=2.0
+
+# The config default. adv_tau weights the policy-gradient term against the kl_tau
+# mismatch term, so with kl_tau = 0 it just scales the whole loss — under AdamW that
+# is nearly a no-op on the update direction, but it does scale the raw gradient norm
+# and therefore how often max_norm = 1.0 clips. Our 4B runs all used 2.0, inherited
+# from the dolci config; there is no reason to clip twice as hard on purpose.
+ADV_TAU=1.0
+
 MAX_OFF_POLICY_STEPS=8
 
 # A ceiling, not a target — the run ends when the eval curve flattens. ~260 s/step
