@@ -45,6 +45,11 @@
 #                                        Qwen3.8-27B server we host ourselves.
 #   No per-env weights exist, so the batch splits evenly: ~21 groups each.
 #
+#   The four ifeval/judge envs also carry a language-consistency reward, scored on
+#   the final answer with the reasoning trace stripped. SFT trains English
+#   reasoning with Finnish prompts and Finnish answers, so the trace language is
+#   deliberately not rewarded either way.
+#
 #   GPU layout — 64 GPUs, every node single-purpose:
 #     node 0    8  trainer      ep=1, dp_shard=8, no dp_replicate, no offload.
 #                               Also runs the orchestrator (CPU-bound).
@@ -94,6 +99,11 @@ FI_IFEVAL_DATASET="$DATASETS/ifeval-fi/fi_dataset.jsonl"
 EN_JUDGE_DATASET="$DATASETS/Dolci-Think-RL-7B"
 FI_JUDGE_DATASET="$DATASETS/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi/Dolci-Think-RL-7B-prompt-ground-truth-translated-fi.jsonl"
 
+# fastText LID model for the language-consistency reward, 126 M. This is already
+# the package's default location; naming it keeps the dependency visible and
+# survives the container's --containall view of the filesystem.
+LID_MODEL="$PRIME_RL_DIR/lid.176.bin"
+
 # ─────────────────────────────────────────────────────────────────────────────
 #   The recipe
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,6 +145,23 @@ DPPO_MASK_HIGH=0.2
 ADV_TAU=1.0
 
 MAX_OFF_POLICY_STEPS=8
+
+# Language consistency. fastText LID detects the prompt's language and the
+# response's, and a mismatch scales the env reward by (1 - w): w = 0.2 caps the
+# penalty at 20%. Scored on the ANSWER ONLY — the reasoning trace is stripped
+# before detection — because the SFT stage trains English reasoning with Finnish
+# prompts and Finnish final answers. The package's own default for a Finnish env
+# is "full", which would score the trace too and penalise precisely what SFT
+# teaches, so every arm pins the scope explicitly.
+#
+# One weight for both languages, as in runs 55176 and 55198. Scoring the answer
+# alone makes the arms symmetric: an on-language answer scores ~0.95-0.99, so the
+# English penalty is a fraction of a percent, and what it buys is a guard against
+# the mirror failure of answering an English prompt in Finnish.
+# Only the ifeval and rubric-judge envs support this; math_env_v1 has no language
+# reward, and a boxed numeric answer is not something LID can judge anyway.
+LANGUAGE_REWARD_SCOPE=answer
+LANGUAGE_REWARD_WEIGHT=0.2
 
 # A ceiling, not a target — the run ends when the eval curve flattens. ~260 s/step
 # puts 2000 steps at ~145 h, comfortably inside the 14-day wall. 2000 x 128 =
@@ -267,6 +294,7 @@ done
 echo "Policy:       $NUM_INF_INSTANCES independent dp=1 instances"
 echo "Broadcast:    nccl — trainer binds 0.0.0.0:$BROADCAST_PORT, workers dial $TRAIN_NODE_IP, world $((NUM_INF_INSTANCES + 1))"
 echo "Envs:         english-math, finnish-math, ifeval-en, ifeval-fi, rubric-judge-en, rubric-judge-fi"
+echo "Lang reward:  weight $LANGUAGE_REWARD_WEIGHT, scope $LANGUAGE_REWARD_SCOPE (reasoning trace not scored)"
 echo "Model:        $POLICY_MODEL"
 echo "Judge model:  $JUDGE_MODEL"
 echo "Batch:        $BATCH_SIZE rollouts / $GROUP_SIZE per group, oversampling $OVERSAMPLING_FACTOR"
@@ -405,6 +433,8 @@ name = "ifeval-en"
 dataset_name = "$EN_IFEVAL_DATASET"
 reasoning_model = true
 system_prompt = ""
+language_reward_weight = $LANGUAGE_REWARD_WEIGHT
+language_reward_scope = "$LANGUAGE_REWARD_SCOPE"
 
 [[train.env]]
 id = "dolci-ifeval-env-fi"
@@ -414,6 +444,8 @@ name = "ifeval-fi"
 dataset_name = "$FI_IFEVAL_DATASET"
 reasoning_model = true
 system_prompt = ""
+language_reward_weight = $LANGUAGE_REWARD_WEIGHT
+language_reward_scope = "$LANGUAGE_REWARD_SCOPE"
 
 [[train.env]]
 id = "rubric-judge-env"
@@ -428,6 +460,8 @@ max_judge_tokens = 64
 dataset_path = "$EN_JUDGE_DATASET"
 use_finnish = false
 system_prompt = ""
+language_reward_weight = $LANGUAGE_REWARD_WEIGHT
+language_reward_scope = "$LANGUAGE_REWARD_SCOPE"
 
 [[train.env]]
 id = "rubric-judge-env"
@@ -442,6 +476,8 @@ max_judge_tokens = 64
 dataset_path = "$FI_JUDGE_DATASET"
 use_finnish = true
 system_prompt = ""
+language_reward_weight = $LANGUAGE_REWARD_WEIGHT
+language_reward_scope = "$LANGUAGE_REWARD_SCOPE"
 TOMLEOF
 
 # Setting pre_batch_filters replaces the default list wholesale, so all three are
@@ -555,6 +591,7 @@ export RCCL_NET_GDR_LEVEL=2
 export NCCL_SOCKET_IFNAME=eno0
 export GLOO_SOCKET_IFNAME=eno0
 export PYTHONUNBUFFERED=1
+export FASTTEXT_LID_PATH=$LID_MODEL
 ENVEOF
 if [ -z "${WANDB_API_KEY:-}" ] && [ -f "$HOME/.bashrc" ]; then
     WANDB_API_KEY=$(grep -oP "(?<=WANDB_API_KEY=)['\"]?\K[^'\" ]+" "$HOME/.bashrc" | head -1 || true)
@@ -575,6 +612,11 @@ SING="$SING $CONTAINER"
 $SING bash -c "source $ENV_SETUP && uv sync --all-extras"
 # punkt_tab is required by the Finnish IFEval env's sentence-count instructions.
 $SING bash -c "source $ENV_SETUP && uv run python -c \"import nltk; nltk.download('punkt_tab', quiet=True)\""
+# The LID model, fetched once if absent. The envs refuse to start with a non-zero
+# language_reward_weight and no model rather than scoring a silent, neutral 1.0,
+# so a missing file fails here at submit time instead of 20 minutes in.
+$SING bash -c "source $ENV_SETUP && uv run python -m language_reward"
+[ -f "$LID_MODEL" ] || { echo "ERROR: fastText LID model missing at $LID_MODEL"; exit 1; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 #   Launch
